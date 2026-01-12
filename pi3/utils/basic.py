@@ -91,7 +91,7 @@ def load_images_as_tensor(path="data/truck", interval=1, PIXEL_LIMIT=255000, ver
     return torch.stack(tensor_list, dim=0)
 
 
-def load_multimodal_data(path="data/truck", conditions=None, interval=1, PIXEL_LIMIT=255000, verbose=True, device='cpu'):
+def load_multimodal_data(path="data/truck", conditions=None, interval=1, PIXEL_LIMIT=63000, verbose=True, device='cpu'):
     """
     Loads images (using strict original logic) and aligns optional conditions (poses, depths, intrinsics).
     
