@@ -454,10 +454,11 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         for i in range(len(self.decoder)):
             blk = self.decoder[i]
 
-            if i % 2 == 0:
+            if i % 2 == 0:       ### frame attention
                 pos = pos.reshape(B*N, hw, -1)
                 hidden = hidden.reshape(B*N, hw, -1)
-            else:
+
+            else:                ### global attention
                 pos = pos.reshape(B, N*hw, -1)
                 hidden = hidden.reshape(B, N*hw, -1)
 

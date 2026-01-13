@@ -274,7 +274,8 @@ class BlockRope(nn.Module):
         attn_class: Callable[..., nn.Module] = Attention,
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool=False,
-        rope=None
+        rope=None,
+
     ) -> None:
         super().__init__()
         # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
@@ -307,9 +308,9 @@ class BlockRope(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, xpos=None) -> Tensor:
+    def forward(self, x: Tensor, xpos=None,global_merging=None) -> Tensor:
         def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), xpos=xpos))
+            return self.ls1(self.attn(self.norm1(x), xpos=xpos,global_merging=global_merging))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

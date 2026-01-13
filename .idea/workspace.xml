@@ -5,8 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="bf1ecdfc-51c4-4e6d-9ea2-3b1833d6836b" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/export.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/make_conditions.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/example_mm.py" beforeDir="false" afterPath="$PROJECT_DIR$/example_mm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pi3/models/layers/attention.py" beforeDir="false" afterPath="$PROJECT_DIR$/pi3/models/layers/attention.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pi3/models/layers/block.py" beforeDir="false" afterPath="$PROJECT_DIR$/pi3/models/layers/block.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pi3/models/pi3x.py" beforeDir="false" afterPath="$PROJECT_DIR$/pi3/models/pi3x.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/pi3/utils/basic.py" beforeDir="false" afterPath="$PROJECT_DIR$/pi3/utils/basic.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -61,6 +64,11 @@
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
+    </key>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -77,7 +85,7 @@
       <option name="presentableId" value="Default" />
       <updated>1768205933603</updated>
       <workItem from="1768205934795" duration="7730000" />
-      <workItem from="1768220486602" duration="3600000" />
+      <workItem from="1768220486602" duration="19924000" />
     </task>
     <servers />
   </component>

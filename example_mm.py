@@ -100,11 +100,11 @@ if __name__ == '__main__':
     # 3. Infer
     print("Running model inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-    
+    imgs = imgs.unsqueeze(dim=0).to(dtype)
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
             res = model(
-                imgs=imgs, 
+                imgs=imgs,
                 **conditions
             )
 

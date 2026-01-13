@@ -17,7 +17,9 @@ import torch
 
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import SDPBackend
-
+from merging.merge import (
+    token_merge_bipartite2d,
+)
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
     if XFORMERS_ENABLED:
@@ -33,6 +35,41 @@ except ImportError:
     # warnings.warn("xFormers is not available (Attention)")
 
 
+# class Attention(nn.Module):
+#     def __init__(
+#         self,
+#         dim: int,
+#         num_heads: int = 8,
+#         qkv_bias: bool = False,
+#         proj_bias: bool = True,
+#         attn_drop: float = 0.0,
+#         proj_drop: float = 0.0,
+#     ) -> None:
+#         super().__init__()
+#         self.num_heads = num_heads
+#         head_dim = dim // num_heads
+#         self.scale = head_dim**-0.5
+#
+#         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+#         self.attn_drop = nn.Dropout(attn_drop)
+#         self.proj = nn.Linear(dim, dim, bias=proj_bias)
+#         self.proj_drop = nn.Dropout(proj_drop)
+#
+#     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+#         B, N, C = x.shape
+#         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+#
+#         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+#         attn = q @ k.transpose(-2, -1)
+#
+#         attn = attn.softmax(dim=-1)
+#         attn = self.attn_drop(attn)
+#
+#         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+#         x = self.proj(x)
+#         x = self.proj_drop(x)
+#         return x
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -42,31 +79,86 @@ class Attention(nn.Module):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        patch_width: int = 37,
+        patch_height: int = 28,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        
-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
+        # token merge 相关
+        self.patch_width = patch_width
+        self.patch_height = patch_height
 
+    def forward(self, x: Tensor, attn_bias=None, global_merging=True) -> Tensor:
+        """
+        x: (B, N, C)
+        global_merging: int or None，用来控制是否开启 merge
+        """
+        B, N, C = x.shape
+
+        # =========================
+        # 1. token merge（最小侵入）
+        # =========================
+        if global_merging is not None:
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(33)
+
+            merge_ratio = 0.5
+            r = int(N * merge_ratio)
+
+            m, u = token_merge_bipartite2d(
+                x,
+                self.patch_width,
+                self.patch_height,
+                2,
+                2,
+                r,
+                False,
+                generator,
+                enable_protection=True,
+            )
+
+            x = m(x, mode="mean")   # (B, N_merge, C)
+            N = x.shape[1]
+
+        # =========================
+        # 2. 原 attention（完全不动）
+        # =========================
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        # =========================
+        # 3. unmerge（恢复 token 数）
+        # =========================
+        if global_merging is not None:
+            x = u(x)   # (B, N_original, C)
+            print("here", flush=True)
+
+
+
         return x
+
+
 
 
 class MemEffAttention(Attention):
@@ -263,6 +355,8 @@ class AttentionRope(nn.Module):
         self.k_norm = norm_layer(head_dim) if qk_norm else nn.Identity()
 
         self.rope = rope
+        self.patch_width = patch_width
+        self.patch_height = patch_height
 
     def forward(self, x: Tensor, attn_bias=None, xpos=None) -> Tensor:
         B, N, C = x.shape
@@ -273,7 +367,7 @@ class AttentionRope(nn.Module):
         if self.rope is not None:
             q = self.rope(q, xpos)
             k = self.rope(k, xpos)
-        
+
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
 
@@ -283,6 +377,7 @@ class AttentionRope(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        print("use attemtion")
         return x
 
 
@@ -346,6 +441,7 @@ class FlashAttentionRope(AttentionRope):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
 
 def get_attn_score(blk_class, x, frame_num, token_length, xpos=None):
     x = blk_class.norm1(x)
