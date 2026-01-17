@@ -7,7 +7,7 @@ from functools import partial
 from copy import deepcopy
 
 from .dinov2.layers import Mlp
-from ..utils.geometry import homogenize_points
+from ..utils.geometry import homogenize_points, depth_edge  # Added depth_edge import
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
@@ -15,6 +15,7 @@ from .layers.transformer_head import TransformerDecoder, LinearPts3d, AnchorGaus
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from torch.utils.checkpoint import checkpoint
+
 
 class Pi3_3DGS(nn.Module):
     def __init__(
@@ -60,7 +61,7 @@ class Pi3_3DGS(nn.Module):
             dec_embed_dim = 1024
             dec_num_heads = 16
             mlp_ratio = 4
-            dec_depth = 36  # Default fallback
+            dec_depth = 36
 
         self.dec_embed_dim = dec_embed_dim
         self.decoder = nn.ModuleList([
@@ -96,7 +97,7 @@ class Pi3_3DGS(nn.Module):
         )
         self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
 
-        # Confidence Decoder (新增：为了过滤点)
+        # Confidence Decoder
         self.conf_decoder = deepcopy(self.point_decoder)
         self.conf_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=1)
 
@@ -163,23 +164,107 @@ class Pi3_3DGS(nn.Module):
         # 5. Freezing Logic
         # ==========================================================
         if freeze_encoder:
-            freeze_all_params([self.encoder])
+            self._freeze_module(self.encoder)
 
+        self.geo_freeze_list = [
+            self.decoder, self.point_decoder, self.point_head,
+            self.conf_decoder, self.conf_head, self.camera_decoder,
+            self.register_token
+        ]
+        for mod in self.geo_freeze_list:
+            self._freeze_module(mod)
+
+        # Camera Head logic: can be unfrozen later
         if freeze_camera_head:
-            print("Freezing Pi3 Geometry (Decoder + Point/Conf/Cam Heads)...")
-            freeze_all_params([
-                self.decoder,
-                self.point_decoder,
-                self.point_head,
-                self.conf_decoder,  # 记得冻结 Conf
-                self.conf_head,  # 记得冻结 Conf
-                self.camera_decoder,
-                self.camera_head,
-                self.register_token
-            ])
+            self._freeze_module(self.camera_head)
+
+    def _freeze_module(self, module):
+        for param in module.parameters():
+            param.requires_grad = False
+        module.eval()
+
+    def unfreeze_camera_head(self):
+        print("Unfreezing Camera Head for Joint Training...")
+        for param in self.camera_head.parameters():
+            param.requires_grad = True
+        self.camera_head.train()
+
+    @torch.no_grad()
+    def precompute_cache(self, imgs):
+        """
+        Runs the frozen backbone, decoder, and geometry heads to create a cache.
+        Returns:
+            dict containing:
+            - patch_tokens: For Gaussian Head
+            - cam_hidden: For Camera Head (Stage 2 training)
+            - camera_poses: Initial poses (Stage 1)
+            - selected_anchors: Geometry anchors
+        """
+        # 1. Normalize
+        imgs = (imgs - self.image_mean) / self.image_std
+        B, N, _, H, W = imgs.shape
+        patch_h, patch_w = H // 14, W // 14
+
+        # 2. Encode
+        imgs_flat = imgs.reshape(B * N, _, H, W)
+        enc_out = self.encoder(imgs_flat, is_training=False)  # Force eval
+        if isinstance(enc_out, dict): enc_out = enc_out["x_norm_patchtokens"]
+
+        # 3. Decode
+        hidden, pos = self.decode(enc_out, N, H, W)
+        patch_tokens = hidden[:, self.patch_start_idx:, :]
+
+        # 4. Geometry Heads (Frozen)
+        # Store cam_hidden for Stage 2
+        cam_hidden = self.camera_decoder(hidden, xpos=pos).float()
+        camera_poses = self.camera_head(cam_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
+
+        # Points & Conf
+        pt_hidden = self.point_decoder(hidden, xpos=pos).float()
+        conf_hidden = self.conf_decoder(hidden, xpos=pos).float()
+
+        ret = self.point_head([pt_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+        xy, z = ret.split([2, 1], dim=-1)
+        z = torch.exp(z)
+        local_points = torch.cat([xy * z, z], dim=-1)
+        conf_logits = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+
+        # Unproject
+        points_global = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+
+        # 5. Filter Anchors
+        selected_anchors = self._filter_anchors(points_global, conf_logits, local_points, imgs.device, B)
+
+        # CACHE everything needed for both stages
+        return {
+            "patch_tokens": patch_tokens.detach(),
+            "cam_hidden": cam_hidden[:, self.patch_start_idx:].detach(),  # Needed for CameraHead
+            "camera_poses": camera_poses.detach(),  # Needed for Stage 1
+            "selected_anchors": selected_anchors.detach(),
+            "img_shape": (H, W)
+        }
+
+    def _filter_anchors(self, points_global, conf_logits, local_points, device, B):
+        mask_conf = torch.sigmoid(conf_logits[..., 0]) > 0.1
+        mask_edge = ~depth_edge(local_points[..., 2], rtol=0.03)
+        valid_mask = torch.logical_and(mask_conf, mask_edge)
+
+        selected_anchors_list = []
+        flat_points = points_global.view(B, -1, 3)
+        flat_mask = valid_mask.view(B, -1)
+
+        for b in range(B):
+            curr_valid_points = flat_points[b][flat_mask[b]]
+            if len(curr_valid_points) < 10:
+                curr_valid_points = flat_points[b]
+
+            sample_indices = torch.randint(0, len(curr_valid_points), (self.num_anchors,), device=device)
+            selected_anchors_list.append(curr_valid_points[sample_indices])
+
+        return torch.stack(selected_anchors_list)
 
     def decode(self, hidden, N, H, W):
-        # ... (Decode 逻辑保持不变) ...
+        # ... (Decode logic remains same) ...
         BN, hw, _ = hidden.shape
         B = BN // N
         final_output = []
@@ -211,80 +296,86 @@ class Pi3_3DGS(nn.Module):
 
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
-    def forward(self, imgs):
-        imgs = (imgs - self.image_mean) / self.image_std
-        B, N, _, H, W = imgs.shape
-        patch_h, patch_w = H // 14, W // 14
+    def forward(self, imgs=None, cache=None, train_pose=False):
+        """
+        Args:
+            imgs: Images if cache is None
+            cache: Output from precompute_cache()
+            train_pose: Bool, enable gradients for camera head (Stage 2)
+        """
 
-        # 1. Encode & Decode
-        imgs = imgs.reshape(B * N, _, H, W)
-        hidden = self.encoder(imgs, is_training=True)
-        if isinstance(hidden, dict): hidden = hidden["x_norm_patchtokens"]
-        hidden, pos = self.decode(hidden, N, H, W)
+        # 1. Inputs Preparation
+        if cache is not None:
+            # === Cached Mode (Fast) ===
+            patch_tokens = cache["patch_tokens"]
+            selected_anchors = cache["selected_anchors"]
+            H, W = cache["img_shape"]
+            B = selected_anchors.shape[0]
+            N = patch_tokens.shape[0] // B
+            patch_h, patch_w = H // 14, W // 14
 
-        # 2. Frozen Geometry Branch
-        with torch.no_grad():
-            # A. Camera
-            cam_hidden = self.camera_decoder(hidden, xpos=pos).float()
-            camera_poses = self.camera_head(cam_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
+            if train_pose:
+                # Stage 2: Train Camera Head using cached hidden states
+                # Requires unfreeze_camera_head() to be called previously
+                cam_feat = cache["cam_hidden"]
+                camera_poses = self.camera_head(cam_feat, patch_h, patch_w).reshape(B, N, 4, 4)
+            else:
+                # Stage 1: Fixed Poses
+                camera_poses = cache["camera_poses"].detach()
 
-            # B. Points & Confidence
-            pt_hidden = self.point_decoder(hidden, xpos=pos).float()
-            conf_hidden = self.conf_decoder(hidden, xpos=pos).float()
+        else:
+            # === Full Forward Mode (Fallback/Original) ===
+            imgs = (imgs - self.image_mean) / self.image_std
+            B, N, _, H, W = imgs.shape
+            patch_h, patch_w = H // 14, W // 14
 
-            ret = self.point_head([pt_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-            xy, z = ret.split([2, 1], dim=-1)
-            z = torch.exp(z)
-            local_points = torch.cat([xy * z, z], dim=-1)  # [B, N, H, W, 3] (Camera Space)
+            with torch.set_grad_enabled(not self.geo_freeze_list[0].training):
+                imgs = imgs.reshape(B * N, _, H, W)
+                hidden = self.encoder(imgs, is_training=True)
+                if isinstance(hidden, dict): hidden = hidden["x_norm_patchtokens"]
+                hidden, pos = self.decode(hidden, N, H, W)
 
-            conf_logits = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W,
-                                                                                                  -1)  # [B, N, H, W, 1]
+            patch_tokens = hidden[:, self.patch_start_idx:, :]
 
-            # C. Unproject to Global
-            points_global = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+            # Geometry Branch
+            if train_pose:
+                cam_hidden = self.camera_decoder(hidden, xpos=pos).float()
+                camera_poses = self.camera_head(cam_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4,
+                                                                                                                4)
+            else:
+                with torch.no_grad():
+                    cam_hidden = self.camera_decoder(hidden, xpos=pos).float()
+                    camera_poses = self.camera_head(cam_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B,
+                                                                                                                    N,
+                                                                                                                    4,
+                                                                                                                    4)
 
-            # ====================================================
-            # 3. Filtering Logic (Based on your snippet)
-            # ====================================================
-            # Mask generation: [B, N, H, W]
-            mask_conf = torch.sigmoid(conf_logits[..., 0]) > 0.1
-            mask_edge = ~depth_edge(local_points[..., 2], rtol=0.03)  # Use local z for edge detection
-            valid_mask = torch.logical_and(mask_conf, mask_edge)
+            # Anchors (Simplified regeneration for full forward)
+            with torch.no_grad():
+                pt_hidden = self.point_decoder(hidden, xpos=pos).float()
+                conf_hidden = self.conf_decoder(hidden, xpos=pos).float()
+                # ... (Anchor generation steps omitted for brevity, logic identical to precompute_cache)
+                # Ideally refactor Anchor Gen into separate method, but assuming cache is used 99% of time.
+                # For safety, here we assume anchors are passed or regenerated similarly.
+                # Let's use the helper:
+                ret = self.point_head([pt_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                xy, z = ret.split([2, 1], dim=-1)
+                z = torch.exp(z)
+                local_points = torch.cat([xy * z, z], dim=-1)
+                conf_logits = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                points_global = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[
+                    ..., :3]
+                selected_anchors = self._filter_anchors(points_global, conf_logits, local_points, imgs.device, B)
 
-            # Sampling Anchors
-            # Since each batch item has different number of valid points, we handle them carefully.
-            selected_anchors_list = []
-
-            # Flatten spatial dims: [B, Total_Points, 3] and [B, Total_Points]
-            flat_points = points_global.view(B, -1, 3)
-            flat_mask = valid_mask.view(B, -1)
-
-            for b in range(B):
-                # Extract valid points for this batch item
-                curr_valid_points = flat_points[b][flat_mask[b]]  # [N_valid, 3]
-
-                # Fallback: If no points are valid (rare), use all points or a subset
-                if len(curr_valid_points) < 10:
-                    curr_valid_points = flat_points[b]
-
-                # Random Sampling with replacement (to ensure constant size [num_anchors])
-                # We need exactly self.num_anchors
-                sample_indices = torch.randint(0, len(curr_valid_points), (self.num_anchors,), device=imgs.device)
-                sampled_anchors = curr_valid_points[sample_indices]  # [num_anchors, 3]
-
-                selected_anchors_list.append(sampled_anchors)
-
-            # Stack: [B, num_anchors, 3]
-            selected_anchors = torch.stack(selected_anchors_list)
-
-        # 4. Gaussian Generation
-        patch_tokens = hidden[:, self.patch_start_idx:, :]
+        # 2. Gaussian Generation
+        if not train_pose:
+            camera_poses = camera_poses.detach()
 
         gaussians = self.gaussian_head(
             tokens=patch_tokens,
-            camera_poses=camera_poses.detach(),
+            camera_poses=camera_poses,
             img_shape=(H, W),
-            selected_anchors=selected_anchors.detach()  # Pass filtered anchors
+            selected_anchors=selected_anchors
         )
 
         return {
