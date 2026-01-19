@@ -6,10 +6,10 @@ model:
     decoder_size: large
     load_vggt: true
     freeze_encoder: true
-    use_global_points: false
+    # use_global_points: false
     train_conf: false
     num_dec_blk_not_to_checkpoint: 4
-    ckpt: null # <path-to-your-pretrain-checkpoint>
+    ckpt: ckpts/pi3/model_pi3.safetensors # <path-to-your-pretrain-checkpoint>
 
 loss:
     train_loss:
