@@ -28,8 +28,9 @@ class Pi3LossGS(nn.Module):
             lambda_rgb=1.0,
             lambda_ssim=0.2,
             lambda_depth=0.1,
-            lambda_repulsion=0.01,  # New
-            lambda_sparsity=0.005  # New
+            lambda_repulsion=0.01,
+            lambda_sparsity=0.005,
+            lambda_consist=0.05 # [Innovation C] Geometry Consistency Weight
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -37,6 +38,7 @@ class Pi3LossGS(nn.Module):
         self.lambda_depth = lambda_depth
         self.lambda_repulsion = lambda_repulsion
         self.lambda_sparsity = lambda_sparsity
+        self.lambda_consist = lambda_consist
 
     def prepare_gt(self, gt):
         """处理输入的 C2W 并转换为渲染所需的 W2C 和归一化尺度"""
@@ -94,24 +96,12 @@ class Pi3LossGS(nn.Module):
 
     def _calc_repulsion_loss(self, xyz, k=4):
         """Simple KNN-based repulsion loss to prevent clamping"""
-        # xyz: [B, N, 3]
-        # Calculate pairwise distance (simplified for memory)
-        # Using a small subset or random subsample if N is huge recommended
         B, N, _ = xyz.shape
         loss = 0.0
         for b in range(B):
-            # Calculate distance matrix: [N, N]
-            # Use torch.cdist for efficiency
             dists = torch.cdist(xyz[b], xyz[b], p=2)
-            # Add large value to diagonal to ignore self
             dists.fill_diagonal_(1e10)
-            # Find k nearest neighbors
             min_dists, _ = dists.topk(k, dim=1, largest=False)
-            # Penalize if too close (threshold can be tuned, e.g., 0.01)
-            # loss += torch.relu(0.01 - min_dists).mean()
-            loss += min_dists.mean()  # Simple minimization of density clumping?
-            # Usually Repulsion maximizes distance: loss = -min_dists.mean() or exp(-dist)
-            # Here we use standard repulsion: exp(-dist^2)
             loss += torch.exp(-min_dists.pow(2) / 0.01).mean()
         return loss / B
 
@@ -147,29 +137,36 @@ class Pi3LossGS(nn.Module):
             depth_mask = (gt_depths > 0).float()
             loss_depth = F.l1_loss(depth_near * depth_mask, gt_depths * depth_mask)
 
-        # 4. 新增损失 (Repulsion & Sparsity)
+        # 4. 新增损失
         loss_repulsion = torch.tensor(0.0, device=rgb_full.device)
         loss_sparsity = torch.tensor(0.0, device=rgb_full.device)
+        loss_consist = torch.tensor(0.0, device=rgb_full.device) # [Innovation C]
 
-        # Repulsion (Prevent GS from bunching up)
+        # Repulsion
         if self.lambda_repulsion > 0:
-            # Only calculate on Object Gaussians (Sky is distinct)
             obj_xyz = gauss['xyz'][:, :num_near[0] if num_near is not None else None]
             loss_repulsion = self._calc_repulsion_loss(obj_xyz)
 
-        # Sparsity (Encourage clean background / removal of artifacts via gating)
+        # Sparsity
         if self.lambda_sparsity > 0:
-            # L1 penalty on Opacity (masked by gating)
-            # Encourages gate_score to be 0 for uncertain areas
             opacity = gauss['opacity']
             loss_sparsity = opacity.mean()
+
+        # [Innovation C] Geometry Consistency
+        # 约束 Gaussian 中心不偏离 Base Anchor
+        if self.lambda_consist > 0 and 'base_anchors' in gauss:
+            # 只约束 Object 部分
+            limit = num_near[0] if num_near is not None else None
+            diff = gauss['xyz'][:, :limit] - gauss['base_anchors'][:, :limit]
+            loss_consist = torch.norm(diff, dim=-1).mean()
 
         final_loss = (
                 self.lambda_rgb * loss_rgb +
                 self.lambda_ssim * loss_ssim +
                 self.lambda_depth * loss_depth +
                 self.lambda_repulsion * loss_repulsion +
-                self.lambda_sparsity * loss_sparsity
+                self.lambda_sparsity * loss_sparsity +
+                self.lambda_consist * loss_consist # Add
         )
 
         details = {
@@ -178,6 +175,7 @@ class Pi3LossGS(nn.Module):
             "loss_gs_depth": loss_depth.item(),
             "loss_repulsion": loss_repulsion.item(),
             "loss_sparsity": loss_sparsity.item(),
+            "loss_consist": loss_consist.item(), # Log
             "total_loss": final_loss.item()
         }
 
