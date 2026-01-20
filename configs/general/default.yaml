@@ -7,8 +7,8 @@ random_seed: 1111
 log:
   # output_dir: '${work_dir}/outputs/${name}-${now:%Y-%m-%d_%H-%M-%S}'
   output_dir: '${work_dir}/outputs/${name}'
-  use_tensorboard: true
-  use_wandb: false
+  use_tensorboard: false
+  use_wandb: true
   wandb_init_conf:
     name: ${name}
     entity: ethan-predator

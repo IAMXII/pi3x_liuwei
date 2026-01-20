@@ -102,7 +102,7 @@ class DynamicBatchSampler(Sampler):
                  epoch=0,
                  seed=42,
                  rank=0,
-                 max_img_per_gpu=48):
+                 max_img_per_gpu=4):
         """
         Initializes the dynamic batch sampler.
 

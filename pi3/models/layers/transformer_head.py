@@ -8,38 +8,6 @@ import torch.nn.functional as F
 import torch
 
 
-# [Innovation B] 全局上下文调制模块
-class GlobalContextModulation(nn.Module):
-    def __init__(self, dim, global_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.proj_global = nn.Linear(global_dim, dim)
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
-            nn.Sigmoid()
-        )
-        self.proj_out = nn.Linear(dim, dim)
-
-    def forward(self, local_feats, global_tokens):
-        # local_feats: [B, M, C]
-        # global_tokens: [B, N_views, L_g, C_g] -> need pooling
-        B, M, C = local_feats.shape
-
-        # 简单聚合全局信息 (Average Pooling over views and tokens)
-        if global_tokens.dim() == 4:
-            g_feat = global_tokens.flatten(1, 2).mean(dim=1)  # [B, C_g]
-        else:
-            g_feat = global_tokens.mean(dim=1)
-
-        g_feat = self.proj_global(g_feat).unsqueeze(1).expand(-1, M, -1)  # [B, M, C]
-
-        # 门控融合
-        concat = torch.cat([self.norm(local_feats), g_feat], dim=-1)
-        gate = self.gate(concat)
-
-        return self.proj_out(local_feats * gate + g_feat * (1 - gate))
-
-
 class TransformerDecoder(nn.Module):
     def __init__(
             self,
@@ -142,9 +110,43 @@ class ContextTransformerDecoder(nn.Module):
 # New / Modified Classes for 3DGS
 # ==========================================
 
+
+# ... (保持 GlobalContextModulation, TransformerDecoder, LinearPts3d 等类不变) ...
+
+# [Innovation B] 全局上下文调制模块
+class GlobalContextModulation(nn.Module):
+    def __init__(self, dim, global_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.proj_global = nn.Linear(global_dim, dim)
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
+        self.proj_out = nn.Linear(dim, dim)
+
+    def forward(self, local_feats, global_tokens):
+        # local_feats: [B, M, C]
+        # global_tokens: [B, N_views, L_g, C_g] -> need pooling
+        B, M, C = local_feats.shape
+
+        # 简单聚合全局信息 (Average Pooling over views and tokens)
+        if global_tokens.dim() == 4:
+            g_feat = global_tokens.flatten(1, 2).mean(dim=1)  # [B, C_g]
+        else:
+            g_feat = global_tokens.mean(dim=1)
+
+        g_feat = self.proj_global(g_feat).unsqueeze(1).expand(-1, M, -1)  # [B, M, C]
+
+        # 门控融合
+        concat = torch.cat([self.norm(local_feats), g_feat], dim=-1)
+        gate = self.gate(concat)
+
+        return self.proj_out(local_feats * gate + g_feat * (1 - gate))
+
+
 class SlotAttention(nn.Module):
     """Simple Slot Attention for aggregating multi-view features."""
-
     def __init__(self, dim, num_heads=4, qkv_bias=False, eps=1e-6):
         super().__init__()
         self.norm_slots = nn.LayerNorm(dim, eps=eps)
@@ -177,18 +179,20 @@ class SlotAttention(nn.Module):
         attn = attn.softmax(dim=-1)
 
         # Aggregate
-        x = (attn @ v.transpose(-1, -2)).transpose(2, 3).reshape(B, M, D)
+        # x = (attn @ v.transpose(-1, -2)).transpose(2, 3).reshape(B, M, D)
+        x = (attn @ v).transpose(2, 3).reshape(B, M, D)
         return x
 
 
 class AnchorGaussianHead(nn.Module):
     def __init__(self,
                  embed_dim,
+                 in_channels=2048,  # <--- [FIX] 新增参数：输入特征的通道数
                  num_sky_anchors=1024,
                  patch_size=14,
                  K=4,
                  sky_radius=100.0,
-                 global_dim=1024):  # [Innovation B] Input dim
+                 global_dim=1024):
         super().__init__()
         self.patch_size = patch_size
         self.num_sky_anchors = num_sky_anchors
@@ -205,9 +209,10 @@ class AnchorGaussianHead(nn.Module):
         self.sky_anchor_dir = nn.Parameter(torch.randn(num_sky_anchors, 3))
         self.sky_anchor_query = nn.Parameter(torch.randn(num_sky_anchors, embed_dim))
 
-        # 3. Feature Upsampler (Restore resolution for better sampling)
+        # 3. Feature Upsampler
+        # [FIX] 关键修改：第一层 ConvTranspose2d 的输入通道改为 in_channels (2048)
         self.feat_upsampler = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, embed_dim // 2, kernel_size=2, stride=2),
+            nn.ConvTranspose2d(in_channels, embed_dim // 2, kernel_size=2, stride=2),
             nn.BatchNorm2d(embed_dim // 2), nn.ReLU(),
             nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=3, padding=1)
         )
@@ -222,7 +227,6 @@ class AnchorGaussianHead(nn.Module):
         )
 
         # [Innovation A] Split Probability Head
-        # 判断当前 Anchor 是否需要裂变出子高斯 (K-1 个)
         self.split_head = nn.Sequential(
             nn.Linear(embed_dim, 64), nn.ReLU(),
             nn.Linear(64, 1), nn.Sigmoid()
@@ -238,14 +242,12 @@ class AnchorGaussianHead(nn.Module):
     def forward(self, tokens, camera_poses, img_shape, selected_anchors,
                 global_tokens=None, anchor_confidence=None):
         """
-        tokens: [B, S, D] (Backbone/Decoder output)
-        global_tokens: [B, N_views, L_g, C_g] [Innovation B]
-        anchor_confidence: [B, M_obj, 1] [Innovation D]
+        tokens: [B, S, D_in] (Backbone output, D_in is usually 2048)
         """
         B = camera_poses.shape[0]
         N_views = camera_poses.shape[1]
 
-        # --- 1. Prepare Anchors (Dual Stream) ---
+        # --- 1. Prepare Anchors ---
         anchors_obj = selected_anchors  # [B, M_obj, 3]
 
         sky_dirs = F.normalize(self.sky_anchor_dir, dim=-1)
@@ -260,10 +262,14 @@ class AnchorGaussianHead(nn.Module):
         H, W = img_shape
         h_p, w_p = H // self.patch_size, W // self.patch_size
 
-        # Upsample Features
-        feats = tokens.view(B, N_views, h_p, w_p, -1).permute(0, 1, 4, 2, 3)  # [B, N, D, H, W]
+        # tokens shape [B, N*h*w, 2048] -> reshape to image layout
+        # Upsample Features: [B*N, 2048, h, w] -> [B*N, embed_dim, h*2, w*2]
+        feats = tokens.view(B, N_views, h_p, w_p, -1).permute(0, 1, 4, 2, 3)  # [B, N, C_in, H, W]
         feats = feats.reshape(B * N_views, -1, h_p, w_p)
-        feats_high = self.feat_upsampler(feats)  # [BN, D, H*2, W*2]
+        
+        # 这里之前报错是因为 feats 是 2048 通道，而 conv 期望 1024
+        # 现在修改了 __init__，应该匹配了
+        feats_high = self.feat_upsampler(feats)  # [BN, D_embed, H*2, W*2]
 
         # --- 3. Sampling (Projection) ---
         sampled_features = []
@@ -294,12 +300,11 @@ class AnchorGaussianHead(nn.Module):
 
         gate_score = self.gating_mlp(torch.cat([feat_mean, feat_var], dim=-1))  # [B, M, 1]
 
-        # Slot Attention: Query=Anchor, Key/Val=Features
+        # Slot Attention
         slots = self.slot_attention(query_total, multi_view_feats)
         slots = slots + query_total  # Residual
 
         # [Innovation B] Global Context Modulation
-        # 在 Slot Attention 之后注入全局信息，修正外观特征
         if global_tokens is not None:
             slots = self.global_modulator(slots, global_tokens)
 
@@ -309,7 +314,6 @@ class AnchorGaussianHead(nn.Module):
         color_raw = self.color_head(slots).view(B, M_total, self.K, 3)
 
         # [Innovation A] Split Probability
-        # [B, M, 1] -> [B, M, 1, 1]
         split_prob = self.split_head(slots).view(B, M_total, 1, 1)
 
         base_xyz = anchors_all.unsqueeze(2).expand(-1, -1, self.K, -1)
@@ -318,34 +322,27 @@ class AnchorGaussianHead(nn.Module):
         final_xyz = base_xyz + d_xyz
         rot = F.normalize(geo_raw[..., 3:7], dim=-1)
 
-        # Scale handling
         scale = torch.sigmoid(geo_raw[..., 7:10]) * 0.05
-        # Sky scale boost (Preserve Original Logic)
+        # Sky scale boost
         is_sky = torch.zeros((B, M_total, self.K, 1), device=slots.device)
         is_sky[:, anchors_obj.shape[1]:] = 1.0
         scale = scale * (1.0 + is_sky * 50.0)
 
-        # [Innovation A] Apply Split Logic (Only to Child Gaussians)
-        # K=0 is parent, K>0 are children
+        # Apply Split Logic
         split_mask = torch.ones_like(scale)
-        split_mask[:, :, 1:, :] = split_prob  # 子高斯受到 split_prob 抑制
+        split_mask[:, :, 1:, :] = split_prob
         scale = scale * split_mask
 
         opacity = torch.sigmoid(geo_raw[..., 10:11])
         final_color = torch.sigmoid(color_raw)
 
-        # Apply Gating (Existing)
+        # Apply Gating
         final_opacity = opacity * gate_score.unsqueeze(2)
 
         # [Innovation D] Uncertainty-guided Pruning
-        # 利用 Pi3 的 Conf 修正 Opacity
         if anchor_confidence is not None:
-            # anchor_confidence 仅对应 Object Anchors
-            # 需要 Pad 到 Total Anchors (Sky Anchors 默认为 High Conf)
-            sky_conf = torch.ones((B, self.num_sky_anchors, 1), device=slots.device) * 10.0  # Logit large
-            full_conf = torch.cat([anchor_confidence, sky_conf], dim=1)  # [B, M_total, 1]
-
-            # Sigmoid & Expand
+            sky_conf = torch.ones((B, self.num_sky_anchors, 1), device=slots.device) * 10.0
+            full_conf = torch.cat([anchor_confidence, sky_conf], dim=1)
             conf_prob = torch.sigmoid(full_conf).unsqueeze(2).expand(-1, -1, self.K, 1)
             final_opacity = final_opacity * conf_prob
 
@@ -357,5 +354,5 @@ class AnchorGaussianHead(nn.Module):
             "color": final_color.reshape(B, -1, 3),
             "gate_score": gate_score,
             "num_near": torch.full((B,), anchors_obj.shape[1] * self.K, dtype=torch.long, device=slots.device),
-            "base_anchors": base_xyz.reshape(B, -1, 3)  # [Innovation C] For Loss
+            "base_anchors": base_xyz.reshape(B, -1, 3)
         }

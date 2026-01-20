@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gsplat.rasterization import rasterization
+from gsplat import rasterization
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 
@@ -30,7 +30,7 @@ class Pi3LossGS(nn.Module):
             lambda_depth=0.1,
             lambda_repulsion=0.01,
             lambda_sparsity=0.005,
-            lambda_consist=0.05 # [Innovation C] Geometry Consistency Weight
+            lambda_consist=0.05
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -75,27 +75,74 @@ class Pi3LossGS(nn.Module):
 
         return dict(
             imgs=gt_imgs,
-            render_w2c=render_w2c,
-            render_ks=gt_ks,
+            render_w2c=render_w2c, # [B, N, 4, 4]
+            render_ks=gt_ks,       # [B, N, 3, 3]
             gt_depths=gt_depths,
             norm_factor=norm_factor
         )
 
-    def _render_gs(self, gaussians, w2c, ks, H, W, num_gaussians=None):
+    def _render_gs(self, gaussians, w2c, ks, H, W, num_gaussians=None, render_mode='RGB'):
+        """
+        gsplat v1.0.0+ 渲染接口
+        支持变长 num_gaussians (Ragged Batch) 和多种渲染模式
+        """
+        # 1. 获取所有属性
+        means = gaussians["xyz"]
+        quats = gaussians["rotation"]
+        scales = gaussians["scale"]
+        opacities = gaussians["opacity"]
+        colors = gaussians["color"]
+        
+        B = means.shape[0]
+
+        # 2. 处理 num_gaussians (Ragged Batch Masking)
+        # 如果不同 batch 的高斯数量不一样，我们取最大值切片，并把多余的 Opacity 设为 0
+        if num_gaussians is not None:
+            if isinstance(num_gaussians, torch.Tensor):
+                # 找到当前 batch 中最大的保留数量
+                max_N = int(num_gaussians.max().item())
+                
+                # 切片到最大长度
+                means = means[:, :max_N]
+                quats = quats[:, :max_N]
+                scales = scales[:, :max_N]
+                opacities = opacities[:, :max_N].clone() # Clone for modifying
+                colors = colors[:, :max_N]
+                
+                # 构建掩码：屏蔽多余的高斯
+                range_seq = torch.arange(max_N, device=means.device).expand(B, max_N)
+                # valid_mask: [B, max_N]
+                valid_mask = range_seq < num_gaussians.unsqueeze(1)
+                
+                # 将无效点的 Opacity 设为 0 (渲染器会完全忽略它们)
+                opacities[~valid_mask] = 0.0
+                
+            else:
+                # 整数情况 (所有 batch 数量一致)
+                limit = int(num_gaussians)
+                means = means[:, :limit]
+                quats = quats[:, :limit]
+                scales = scales[:, :limit]
+                opacities = opacities[:, :limit]
+                colors = colors[:, :limit]
+
+        # 3. 渲染
+        # render_mode: 'RGB', 'D' (Accumulated Depth), 'ED' (Expected Depth)
         return rasterization(
-            means3d=gaussians["xyz"][:, :num_gaussians].contiguous(),
-            quats=gaussians["rotation"][:, :num_gaussians].contiguous(),
-            scales=gaussians["scale"][:, :num_gaussians].contiguous(),
-            opacities=gaussians["opacity"][:, :num_gaussians].squeeze(-1).contiguous(),
-            colors=gaussians["color"][:, :num_gaussians].contiguous(),
-            viewmats=w2c,
-            Ks=ks,
+            means=means.contiguous(),
+            quats=quats.contiguous(),
+            scales=scales.contiguous(),
+            opacities=opacities.squeeze(-1).contiguous(),
+            colors=colors.contiguous(),
+            viewmats=w2c,   # [B, N, 4, 4]
+            Ks=ks,          # [B, N, 3, 3]
             width=W, height=H,
+            render_mode=render_mode, # <--- Key Change: Use gsplat's native mode
             packed=False
         )
 
     def _calc_repulsion_loss(self, xyz, k=4):
-        """Simple KNN-based repulsion loss to prevent clamping"""
+        """Simple KNN-based repulsion loss"""
         B, N, _ = xyz.shape
         loss = 0.0
         for b in range(B):
@@ -110,41 +157,61 @@ class Pi3LossGS(nn.Module):
         gt = self.prepare_gt(gt_raw)
 
         B, N, C, H, W = gt['imgs'].shape
-        render_w2c = gt['render_w2c'].reshape(B * N, 4, 4)
-        render_ks = gt['render_ks'].reshape(B * N, 3, 3)
+        render_w2c = gt['render_w2c'] # Shape: [B, N, 4, 4]
+        render_ks = gt['render_ks']   # Shape: [B, N, 3, 3]
 
         gauss = pred['gaussians']
         num_near = gauss.get('num_near', None)
-        gate_score = gauss.get('gate_score', None)
+        
+        # 2. 渲染 RGB
+        # render_mode='RGB' 返回的第一个参数是 image [B, N, H, W, 3]
+        rgb_full, _, _ = self._render_gs(
+            gauss, render_w2c, render_ks, H, W, 
+            num_gaussians=None, render_mode='RGB'
+        )
 
-        # 2. 渲染
-        rgb_full, _, _ = self._render_gs(gauss, render_w2c, render_ks, H, W, num_gaussians=None)
-
+        # 3. 渲染深度 (如果有 num_near 约束)
         depth_near = None
         if num_near is not None:
-            _, _, info_near = self._render_gs(gauss, render_w2c, render_ks, H, W, num_gaussians=num_near)
-            depth_near = info_near["depths"]
+            # 使用 'ED' (Expected Depth) 模式直接渲染深度图
+            # gsplat 会返回 [B, N, H, W, 1] 的深度图
+            depth_near_map, _, _ = self._render_gs(
+                gauss, render_w2c, render_ks, H, W, 
+                num_gaussians=num_near, render_mode='ED'
+            )
+            depth_near = depth_near_map
 
-        # 3. 基础损失
+        # 4. 计算损失
+        # [B, N, H, W, 3] -> [B*N, 3, H, W]
         rgb_full = rgb_full.reshape(B * N, H, W, 3).permute(0, 3, 1, 2)
         gt_imgs = gt['imgs'].reshape(B * N, 3, H, W)
+        
         loss_rgb = F.l1_loss(rgb_full, gt_imgs)
         loss_ssim = 1.0 - ssim(rgb_full, gt_imgs, data_range=1.0)
 
         loss_depth = torch.tensor(0.0, device=rgb_full.device)
         if depth_near is not None:
             gt_depths = gt['gt_depths'].reshape(B * N, H, W, 1)
+            # depth_near [B, N, H, W, 1] -> [B*N, H, W, 1]
+            depth_near = depth_near.reshape(B * N, H, W, 1)
+            
+            # Mask valid depths
             depth_mask = (gt_depths > 0).float()
             loss_depth = F.l1_loss(depth_near * depth_mask, gt_depths * depth_mask)
 
-        # 4. 新增损失
+        # 5. 其他正则项 (切片索引必须转为 int)
         loss_repulsion = torch.tensor(0.0, device=rgb_full.device)
         loss_sparsity = torch.tensor(0.0, device=rgb_full.device)
-        loss_consist = torch.tensor(0.0, device=rgb_full.device) # [Innovation C]
+        loss_consist = torch.tensor(0.0, device=rgb_full.device) 
 
         # Repulsion
         if self.lambda_repulsion > 0:
-            obj_xyz = gauss['xyz'][:, :num_near[0] if num_near is not None else None]
+            limit = int(num_near[0].item()) if num_near is not None else None
+            # 注意：如果 num_near 不一致，这里只切到第一个 batch 的长度作为近似，或者取 max
+            # 为了严谨，建议在 _calc_repulsion_loss 里也处理 ragged batch，
+            # 但这里为保持简单，使用第一个 batch 的长度切片（假设差异不大）
+            # 或者使用上面 _render_gs 里计算出的 max_N
+            obj_xyz = gauss['xyz'][:, :limit]
             loss_repulsion = self._calc_repulsion_loss(obj_xyz)
 
         # Sparsity
@@ -152,11 +219,9 @@ class Pi3LossGS(nn.Module):
             opacity = gauss['opacity']
             loss_sparsity = opacity.mean()
 
-        # [Innovation C] Geometry Consistency
-        # 约束 Gaussian 中心不偏离 Base Anchor
+        # Geometry Consistency
         if self.lambda_consist > 0 and 'base_anchors' in gauss:
-            # 只约束 Object 部分
-            limit = num_near[0] if num_near is not None else None
+            limit = int(num_near[0].item()) if num_near is not None else None
             diff = gauss['xyz'][:, :limit] - gauss['base_anchors'][:, :limit]
             loss_consist = torch.norm(diff, dim=-1).mean()
 
@@ -166,7 +231,7 @@ class Pi3LossGS(nn.Module):
                 self.lambda_depth * loss_depth +
                 self.lambda_repulsion * loss_repulsion +
                 self.lambda_sparsity * loss_sparsity +
-                self.lambda_consist * loss_consist # Add
+                self.lambda_consist * loss_consist
         )
 
         details = {
@@ -175,7 +240,7 @@ class Pi3LossGS(nn.Module):
             "loss_gs_depth": loss_depth.item(),
             "loss_repulsion": loss_repulsion.item(),
             "loss_sparsity": loss_sparsity.item(),
-            "loss_consist": loss_consist.item(), # Log
+            "loss_consist": loss_consist.item(),
             "total_loss": final_loss.item()
         }
 

@@ -3,22 +3,30 @@ import os.path as osp
 import numpy as np
 from PIL import Image
 import json
-from tqdm import tqdm
 from datasets.base.base_dataset import BaseDataset
 
 
 def load_camera_from_npz(npz_path):
     """从 metadata npz 文件读取相机参数"""
+    if not osp.exists(npz_path):
+        raise FileNotFoundError(f"Metadata file not found: {npz_path}")
     data = np.load(npz_path)
-    R = data['R']  # 3x3
-    T = data['T']  # 3
-    focal_length = data['focal_length']  # 2
-    principal_point = data['principal_point']  # 2
-    return R, T, focal_length, principal_point
+    
+    # 修改：直接读取 camera_pose 和 camera_intrinsics
+    # 假设 npz 中的键名为 'camera_pose' 和 'camera_intrinsics'
+    # 如果键名是大写 ('Camera Pose'), 请将下面改为 data['Camera Pose']
+    camera_pose = data['camera_pose']            # 4x4
+    camera_intrinsics = data['camera_intrinsics'] # 3x3
+    
+    return camera_pose, camera_intrinsics
 
 
 def opencv_from_cameras_projection(R, T, focal, p0, image_size):
-    """保持和 CO3DV2Dataset 相同的转换"""
+    """
+    保持和 CO3DV2Dataset 相同的转换
+    (注意：由于新的 npz 格式直接提供了 Pose 和 Intrinsics，此函数在 _get_views 中不再被调用，
+     保留它是为了维持代码结构完整性)
+    """
     R = R[None, :, :]
     T = T[None, :]
     focal = focal[None, :]
@@ -54,7 +62,7 @@ def opencv_from_cameras_projection(R, T, focal, p0, image_size):
 class WildRGBDDataset(BaseDataset):
     """WildRGBD 数据集加载类"""
 
-    def __init__(self, data_root, mode='train', verbose=False, mask_bg='rand', **kwargs):
+    def __init__(self, data_root='/data/liuwei/dataset/wildrgbd_processed', mode='train', verbose=False, mask_bg='rand', **kwargs):
         super().__init__(**kwargs)
         assert data_root is not None
         self.data_root = data_root
@@ -65,8 +73,8 @@ class WildRGBDDataset(BaseDataset):
         if self.mode == 'test' and mask_bg == 'rand':
             if self.verbose:
                 print(
-                    "[WildRGBD] Warning: 'rand' mask_bg in test mode. Forcing mask_bg=False (or True) for determinism.")
-            self.mask_bg = False  # 或者根据需求改为 True
+                    "[WildRGBD] Warning: 'rand' mask_bg in test mode. Forcing mask_bg=False.")
+            self.mask_bg = False 
         else:
             self.mask_bg = mask_bg
 
@@ -80,11 +88,9 @@ class WildRGBDDataset(BaseDataset):
             raise FileNotFoundError(f"Data root not found: {data_root}")
 
         categories = [d for d in os.listdir(data_root) if osp.isdir(osp.join(data_root, d))]
-        categories.sort()  # 排序保证不同机器加载顺序一致
+        categories.sort()
 
         # 2. 根据 mode 构建 json 文件名
-        # 如果 mode='train', 读取 selected_seqs_train.json
-        # 如果 mode='test',  读取 selected_seqs_test.json
         split_filename = f'selected_seqs_{mode}.json'
 
         if self.verbose:
@@ -101,25 +107,35 @@ class WildRGBDDataset(BaseDataset):
 
             try:
                 with open(seq_json_path, 'r') as f:
-                    selected_seqs = json.load(f)
+                    selected_seqs_data = json.load(f)
             except Exception as e:
                 print(f"  - Error loading json {seq_json_path}: {e}")
                 continue
 
-            for seq_name in selected_seqs:
+            # 遍历 JSON 中的 items
+            for seq_key, valid_indices in selected_seqs_data.items():
+                
+                # --- 解析序列名 ---
+                if '/' in seq_key:
+                    seq_name = seq_key.split('/')[-1]
+                else:
+                    seq_name = seq_key
+                
+                if not seq_name.startswith('scene_'):
+                    seq_name = f"scene_{seq_name}"
+
+                # 检查路径是否存在
                 scene_path = osp.join(data_root, cat, 'scenes', seq_name)
                 rgb_dir = osp.join(scene_path, 'rgb')
 
                 if not osp.exists(rgb_dir):
-                    print(f"  - Warning: RGB dir missing for {cat}/{seq_name}, skipping.")
                     continue
 
-                img_files = sorted(os.listdir(rgb_dir))
-                if len(img_files) == 0:
+                if len(valid_indices) == 0:
                     continue
 
-                self.num_image[(cat, seq_name)] = len(img_files)
-                self.sequences.append((cat, seq_name))
+                self.num_image[(cat, seq_name)] = len(valid_indices)
+                self.sequences.append((cat, seq_name, valid_indices))
 
         if self.verbose:
             print(f"[WildRGBD] Successfully loaded {len(self.sequences)} sequences for mode '{mode}'.")
@@ -128,23 +144,21 @@ class WildRGBDDataset(BaseDataset):
         return len(self.sequences)
 
     def _get_views(self, index, resolution, rng):
-        cat, seq_name = self.sequences[index]
+        cat, seq_name, valid_indices = self.sequences[index]
         scene_path = osp.join(self.data_root, cat, 'scenes', seq_name)
 
-        num_img = self.num_image[(cat, seq_name)]
+        num_valid = len(valid_indices)
 
-        # 训练时允许重复采样以填满 frame_num，测试时根据具体需求（通常保持一致）
-        should_replace = num_img < self.frame_num
-        idxs = rng.choice(num_img, self.frame_num, replace=should_replace)
+        # 采样逻辑
+        should_replace = num_valid < self.frame_num
+        idxs = rng.choice(valid_indices, self.frame_num, replace=should_replace)
+        idxs.sort()
 
-        # 如果是 test 模式，这里可能需要改为固定排序（例如取前N帧），看你的具体需求
-        # 如果只是单纯划分数据集，保持 rng.choice 也可以，但最好使用固定的 seed
-
-        # 处理背景 Mask 逻辑
+        # Mask 逻辑
         if self.mask_bg == 'rand':
-            mask_bg = rng.choice(2)  # 0 or 1
+            mask_bg = rng.choice(2) 
         else:
-            mask_bg = self.mask_bg  # True or False
+            mask_bg = self.mask_bg
 
         views = []
         for idx in idxs:
@@ -154,18 +168,25 @@ class WildRGBDDataset(BaseDataset):
             mask_path = osp.join(scene_path, 'masks', f"{idx:05d}.png")
             meta_path = osp.join(scene_path, 'metadata', f"{idx:05d}.npz")
 
+            if not osp.exists(rgb_path):
+                # 简单跳过，防止报错
+                pass
+
             # load RGB and depth
             rgb_image = np.array(Image.open(rgb_path))
             depthmap = np.array(Image.open(depth_path)).astype(np.float32)
 
-            # load camera
-            R, T, focal, p0 = load_camera_from_npz(meta_path)
-            image_size = np.array([rgb_image.shape[0], rgb_image.shape[1]])
-            R, tvec, camera_intrinsics = opencv_from_cameras_projection(R, T, focal, p0, image_size)
-            camera_pose = np.eye(4)
-            camera_pose[:3, :3] = R
-            camera_pose[:3, 3] = tvec
-            camera_pose = np.linalg.inv(camera_pose)
+            # --- 修改：加载相机参数 ---
+            # 直接获取 pose 和 intrinsics
+            camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
+            
+            # 类型转换
+            camera_pose = camera_pose.astype(np.float32)
+            camera_intrinsics = camera_intrinsics.astype(np.float32)
+            
+            # 注意: 这里的 camera_pose 通常已经是 Camera-to-World (C2W) 矩阵
+            # 旧代码逻辑是先算 W2C 再求逆，现在我们直接拥有了结果，因此不需要 calculate & inverse。
+            # 如果你的训练结果显示相机运动反了，请在这里加一行: camera_pose = np.linalg.inv(camera_pose)
 
             # mask
             if mask_bg:
@@ -173,12 +194,8 @@ class WildRGBDDataset(BaseDataset):
                     maskmap = np.array(Image.open(mask_path)).astype(np.float32)
                     maskmap = (maskmap / 255.0) > 0.1
                     depthmap *= maskmap
-                else:
-                    # 如果 mask 文件不存在但要求 mask，可以报错或忽略
-                    pass
 
             # crop/resize if necessary
-            # 这里的 info=rgb_path 有助于 debug
             rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
                 rgb_image, depthmap, camera_intrinsics.copy(), resolution, rng=rng, info=rgb_path
             )

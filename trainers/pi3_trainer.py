@@ -5,6 +5,7 @@ from datasets.base.base_dataset import sample_resolutions
 import hydra
 
 from pi3.models.loss import Pi3Loss
+from pi3.models.loss_3dgs import Pi3LossGS
 
 class Pi3Trainer(BaseTrainer):
     def __init__(self, cfg):
