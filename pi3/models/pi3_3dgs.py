@@ -42,7 +42,7 @@ class MemDebug:
         current = torch.cuda.memory_allocated()
         peak = torch.cuda.max_memory_allocated()
         diff = current - self.last_mem
-        print(f"🔴 [MEM] {tag:<25} | Curr: {current/1024**3:5.2f}GB | Peak: {peak/1024**3:5.2f}GB | Diff: {diff/1024**3:+5.2f}GB")
+        # print(f"🔴 [MEM] {tag:<25} | Curr: {current/1024**3:5.2f}GB | Peak: {peak/1024**3:5.2f}GB | Diff: {diff/1024**3:+5.2f}GB")
         sys.stdout.flush() 
         self.last_mem = current
 
@@ -61,7 +61,7 @@ class Pi3_3DGS(nn.Module):
             num_anchors=16384,
             num_sky_anchors=1024,
             K=4,
-            debug_mem=True 
+            debug_mem=False 
     ):
         super().__init__()
         self.debug_mem = debug_mem 
@@ -232,7 +232,7 @@ class Pi3_3DGS(nn.Module):
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
     # ------------------------------------------------------------------
-    # [修改] 使用 Matmul 替换 Einsum，并加强显存管理
+    # [修改] 使用 Matmul 替换 Einsum，并加强显存管理 + CUDA Fix
     # ------------------------------------------------------------------
     def _forward_geometry_branch(self, hidden, pos, H, W, B, N, patch_h, patch_w, device):
         # 1. Run Decoders
@@ -265,16 +265,17 @@ class Pi3_3DGS(nn.Module):
             camera_poses = self.camera_head(cam_feat, patch_h, patch_w).reshape(B, N, 4, 4)
 
             # --- Global Transform (REPLACING EINSUM) ---
-            # Original: einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))
-            # Einsum 在 Backward 时可能会申请巨大的 workspace，改用显式 matmul
             
             # 1. Prepare Points: (B, N, H, W, 4) -> (B, N, H*W, 4) -> (B, N, 4, H*W)
             local_points_h = homogenize_points(local_points)
-            # 确保 flatten 后是 contiguous 的
-            flat_local_points = local_points_h.view(B, N, -1, 4).transpose(2, 3) # -> (B, N, 4, HW)
+            
+            # [CRITICAL FIX] 必须加上 .contiguous()
+            # transpose 返回的是 stride 不连续的 tensor，在混合精度训练(BF16/FP16)时
+            # 直接传给 torch.matmul 会触发 CUBLAS_STATUS_INTERNAL_ERROR
+            flat_local_points = local_points_h.view(B, N, -1, 4).transpose(2, 3).contiguous()
             
             # 2. Matmul: (B, N, 4, 4) @ (B, N, 4, HW) -> (B, N, 4, HW)
-            # 这通常比 einsum 在 backward 时更稳定
+            # 此时输入已经是连续内存，cuBLAS 可以正常工作
             transformed_points = torch.matmul(camera_poses, flat_local_points) 
             
             # 3. Reshape back: (B, N, 4, HW) -> (B, N, HW, 4) -> (B, N, H, W, 4)

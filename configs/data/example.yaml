@@ -44,7 +44,7 @@ train_dataset:
     wildrgbd:
         _target_: datasets.wildrgbd_dataset.WildRGBDDataset
         z_far: 0
-        frame_num: 4
+        frame_num: 8
         aug_crop: 16
         transform:
             _partial_: true
@@ -87,7 +87,7 @@ test_dataset:
     wildrgbd:
         _target_: datasets.wildrgbd_dataset.WildRGBDDataset
         z_far: 0
-        frame_num: 2
+        frame_num: 8
         resolution:
             - [518, 336]
         transform:

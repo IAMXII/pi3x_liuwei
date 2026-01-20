@@ -184,10 +184,17 @@ class SlotAttention(nn.Module):
         return x
 
 
+# transformer_head.py
+
+# ... (前面的 Import 和 其他类如 TransformerDecoder 保持不变) ...
+
+# 确保引入 checkpoint
+from torch.utils.checkpoint import checkpoint
+
 class AnchorGaussianHead(nn.Module):
     def __init__(self,
                  embed_dim,
-                 in_channels=2048,  # <--- [FIX] 新增参数：输入特征的通道数
+                 in_channels=2048,
                  num_sky_anchors=1024,
                  patch_size=14,
                  K=4,
@@ -210,7 +217,6 @@ class AnchorGaussianHead(nn.Module):
         self.sky_anchor_query = nn.Parameter(torch.randn(num_sky_anchors, embed_dim))
 
         # 3. Feature Upsampler
-        # [FIX] 关键修改：第一层 ConvTranspose2d 的输入通道改为 in_channels (2048)
         self.feat_upsampler = nn.Sequential(
             nn.ConvTranspose2d(in_channels, embed_dim // 2, kernel_size=2, stride=2),
             nn.BatchNorm2d(embed_dim // 2), nn.ReLU(),
@@ -220,7 +226,6 @@ class AnchorGaussianHead(nn.Module):
         # 4. Attention & Gating
         self.slot_attention = SlotAttention(embed_dim)
 
-        # Input: [Mean, Var] -> Gating
         self.gating_mlp = nn.Sequential(
             nn.Linear(embed_dim + 1, 64), nn.ReLU(),
             nn.Linear(64, 1), nn.Sigmoid()
@@ -239,120 +244,190 @@ class AnchorGaussianHead(nn.Module):
         self.geo_head = nn.Sequential(nn.Linear(embed_dim, 128), nn.ReLU(), nn.Linear(128, 11 * self.K))
         self.color_head = nn.Sequential(nn.Linear(embed_dim, 128), nn.ReLU(), nn.Linear(128, 3 * self.K))
 
+    def _compact_batch(self, tensors_dict, mask, B):
+        """
+        [Speed Optimized] Vectorized compaction using argsort.
+        No more python loops over batch dimension.
+        """
+        # 1. 计算每个 batch 保留的数量
+        # mask: [B, N_total]
+        valid_counts = mask.sum(dim=1)  # [B]
+        max_valid = int(valid_counts.max().item())
+        
+        if max_valid == 0:
+            max_valid = 1
+            mask[:, 0] = True
+            valid_counts[:] = 1
+
+        # 2. 生成排序索引
+        # 将 mask 转为 int，True(1) 会排在 False(0) 前面 (descending=True)
+        # 这样所有有效的点都会被集中到 Tensor 的左侧
+        # stable=True 保持点原本的相对顺序（对渲染稳定性很重要）
+        sorted_idxs = torch.argsort(mask.int(), dim=1, descending=True, stable=True)
+        
+        # 截取前 max_valid 个索引
+        # [B, max_valid]
+        gather_idxs = sorted_idxs[:, :max_valid]
+
+        out_dict = {}
+        
+        # 3. 批量 Gather
+        for name, tensor in tensors_dict.items():
+            # tensor: [B, N_total, C]
+            C = tensor.shape[-1]
+            
+            # 扩展索引以匹配通道数: [B, max_valid, C]
+            expanded_idxs = gather_idxs.unsqueeze(-1).expand(B, max_valid, C)
+            
+            # 一次性提取所有 Batch 的数据
+            compacted = torch.gather(tensor, 1, expanded_idxs)
+            
+            # 此时右侧可能混入了原本 mask 为 False 的点（如果该 batch 有效点少于 max_valid）
+            # 我们需要在后续渲染或 loss 中使用 valid_counts/num_near 来忽略它们
+            # _render_gs 已经处理了 num_near，所以这里直接输出即可
+            out_dict[name] = compacted
+            
+        return out_dict, valid_counts
+
+    def _decode_heavy(self, slots):
+        geo_raw = self.geo_head(slots)
+        color_raw = self.color_head(slots)
+        split_prob = self.split_head(slots)
+        return geo_raw, color_raw, split_prob
+
     def forward(self, tokens, camera_poses, img_shape, selected_anchors,
                 global_tokens=None, anchor_confidence=None):
-        """
-        tokens: [B, S, D_in] (Backbone output, D_in is usually 2048)
-        """
         B = camera_poses.shape[0]
         N_views = camera_poses.shape[1]
 
         # --- 1. Prepare Anchors ---
-        anchors_obj = selected_anchors  # [B, M_obj, 3]
-
+        anchors_obj = selected_anchors
         sky_dirs = F.normalize(self.sky_anchor_dir, dim=-1)
-        anchors_sky = (sky_dirs * self.sky_radius).unsqueeze(0).expand(B, -1, -1)  # [B, M_sky, 3]
-
+        anchors_sky = (sky_dirs * self.sky_radius).unsqueeze(0).expand(B, -1, -1)
+        
+        # Position Encoding
         query_obj = self.pos_encoder(anchors_obj)
         query_sky = self.pos_encoder(sky_dirs.unsqueeze(0).expand(B, -1, -1)) + \
                     self.sky_anchor_query.unsqueeze(0).expand(B, -1, -1)
-        query_total = torch.cat([query_obj, query_sky], dim=1)  # [B, M_total, D]
+        query_total = torch.cat([query_obj, query_sky], dim=1)
 
         # --- 2. Feature Handling ---
         H, W = img_shape
         h_p, w_p = H // self.patch_size, W // self.patch_size
-
-        # tokens shape [B, N*h*w, 2048] -> reshape to image layout
-        # Upsample Features: [B*N, 2048, h, w] -> [B*N, embed_dim, h*2, w*2]
-        feats = tokens.view(B, N_views, h_p, w_p, -1).permute(0, 1, 4, 2, 3)  # [B, N, C_in, H, W]
-        feats = feats.reshape(B * N_views, -1, h_p, w_p)
         
-        # 这里之前报错是因为 feats 是 2048 通道，而 conv 期望 1024
-        # 现在修改了 __init__，应该匹配了
-        feats_high = self.feat_upsampler(feats)  # [BN, D_embed, H*2, W*2]
+        feats = tokens.view(B, N_views, h_p, w_p, -1).permute(0, 1, 4, 2, 3)
+        feats = feats.reshape(B * N_views, -1, h_p, w_p)
+        feats_high = self.feat_upsampler(feats)
 
-        # --- 3. Sampling (Projection) ---
+        # --- 3. Sampling ---
         sampled_features = []
-        anchors_all = torch.cat([anchors_obj, anchors_sky], dim=1)  # [B, M_tot, 3]
-
+        anchors_all = torch.cat([anchors_obj, anchors_sky], dim=1)
+        
         for v in range(N_views):
-            pose = camera_poses[:, v]  # [B, 4, 4]
-            inv_pose = torch.inverse(pose)  # W2C
+            pose = camera_poses[:, v]
+            inv_pose = torch.inverse(pose)
             R, T = inv_pose[:, :3, :3], inv_pose[:, :3, 3:]
-
-            # Project
             p_cam = torch.matmul(R, anchors_all.transpose(1, 2)) + T
             depth = p_cam[:, 2:3, :] + 1e-5
             uv = p_cam[:, :2, :] / depth
-            grid = uv.transpose(1, 2).unsqueeze(1)  # [B, 1, M, 2]
-
-            # Sample
+            grid = uv.transpose(1, 2).unsqueeze(1)
+            
             curr_feat = feats_high[B * v: B * (v + 1)]
             sampled = F.grid_sample(curr_feat, grid, align_corners=True, padding_mode='border')
             sampled_features.append(sampled.squeeze(2).permute(0, 2, 1))
 
-        # [B, M, N, D]
         multi_view_feats = torch.stack(sampled_features, dim=2)
 
         # --- 4. Gating & Slot Attention ---
         feat_mean = multi_view_feats.mean(dim=2)
-        feat_var = multi_view_feats.var(dim=2).mean(dim=-1, keepdim=True)  # Variance for gating
+        feat_var = multi_view_feats.var(dim=2).mean(dim=-1, keepdim=True)
+        gate_score = self.gating_mlp(torch.cat([feat_mean, feat_var], dim=-1))
 
-        gate_score = self.gating_mlp(torch.cat([feat_mean, feat_var], dim=-1))  # [B, M, 1]
-
-        # Slot Attention
         slots = self.slot_attention(query_total, multi_view_feats)
-        slots = slots + query_total  # Residual
+        slots = slots + query_total
 
-        # [Innovation B] Global Context Modulation
         if global_tokens is not None:
             slots = self.global_modulator(slots, global_tokens)
 
         # --- 5. Decode ---
         M_total = slots.shape[1]
-        geo_raw = self.geo_head(slots).view(B, M_total, self.K, 11)
-        color_raw = self.color_head(slots).view(B, M_total, self.K, 3)
+        
+        if self.training:
+             geo_raw, color_raw, split_prob = checkpoint(
+                 self._decode_heavy, slots, use_reentrant=False
+             )
+        else:
+             geo_raw, color_raw, split_prob = self._decode_heavy(slots)
 
-        # [Innovation A] Split Probability
-        split_prob = self.split_head(slots).view(B, M_total, 1, 1)
+        geo_raw = geo_raw.view(B, M_total, self.K, 11)
+        color_raw = color_raw.view(B, M_total, self.K, 3)
+        split_prob = split_prob.view(B, M_total, 1, 1)
 
         base_xyz = anchors_all.unsqueeze(2).expand(-1, -1, self.K, -1)
-
         d_xyz = torch.tanh(geo_raw[..., :3]) * 0.1
         final_xyz = base_xyz + d_xyz
         rot = F.normalize(geo_raw[..., 3:7], dim=-1)
-
+        
         scale = torch.sigmoid(geo_raw[..., 7:10]) * 0.05
-        # Sky scale boost
+        # Sky scale
         is_sky = torch.zeros((B, M_total, self.K, 1), device=slots.device)
         is_sky[:, anchors_obj.shape[1]:] = 1.0
         scale = scale * (1.0 + is_sky * 50.0)
 
-        # Apply Split Logic
-        split_mask = torch.ones_like(scale)
-        split_mask[:, :, 1:, :] = split_prob
-        scale = scale * split_mask
-
+        # Opacity & Color
         opacity = torch.sigmoid(geo_raw[..., 10:11])
         final_color = torch.sigmoid(color_raw)
-
-        # Apply Gating
         final_opacity = opacity * gate_score.unsqueeze(2)
 
-        # [Innovation D] Uncertainty-guided Pruning
         if anchor_confidence is not None:
             sky_conf = torch.ones((B, self.num_sky_anchors, 1), device=slots.device) * 10.0
             full_conf = torch.cat([anchor_confidence, sky_conf], dim=1)
             conf_prob = torch.sigmoid(full_conf).unsqueeze(2).expand(-1, -1, self.K, 1)
             final_opacity = final_opacity * conf_prob
+            
+        # =========================================================
+        # [MEMORY OPTIMIZATION] Hard Selection / Pruning
+        # =========================================================
+        
+        # Split Logic
+        split_prob_expanded = torch.ones_like(final_opacity) 
+        split_prob_expanded[:, :, 1:, :] = split_prob
+        split_mask = split_prob_expanded > 0.5 
+        
+        scale_mod = torch.ones_like(scale)
+        scale_mod[:, :, 1:, :] = split_prob
+        scale = scale * scale_mod
 
-        return {
-            "xyz": final_xyz.reshape(B, -1, 3),
-            "opacity": final_opacity.reshape(B, -1, 1),
-            "scale": scale.reshape(B, -1, 3),
-            "rotation": rot.reshape(B, -1, 4),
-            "color": final_color.reshape(B, -1, 3),
-            "gate_score": gate_score,
-            "num_near": torch.full((B,), anchors_obj.shape[1] * self.K, dtype=torch.long, device=slots.device),
-            "base_anchors": base_xyz.reshape(B, -1, 3)
+        # [FIX]: 使用 reshape 代替 view，防止 "view size is not compatible" 错误
+        # 因为 base_xyz 是 expand 出来的，非连续，view 会报错
+        flat_xyz = final_xyz.reshape(B, -1, 3)
+        flat_opacity = final_opacity.reshape(B, -1, 1)
+        flat_scale = scale.reshape(B, -1, 3)
+        flat_rot = rot.reshape(B, -1, 4)
+        flat_color = final_color.reshape(B, -1, 3)
+        flat_base = base_xyz.reshape(B, -1, 3) # <--- Fixed here
+        
+        flat_mask = split_mask.reshape(B, -1)
+
+        # Compact Tensors
+        tensors_to_compact = {
+            "xyz": flat_xyz,
+            "opacity": flat_opacity,
+            "scale": flat_scale,
+            "rotation": flat_rot,
+            "color": flat_color,
+            "base_anchors": flat_base
         }
+        
+        compacted_dict, num_near = self._compact_batch(tensors_to_compact, flat_mask, B)
+        
+        compacted_dict["num_near"] = num_near
+        compacted_dict["gate_score"] = gate_score 
+        
+        return compacted_dict
+
+    def _decode_heavy(self, slots):
+        geo_raw = self.geo_head(slots)
+        color_raw = self.color_head(slots)
+        split_prob = self.split_head(slots)
+        return geo_raw, color_raw, split_prob
