@@ -617,7 +617,7 @@ class Pi3_3DGS(nn.Module):
         
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
-    def _forward_geometry_branch(self, hidden, pos,camera_poses, H, W, B, N, patch_h, patch_w, device):
+    def _forward_geometry_branch(self, hidden, pos, H, W, B, N, patch_h, patch_w, device):
         # 1. Run Decoders
         point_hidden = self.point_decoder(hidden, xpos=pos)
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
@@ -644,16 +644,16 @@ class Pi3_3DGS(nn.Module):
             camera_hidden = camera_hidden.float()
             cam_feat = camera_hidden[:, self.patch_start_idx:].contiguous()
             del camera_hidden
-            pred_camera_poses = self.camera_head(cam_feat, patch_h, patch_w).reshape(B, N, 4, 4)
+            camera_poses = self.camera_head(cam_feat, patch_h, patch_w).reshape(B, N, 4, 4)
 
             # --- Global Transform ---
             local_points_h = homogenize_points(local_points)
             flat_local_points = local_points_h.view(B, N, -1, 4).transpose(2, 3).contiguous()
-            transformed_points = torch.matmul(camera_poses, flat_local_points) 
+            transformed_points = torch.matmul(camera_poses, flat_local_points)
             transformed_points = transformed_points.transpose(2, 3).reshape(B, N, H, W, 4)
             points_global = transformed_points[..., :3].contiguous()
 
-        return points_global, conf_logits, local_points, pred_camera_poses
+        return points_global, conf_logits, local_points, camera_poses
 
     def _filter_anchors(self, points_global, conf_logits, local_points, device, B):
         mask_conf = torch.sigmoid(conf_logits[..., 0]) > 0.1
@@ -717,8 +717,8 @@ class Pi3_3DGS(nn.Module):
         
         # [优化 5] 彻底移除 Checkpoint
         # A6000 显存足够，直接运行以提升速度
-        points_global, conf_logits, local_points, pred_camera_poses = self._forward_geometry_branch(
-            hidden, pos,camera_poses, H, W, B, N, patch_h, patch_w, imgs.device
+        points_global, conf_logits, local_points, camera_poses = self._forward_geometry_branch(
+            hidden, pos, H, W, B, N, patch_h, patch_w, imgs.device
         )
         mem.step("After Geo Branch")
 
@@ -731,7 +731,7 @@ class Pi3_3DGS(nn.Module):
         # 6. Gaussian Head
         gaussians = self.gaussian_head(
             tokens=patch_tokens_flat,
-            camera_poses=pred_camera_poses,
+            camera_poses=camera_poses,
             img_shape=(H, W),
             selected_anchors=selected_anchors,
             global_tokens=global_tokens, 
