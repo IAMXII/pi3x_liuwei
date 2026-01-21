@@ -747,11 +747,12 @@ class AnchorGaussianHead(nn.Module):
         split_prob = split_prob.view(B, M_total, 1, 1)
 
         base_xyz = anchors_all.unsqueeze(2).expand(-1, -1, self.K, -1)
-        d_xyz = torch.tanh(geo_raw[..., :3]) * 0.1
+        d_xyz = torch.tanh(geo_raw[..., :3]) * 0.5
         final_xyz = base_xyz + d_xyz
         rot = F.normalize(geo_raw[..., 3:7], dim=-1)
         
-        scale = torch.sigmoid(geo_raw[..., 7:10]) * 0.05
+        # scale = torch.sigmoid(geo_raw[..., 7:10])
+        scale = torch.exp(geo_raw[..., 7:10]) * 0.01  # 基础大小 + 动态调整
         # Sky scale
         is_sky = torch.zeros((B, M_total, self.K, 1), device=slots.device)
         is_sky[:, anchors_obj.shape[1]:] = 1.0
