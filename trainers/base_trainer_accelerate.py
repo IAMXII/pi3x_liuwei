@@ -298,7 +298,7 @@ class BaseTrainer:
                 outputs = self.calculate_loss(
                     outputs, 
                     batch, 
-                    mode='train',  # 注意：保持 mode='train' 意味着计算 Loss，如果不需要计算 Loss 可改为 'test'
+                    mode='test',  # 注意：保持 mode='train' 意味着计算 Loss，如果不需要计算 Loss 可改为 'test'
                     current_epoch=epoch, 
                     total_epochs=self.cfg.train.num_epoch
                 )

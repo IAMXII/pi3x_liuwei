@@ -79,7 +79,8 @@ class Pi3Trainer(BaseTrainer):
             
     def forward_batch(self, batch, mode='train'):
         imgs = torch.stack([view['img'] for view in batch], dim=1)
-        pred = self.model(imgs)
+        camera_poses = torch.stack([view['camera_pose'] for view in batch], dim=1)
+        pred = self.model(imgs,camera_poses)
 
         return [pred, batch]
     
