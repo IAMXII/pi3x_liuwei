@@ -477,7 +477,7 @@ class Pi3_3DGS(nn.Module):
         
         # [优化 3] 减少 Decoder 层数：36 -> 12
         # A6000 足够跑，但为了速度，Decoder 不需要那么深
-        dec_depth = 12 if decoder_size == 'large' else 6 
+        dec_depth = 36 if decoder_size == 'large' else 36 
         print(f"🚀 [Optimization] Decoder depth set to: {dec_depth}")
 
         self.dec_embed_dim = dec_embed_dim
