@@ -294,7 +294,7 @@ class Pi3LossGS(nn.Module):
             lambda_ssim=0.2,
             lambda_depth=0.1,
             # [优化 1] Repulsion 默认为 0，如需开启建议设得很小
-            lambda_repulsion=0.0, 
+            lambda_repulsion=0.01, 
             lambda_sparsity=0.005,
             lambda_consist=0.05,
             warmup_ratio=0.3  # [新增参数] 默认为 0.5，即前 50% epoch 不开启正则
