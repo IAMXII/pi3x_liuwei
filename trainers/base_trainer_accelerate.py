@@ -293,7 +293,15 @@ class BaseTrainer:
 
                 # Forward pass
                 outputs = self.forward_batch(batch, mode='test')
-                outputs = self.calculate_loss(outputs, batch, mode='train')
+                
+                # [修改点 1] 传递 current_epoch 和 total_epochs 到 calculate_loss
+                outputs = self.calculate_loss(
+                    outputs, 
+                    batch, 
+                    mode='train',  # 注意：保持 mode='train' 意味着计算 Loss，如果不需要计算 Loss 可改为 'test'
+                    current_epoch=epoch, 
+                    total_epochs=self.cfg.train.num_epoch
+                )
                 loss = outputs.loss
 
                 # Gather statistics
@@ -346,7 +354,16 @@ class BaseTrainer:
                 batch = move_to_device(batch, device=self.accelerator.device)
                 with self.accelerator.autocast():
                     forward_output = self.forward_batch(batch, mode='train')
-                batch_output = self.calculate_loss(forward_output, batch, mode='train')
+                
+                # [修改点 2] 传递 current_epoch 和 total_epochs 到 calculate_loss
+                batch_output = self.calculate_loss(
+                    forward_output, 
+                    batch, 
+                    mode='train', 
+                    current_epoch=epoch, 
+                    total_epochs=self.cfg.train.num_epoch
+                )
+                
                 loss = batch_output.loss
                 if loss > self.cfg.train.clip_loss:
                     loss = loss * 0.0
@@ -462,7 +479,8 @@ class BaseTrainer:
         assert isinstance(output, EasyDict)
         return output
 
-    def calculate_loss(self, output, batch, mode='train'):
+    # [修改点 3] 更新函数签名，接收 current_epoch 和 total_epochs
+    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None):
         pass
 
     def build_accelerator(self):

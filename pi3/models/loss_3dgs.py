@@ -296,7 +296,8 @@ class Pi3LossGS(nn.Module):
             # [优化 1] Repulsion 默认为 0，如需开启建议设得很小
             lambda_repulsion=0.0, 
             lambda_sparsity=0.005,
-            lambda_consist=0.05
+            lambda_consist=0.05,
+            warmup_ratio=0.3  # [新增参数] 默认为 0.5，即前 50% epoch 不开启正则
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -305,6 +306,7 @@ class Pi3LossGS(nn.Module):
         self.lambda_repulsion = lambda_repulsion
         self.lambda_sparsity = lambda_sparsity
         self.lambda_consist = lambda_consist
+        self.warmup_ratio = warmup_ratio # 保存参数
 
     def prepare_gt(self, gt):
         """处理输入的 C2W 并转换为渲染所需的 W2C 和归一化尺度"""
@@ -421,7 +423,14 @@ class Pi3LossGS(nn.Module):
             
         return loss / B
 
-    def forward(self, pred, gt_raw):
+    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None):
+        """
+        Args:
+            pred: 模型预测输出
+            gt_raw: Ground Truth 数据
+            current_epoch: 当前的 epoch 数 (从 0 开始)
+            total_epochs: 总共训练的 epoch 数
+        """
         # 1. 准备 GT
         gt = self.prepare_gt(gt_raw)
 
@@ -432,22 +441,23 @@ class Pi3LossGS(nn.Module):
         gauss = pred['gaussians']
         num_near = gauss.get('num_near', None) 
         
-        # 2. 渲染 RGB
+        # 2. 渲染 RGB (始终计算)
         rgb_full, _, _ = self._render_gs(
             gauss, render_w2c, render_ks, H, W, 
             num_gaussians=num_near, render_mode='RGB'
         )
 
-        # 3. 渲染深度
+        # 3. 渲染深度 (始终计算)
         depth_near = None
-        if num_near is not None:
+        # 如果需要计算 depth loss，则渲染深度图
+        if self.lambda_depth > 0 and num_near is not None:
             depth_near_map, _, _ = self._render_gs(
                 gauss, render_w2c, render_ks, H, W, 
                 num_gaussians=num_near, render_mode='ED'
             )
             depth_near = depth_near_map
 
-        # 4. 计算损失
+        # 4. 计算基础损失 (RGB, SSIM, Depth) - 始终处于激活状态
         rgb_full = rgb_full.reshape(B * N, H, W, 3).permute(0, 3, 1, 2)
         gt_imgs = gt['imgs'].reshape(B * N, 3, H, W)
         
@@ -461,44 +471,51 @@ class Pi3LossGS(nn.Module):
             depth_mask = (gt_depths > 0).float()
             loss_depth = F.l1_loss(depth_near * depth_mask, gt_depths * depth_mask)
 
-        # 5. 其他正则项
+        # 5. 定义正则化项 (初始化为 0)
         loss_repulsion = torch.tensor(0.0, device=rgb_full.device)
         loss_sparsity = torch.tensor(0.0, device=rgb_full.device)
         loss_consist = torch.tensor(0.0, device=rgb_full.device) 
 
-        # [优化 3] Repulsion Loss 性能瓶颈解决
-        # 策略：仅有 10% 的概率计算此 Loss，且计算时权重放大 10 倍
-        # 这样能极大减少 O(N^2) 计算的频率，同时保持梯度期望一致
-        if self.lambda_repulsion > 0 and num_near is not None:
-            if torch.rand(1).item() < 0.1:
-                loss_repulsion = self._calc_repulsion_loss(gauss['xyz'], num_near) * 10.0
-            else:
-                # 不计算时必须保留一个梯度挂载点，防止 DDP 报错
-                # loss_repulsion = 0.0 * gauss['xyz'].sum() 
-                pass
+        # ==========================================
+        # 策略逻辑: 根据 warmup_ratio 决定是否开启正则化
+        # ==========================================
+        enable_regularization = True
+        
+        # 如果传入了 epoch 信息，且当前 epoch 小于 设定的比例，则关闭正则化
+        if current_epoch is not None and total_epochs is not None:
+            if current_epoch < (total_epochs * self.warmup_ratio):
+                enable_regularization = False
+        
+        if enable_regularization:
+            # [优化 3] Repulsion Loss
+            if self.lambda_repulsion > 0 and num_near is not None:
+                # 依然保持 10% 概率采样策略
+                if torch.rand(1).item() < 0.1:
+                    loss_repulsion = self._calc_repulsion_loss(gauss['xyz'], num_near) * 10.0
+            
+            # Sparsity
+            if self.lambda_sparsity > 0:
+                opacity = gauss['opacity'] 
+                total_sparsity = 0.0
+                for b in range(B):
+                    n = int(num_near[b].item())
+                    if n > 0:
+                        total_sparsity += opacity[b, :n].mean()
+                loss_sparsity = total_sparsity / B
 
-        # Sparsity
-        if self.lambda_sparsity > 0:
-            opacity = gauss['opacity'] 
-            total_sparsity = 0.0
-            for b in range(B):
-                n = int(num_near[b].item())
-                if n > 0:
-                    total_sparsity += opacity[b, :n].mean()
-            loss_sparsity = total_sparsity / B
+            # Geometry Consistency
+            if self.lambda_consist > 0 and 'base_anchors' in gauss:
+                xyz = gauss['xyz']
+                base = gauss['base_anchors']
+                total_consist = 0.0
+                for b in range(B):
+                    n = int(num_near[b].item())
+                    if n > 0:
+                        diff = xyz[b, :n] - base[b, :n]
+                        total_consist += torch.norm(diff, dim=-1).mean()
+                loss_consist = total_consist / B
 
-        # Geometry Consistency
-        if self.lambda_consist > 0 and 'base_anchors' in gauss:
-            xyz = gauss['xyz']
-            base = gauss['base_anchors']
-            total_consist = 0.0
-            for b in range(B):
-                n = int(num_near[b].item())
-                if n > 0:
-                    diff = xyz[b, :n] - base[b, :n]
-                    total_consist += torch.norm(diff, dim=-1).mean()
-            loss_consist = total_consist / B
-
+        # 6. 汇总 Loss
         final_loss = (
                 self.lambda_rgb * loss_rgb +
                 self.lambda_ssim * loss_ssim +
@@ -515,7 +532,8 @@ class Pi3LossGS(nn.Module):
             "loss_repulsion": loss_repulsion,
             "loss_sparsity": loss_sparsity,
             "loss_consist": loss_consist,
-            "total_loss": final_loss
+            "total_loss": final_loss,
+            "reg_enabled": float(enable_regularization) # 方便在 log 中监控当前是否开启了正则
         }
 
         return final_loss, details
