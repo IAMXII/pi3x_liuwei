@@ -28,7 +28,7 @@ class Pi3LossGS(nn.Module):
             lambda_sparsity=0.005,
             lambda_consist=0.05,
             lambda_pose=0.1,
-            warmup_ratio=0.3
+            warmup_ratio=0.5
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
