@@ -90,7 +90,7 @@ class Pi3Trainer(BaseTrainer):
             loss, details = self.train_loss(output, batch,current_epoch=current_epoch, 
             total_epochs=total_epochs)
         else:
-            loss, details = self.test_loss(output, batchcurrent_epoch=current_epoch, 
+            loss, details = self.test_loss(output, batch,current_epoch=current_epoch, 
             total_epochs=total_epochs)
 
         return EasyDict(
