@@ -203,8 +203,11 @@ class Pi3LossGS(nn.Module):
                 log_target = torch.log(t_masked + epsilon)
                 
                 # 2. Compute L1 Loss in Log Space
-                loss_depth = F.l1_loss(log_pred, log_target)
-                
+                # loss_depth = F.l1_loss(log_pred, log_target)
+                log_pred_centered = log_pred - log_pred.mean()
+                log_target_centered = log_target - log_target.mean()
+
+                loss_depth = F.l1_loss(log_pred_centered, log_target_centered)
                 # Optional: Calculate scale just for visualization/logging purposes
                 # (Since we are using Log loss, we don't strictly align the scale for the loss itself anymore, 
                 # but knowing the scale factor is useful for debugging)
