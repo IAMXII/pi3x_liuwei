@@ -752,7 +752,9 @@ class AnchorGaussianHead(nn.Module):
         rot = F.normalize(geo_raw[..., 3:7], dim=-1)
         
         # scale = torch.sigmoid(geo_raw[..., 7:10])
-        scale = torch.exp(geo_raw[..., 7:10]) * 0.01  # 基础大小 + 动态调整
+        # scale = torch.exp(geo_raw[..., 7:10]) * 0.01  # 基础大小 + 动态调整
+        scale_base = F.softplus(geo_raw[..., 7:10]) 
+        scale = scale_base * 0.05 + 0.005  # 最小 0.005，基础放大系数 0.05
         # Sky scale
         is_sky = torch.zeros((B, M_total, self.K, 1), device=slots.device)
         is_sky[:, anchors_obj.shape[1]:] = 1.0

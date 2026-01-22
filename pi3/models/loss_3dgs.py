@@ -23,7 +23,7 @@ class Pi3LossGS(nn.Module):
             self,
             lambda_rgb=1.0,
             lambda_ssim=0.5,
-            lambda_depth=0.02,
+            lambda_depth=0.2,
             lambda_repulsion=0.01,
             lambda_sparsity=0.005,
             lambda_consist=0.05,
