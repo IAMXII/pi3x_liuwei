@@ -689,7 +689,7 @@ class Pi3_3DGS(nn.Module):
 
         return torch.stack(selected_anchors_list), torch.stack(selected_conf_list)
 
-    def forward(self, imgs,camera_poses):
+    def forward(self, imgs):
         mem = MemDebug(active=self.debug_mem)
         mem.step("Start Forward")
         

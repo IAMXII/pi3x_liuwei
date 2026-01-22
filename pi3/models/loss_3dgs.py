@@ -22,8 +22,8 @@ class Pi3LossGS(nn.Module):
     def __init__(
             self,
             lambda_rgb=1.0,
-            lambda_ssim=0.2,
-            lambda_depth=0.1,
+            lambda_ssim=0.5,
+            lambda_depth=0.02,
             lambda_repulsion=0.01,
             lambda_sparsity=0.005,
             lambda_consist=0.05,
@@ -101,7 +101,7 @@ class Pi3LossGS(nn.Module):
             opacities=opacities.squeeze(-1).contiguous(),
             colors=colors.contiguous(),
             viewmats=w2c,
-            Ks=ks,
+            Ks=ks,  # Note: gsplat argument is usually ks or Ks depending on version, keeping your code
             width=W, height=H,
             render_mode=render_mode,
             packed=False
@@ -133,7 +133,7 @@ class Pi3LossGS(nn.Module):
 
         return loss / B
 
-    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None, enable_pose_loss=True):
+    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None, enable_pose_loss=False):
         """
         Args:
             pred: Model prediction output (must contain 'gaussians' and 'camera_poses')
@@ -180,16 +180,40 @@ class Pi3LossGS(nn.Module):
         loss_ssim = 1.0 - ssim(rgb_full, gt_imgs, data_range=1.0)
 
         loss_depth = torch.tensor(0.0, device=rgb_full.device)
+        depth_scale_scalar = 1.0  # For logging
+
         if depth_near is not None:
-            # Absolute Depth Constraint
-            # Compare rendered depth (from predicted pose) directly to GT depth
-            target_depth = gt_depths.reshape(B * N, H, W, 1)
-            pred_depth = depth_near.reshape(B * N, H, W, 1)
+            # Flatten tensors for easier processing
+            target_depth = gt_depths.reshape(-1)
+            pred_depth = depth_near.reshape(-1)
 
-            # Apply valid mask (e.g., ignore depth=0 regions in GT)
-            valid_depth_mask = (target_depth > 0).float()
+            # Mask for valid GT depth (GT > 1e-4)
+            valid_mask = (target_depth > 1e-4)
 
-            loss_depth = F.l1_loss(pred_depth * valid_depth_mask, target_depth * valid_depth_mask)
+            # --- [Modified] Logarithmic Depth Loss ---
+            if valid_mask.sum() > 10:  # Ensure enough points for stability
+                t_masked = target_depth[valid_mask]
+                p_masked = pred_depth[valid_mask]
+                
+                # 1. Log Transform
+                # Apply log(x + epsilon) to prevent NaN and handle scale
+                # Log loss treats multiplicative error as additive error: log(p/t) = log(p) - log(t)
+                epsilon = 1e-7
+                log_pred = torch.log(p_masked + epsilon)
+                log_target = torch.log(t_masked + epsilon)
+                
+                # 2. Compute L1 Loss in Log Space
+                loss_depth = F.l1_loss(log_pred, log_target)
+                
+                # Optional: Calculate scale just for visualization/logging purposes
+                # (Since we are using Log loss, we don't strictly align the scale for the loss itself anymore, 
+                # but knowing the scale factor is useful for debugging)
+                with torch.no_grad():
+                    dot_pt = (p_masked * t_masked).sum()
+                    dot_pp = (p_masked.pow(2)).sum()
+                    scale = dot_pt / (dot_pp + 1e-8)
+                    depth_scale_scalar = scale.item()
+            # -------------------------------------------
 
         # 6. Compute Camera Pose Loss (Direct Supervision)
         loss_pose_R = torch.tensor(0.0, device=rgb_full.device)
@@ -256,6 +280,7 @@ class Pi3LossGS(nn.Module):
             "loss_gs_rgb": loss_rgb,
             "loss_gs_ssim": loss_ssim,
             "loss_gs_depth": loss_depth,
+            "depth_scale": depth_scale_scalar,  # 增加了这个便于监控缩放比例
             "loss_pose_R": loss_pose_R,
             "loss_pose_T": loss_pose_T,
             "loss_repulsion": loss_repulsion,
