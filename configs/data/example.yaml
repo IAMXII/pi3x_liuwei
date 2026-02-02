@@ -8,6 +8,7 @@ train_dataset:
         # ScanNet: 20000
         # CO3DV2: 10000
         wildrgbd: 10000
+        matrixcity: 10000
 
     # TarTanAir:
     #     _target_: datasets.tartanair_dataset.TarTanAirDataset
@@ -51,6 +52,17 @@ train_dataset:
             _target_: datasets.base.transforms.JitterJpegLossBlurring
         aug_focal: 0.9
         mode: 'train'
+    
+    matrixcity:
+        _target_: datasets.matrixcity_dataset.MatrixCityDataset
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: 'train'
 
 
 train_dataloader:
@@ -62,6 +74,7 @@ test_dataset:
         # ScanNet: 2000
         # CO3DV2: 2000
         wildrgbd: 2000
+        matrixcity: 2000
 
     # ScanNet:
     #     _target_: datasets.scannet_dataset.ScannetDataset
@@ -86,6 +99,16 @@ test_dataset:
     #     mode: 'test'
     wildrgbd:
         _target_: datasets.wildrgbd_dataset.WildRGBDDataset
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+    matrixcity:
+        _target_: datasets.matrixcity_dataset.MatrixCityDataset
         z_far: 0
         frame_num: 8
         resolution:
