@@ -14,7 +14,6 @@ def load_camera_from_npz(npz_path):
     
     # 修改：直接读取 camera_pose 和 camera_intrinsics
     # 假设 npz 中的键名为 'camera_pose' 和 'camera_intrinsics'
-    # 如果键名是大写 ('Camera Pose'), 请将下面改为 data['Camera Pose']
     camera_pose = data['camera_pose']            # 4x4
     camera_intrinsics = data['camera_intrinsics'] # 3x3
     
@@ -69,16 +68,9 @@ class WildRGBDDataset(BaseDataset):
         self.mode = mode
         self.verbose = verbose
 
-        # 针对 test 模式的特殊处理：如果是测试，通常不希望随机mask背景
-        if self.mode == 'test' and mask_bg == 'rand':
-            if self.verbose:
-                print(
-                    "[WildRGBD] Warning: 'rand' mask_bg in test mode. Forcing mask_bg=False.")
-            self.mask_bg = False 
-        else:
-            self.mask_bg = mask_bg
-
-        assert self.mask_bg in (True, False, 'rand')
+        # --- 修改：删除了 mask_bg 的逻辑处理 ---
+        # 即使传入 mask_bg 参数，本类现在也会忽略它
+        self.mask_bg = False 
 
         self.sequences = []
         self.num_image = {}
@@ -154,18 +146,14 @@ class WildRGBDDataset(BaseDataset):
         idxs = rng.choice(valid_indices, self.frame_num, replace=should_replace)
         idxs.sort()
 
-        # Mask 逻辑
-        if self.mask_bg == 'rand':
-            mask_bg = rng.choice(2) 
-        else:
-            mask_bg = self.mask_bg
+        # --- 修改：删除了 mask_bg 的随机选择逻辑 ---
 
         views = []
         for idx in idxs:
             fname = f"{idx:05d}.jpg"
             rgb_path = osp.join(scene_path, 'rgb', fname)
             depth_path = osp.join(scene_path, 'depth', f"{idx:05d}.png")
-            mask_path = osp.join(scene_path, 'masks', f"{idx:05d}.png")
+            # --- 修改：删除了 mask_path 定义 ---
             meta_path = osp.join(scene_path, 'metadata', f"{idx:05d}.npz")
 
             if not osp.exists(rgb_path):
@@ -176,7 +164,7 @@ class WildRGBDDataset(BaseDataset):
             rgb_image = np.array(Image.open(rgb_path))
             depthmap = np.array(Image.open(depth_path)).astype(np.float32)
 
-            # --- 修改：加载相机参数 ---
+            # --- 加载相机参数 ---
             # 直接获取 pose 和 intrinsics
             camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
             
@@ -184,16 +172,8 @@ class WildRGBDDataset(BaseDataset):
             camera_pose = camera_pose.astype(np.float32)
             camera_intrinsics = camera_intrinsics.astype(np.float32)
             
-            # 注意: 这里的 camera_pose 通常已经是 Camera-to-World (C2W) 矩阵
-            # 旧代码逻辑是先算 W2C 再求逆，现在我们直接拥有了结果，因此不需要 calculate & inverse。
-            # 如果你的训练结果显示相机运动反了，请在这里加一行: camera_pose = np.linalg.inv(camera_pose)
-
-            # mask
-            if mask_bg:
-                if osp.exists(mask_path):
-                    maskmap = np.array(Image.open(mask_path)).astype(np.float32)
-                    maskmap = (maskmap / 255.0) > 0.1
-                    depthmap *= maskmap
+            # --- 修改：删除了 Mask 读取和处理逻辑 ---
+            # 原有的 mask 读取、二值化以及 depthmap *= maskmap 代码已移除
 
             # crop/resize if necessary
             rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
