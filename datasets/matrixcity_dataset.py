@@ -26,7 +26,7 @@ def load_camera_from_npz(npz_path):
 class MatrixCityDataset(BaseDataset):
     """MatrixCity 数据集加载类 (使用 .npz metadata 和 .exr depth)"""
 
-    def __init__(self, data_root, mode='train', verbose=False, **kwargs):
+    def __init__(self, data_root='/data/liuwei/dataset/matrixcity_processed', mode='train', verbose=False, **kwargs):
         super().__init__(**kwargs)
         assert data_root is not None
         self.data_root = data_root
