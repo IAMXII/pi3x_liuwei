@@ -223,7 +223,7 @@ class BaseTrainer:
                     self.cfg.log.ckpt_dir,
                     "best_model",
                 )
-                self.accelerator.save_state(best_model_path, safe_serialization=False)
+                self.accelerator.save_state(best_model_path, safe_serialization=True)
                 self.log_info(f"Saved best model at epoch {epoch} with val_metric: {best_val_metric:.4f}")
 
             self.accelerator.wait_for_everyone()
@@ -237,7 +237,7 @@ class BaseTrainer:
                         self.cfg.log.ckpt_dir,
                         f"checkpoint_{epoch}",
                     )
-                    self.accelerator.save_state(save_path, safe_serialization=False)
+                    self.accelerator.save_state(save_path, safe_serialization=True)
                     self.log_info(
                         f"Saved state for global step {self.global_step}"
                     )
@@ -608,23 +608,21 @@ class BaseTrainer:
 
         if path is None:
             self.log_info("Checkpoint does not exist. Starting a new training run.")
-            
             start_epoch = 0
         else:
             self.log_info(f"Resuming from checkpoint {path}")
-            self.accelerator.load_state(
-                # os.path.join(self.cfg.log.ckpt_dir, path)
-                path
-            )
+            self.accelerator.load_state(path)
+            
             # Extract epoch number from checkpoint path
-            # Handles both "checkpoint_N" and "best_model" formats
             if "checkpoint_" in path:
                 # Extract epoch from "checkpoint_N" format
                 checkpoint_name = path.rstrip('/').split('/')[-1]
-                start_epoch = int(checkpoint_name.split("checkpoint_")[-1])
+                # FIX: Add +1 because checkpoint is saved AFTER the epoch finishes
+                start_epoch = int(checkpoint_name.split("checkpoint_")[-1]) + 1
             else:
-                # For "best_model" or other formats, start from epoch 0
-                # This is correct for stage transitions where we want to reset the epoch counter
+                # For "best_model", strictly speaking we should probably not resume training 
+                # loop logic from it unless we know the epoch, but defaulting to 0 is risky
+                # if the scheduler is loaded. For now, keep as 0 or consider handling best_model differently.
                 start_epoch = 0
 
         return start_epoch
