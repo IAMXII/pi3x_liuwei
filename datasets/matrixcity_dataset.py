@@ -172,7 +172,8 @@ class MatrixCityDataset(BaseDataset):
             # --- 1. Load RGB ---
             if not osp.exists(rgb_path):
                 # 简单跳过或返回黑图
-                rgb_image = np.zeros((resolution[0], resolution[1], 3), dtype=np.uint8)
+                # rgb_image = np.zeros((resolution[0], resolution[1], 3), dtype=np.uint8)
+                continue
             else:
                 # rgb_image = np.array(Image.open(rgb_path))
                 img = Image.open(rgb_path).convert("RGB")
@@ -181,7 +182,8 @@ class MatrixCityDataset(BaseDataset):
             # --- 2. Load Depth (EXR) ---
             if not osp.exists(depth_path):
                 # 如果没有深度图，返回全0
-                depthmap = np.zeros((rgb_image.shape[0], rgb_image.shape[1]), dtype=np.float32)
+                # depthmap = np.zeros((rgb_image.shape[0], rgb_image.shape[1]), dtype=np.float32)
+                continue
             else:
                 # 使用 cv2 读取 .exr 文件，flag=-1 保持原始深度数据 (float32)
                 depthmap = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
@@ -198,8 +200,9 @@ class MatrixCityDataset(BaseDataset):
                 camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
             else:
                 # 缺省相机参数
-                camera_pose = np.eye(4, dtype=np.float32)
-                camera_intrinsics = np.eye(3, dtype=np.float32)
+                continue
+                # camera_pose = np.eye(4, dtype=np.float32)
+                # camera_intrinsics = np.eye(3, dtype=np.float32)
 
             # 类型转换
             camera_pose = camera_pose.astype(np.float32)

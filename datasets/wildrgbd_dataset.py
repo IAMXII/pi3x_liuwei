@@ -159,6 +159,10 @@ class WildRGBDDataset(BaseDataset):
             if not osp.exists(rgb_path):
                 # 简单跳过，防止报错
                 pass
+            if not osp.exists(depth_path):
+                pass
+            if not osp.exists(meta_path):
+                pass
 
             # load RGB and depth
             rgb_image = np.array(Image.open(rgb_path))
