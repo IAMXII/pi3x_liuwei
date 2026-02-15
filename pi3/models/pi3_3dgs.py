@@ -552,33 +552,88 @@ class Pi3_3DGS(nn.Module):
         if not train_conf: freeze_all_params([self.conf_decoder, self.conf_head])
         if not train_cam: freeze_all_params([self.camera_decoder, self.camera_head])
 
+    # def _load_vggt_weights(self):
+    #     print("Loading VGGT weights...")
+    #     try:
+    #         vggt_weight = load_file('ckpts/model.safetensors')
+    #         vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''): vggt_weight[k] for k in
+    #                            list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
+    #         self.encoder.load_state_dict(vggt_enc_weight, strict=False)
+
+    #         vggt_dec_weight = {k.replace('aggregator.global_blocks.', ''): vggt_weight[k] for k in
+    #                            list(vggt_weight.keys()) if k.startswith('aggregator.global_blocks.')}
+    #         vggt_dec_weight1 = {}
+    #         for k in list(vggt_dec_weight.keys()):
+    #             idx = k.split('.')[0]
+    #             other = k[len(idx):]
+    #             vggt_dec_weight1[f'{int(idx) * 2 + 1}{other}'] = vggt_dec_weight[k]
+    #         vggt_dec_weight = vggt_dec_weight1
+
+    #         vggt_dec_weight_frame = {k.replace('aggregator.frame_blocks.', ''): vggt_weight[k] for k in
+    #                                  list(vggt_weight.keys()) if k.startswith('aggregator.frame_blocks.')}
+    #         for k in list(vggt_dec_weight_frame.keys()):
+    #             idx = k.split('.')[0]
+    #             other = k[len(idx):]
+    #             vggt_dec_weight[f'{int(idx) * 2}{other}'] = vggt_dec_weight_frame[k]
+    #         self.decoder.load_state_dict(vggt_dec_weight, strict=False)
+    #         print("VGGT weights loaded successfully.")
+    #     except Exception as e:
+    #         print(f"Warning: Failed to load VGGT weights: {e}")
+
     def _load_vggt_weights(self):
-        print("Loading VGGT weights...")
+        # 这里的路径可以改为你最新的 safetensors 路径
+        checkpoint_path = 'ckpts/model.safetensors'
+        print(f"Loading weights from {checkpoint_path}...")
+        
         try:
-            vggt_weight = load_file('ckpts/model.safetensors')
-            vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''): vggt_weight[k] for k in
-                               list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
-            self.encoder.load_state_dict(vggt_enc_weight, strict=False)
+            # 使用 safetensors 加载
+            state_dict = load_file(checkpoint_path)
+            
+            # [关键判断] 检查是否存在原始 VGGT 的特定前缀
+            # 如果包含 'aggregator.'，说明是原始权重，需要执行复杂的 Key 转换
+            is_raw_vggt = any(k.startswith('aggregator.') for k in state_dict.keys())
 
-            vggt_dec_weight = {k.replace('aggregator.global_blocks.', ''): vggt_weight[k] for k in
-                               list(vggt_weight.keys()) if k.startswith('aggregator.global_blocks.')}
-            vggt_dec_weight1 = {}
-            for k in list(vggt_dec_weight.keys()):
-                idx = k.split('.')[0]
-                other = k[len(idx):]
-                vggt_dec_weight1[f'{int(idx) * 2 + 1}{other}'] = vggt_dec_weight[k]
-            vggt_dec_weight = vggt_dec_weight1
+            if is_raw_vggt:
+                print("Detected raw VGGT format. Applying manual mapping...")
+                # --- 1. Encoder 映射 ---
+                vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''): state_dict[k] for k in
+                                   list(state_dict.keys()) if k.startswith('aggregator.patch_embed.')}
+                self.encoder.load_state_dict(vggt_enc_weight, strict=False)
 
-            vggt_dec_weight_frame = {k.replace('aggregator.frame_blocks.', ''): vggt_weight[k] for k in
-                                     list(vggt_weight.keys()) if k.startswith('aggregator.frame_blocks.')}
-            for k in list(vggt_dec_weight_frame.keys()):
-                idx = k.split('.')[0]
-                other = k[len(idx):]
-                vggt_dec_weight[f'{int(idx) * 2}{other}'] = vggt_dec_weight_frame[k]
-            self.decoder.load_state_dict(vggt_dec_weight, strict=False)
-            print("VGGT weights loaded successfully.")
+                # --- 2. Decoder 映射 ---
+                vggt_dec_weight = {k.replace('aggregator.global_blocks.', ''): state_dict[k] for k in
+                                   list(state_dict.keys()) if k.startswith('aggregator.global_blocks.')}
+                vggt_dec_weight1 = {}
+                for k in list(vggt_dec_weight.keys()):
+                    idx = k.split('.')[0]
+                    other = k[len(idx):]
+                    vggt_dec_weight1[f'{int(idx) * 2 + 1}{other}'] = vggt_dec_weight[k]
+                vggt_dec_weight = vggt_dec_weight1
+
+                vggt_dec_weight_frame = {k.replace('aggregator.frame_blocks.', ''): state_dict[k] for k in
+                                         list(state_dict.keys()) if k.startswith('aggregator.frame_blocks.')}
+                for k in list(vggt_dec_weight_frame.keys()):
+                    idx = k.split('.')[0]
+                    other = k[len(idx):]
+                    vggt_dec_weight[f'{int(idx) * 2}{other}'] = vggt_dec_weight_frame[k]
+                
+                self.decoder.load_state_dict(vggt_dec_weight, strict=False)
+            
+            else:
+                print("Detected trained Pi3_3DGS format. Direct loading...")
+                # 如果是你训练过的模型，Key 已经是 encoder.xxx, decoder.xxx, gaussian_head.xxx
+                # 直接通过主模型加载，strict=False 以免因为新增小组件报错
+                missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
+                
+                if missing_keys:
+                    print(f"Missing keys (randomly initialized): {len(missing_keys)} keys")
+                if unexpected_keys:
+                    print(f"Unexpected keys (ignored): {len(unexpected_keys)} keys")
+
+            print("Weights loaded successfully.")
+            
         except Exception as e:
-            print(f"Warning: Failed to load VGGT weights: {e}")
+            print(f"Warning: Failed to load weights: {e}")
 
     def decode(self, hidden, N, H, W, mem_debug=None):
         BN, hw, _ = hidden.shape

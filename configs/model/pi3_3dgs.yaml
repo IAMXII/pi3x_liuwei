@@ -9,7 +9,7 @@ model:
     # use_global_points: false
     train_conf: false
     num_dec_blk_not_to_checkpoint: 4
-    ckpt: 'ckpts/model.safetensors' # <path-to-your-pretrain-checkpoint>
+    ckpt: none #'ckpts/pi3/model_pi3.safetensors' # <path-to-your-pretrain-checkpoint>
 
 loss:
     train_loss:
@@ -23,7 +23,7 @@ loss:
 train:
     num_workers: 16
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 20 #80
+    num_epoch: 12 #80
     iters_per_epoch: 20000 # 800
 
     print_freq: 40
