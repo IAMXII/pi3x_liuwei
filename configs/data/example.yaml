@@ -1,7 +1,7 @@
 # @package _global_
 
 train_dataset:
-    length: 2000000         # dummy
+    length: 2500000         # dummy
 
     weights: 
         # TarTanAir: 8000
@@ -9,6 +9,9 @@ train_dataset:
         # CO3DV2: 10000
         wildrgbd: 10000
         matrixcity: 10000
+        co3dv2: 10000
+        # mapfree: 10000
+        midair: 10000
 
     # TarTanAir:
     #     _target_: datasets.tartanair_dataset.TarTanAirDataset
@@ -63,6 +66,36 @@ train_dataset:
             _target_: datasets.base.transforms.JitterJpegLossBlurring
         aug_focal: 0.9
         mode: 'train'
+    co3dv2:
+        _target_: datasets.co3dv2_dataset.CO3DV2Dataset
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: 'train'
+    # mapfree:
+    #     _target_: datasets.mapfree_dataset.MapFreeDataset
+    #     z_far: 0
+    #     frame_num: 8
+    #     aug_crop: 16
+    #     transform:
+    #         _partial_: true
+    #         _target_: datasets.base.transforms.JitterJpegLossBlurring
+    #     aug_focal: 0.9
+    #     mode: 'train'
+    midair:
+        _target_: datasets.midair_dataset.MidAirDataset
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: 'train'
 
 
 train_dataloader:
@@ -75,6 +108,9 @@ test_dataset:
         # CO3DV2: 2000
         wildrgbd: 2000
         matrixcity: 2000
+        co3dv2: 2000
+        # mapfree: 2000
+        midair: 2000
 
     # ScanNet:
     #     _target_: datasets.scannet_dataset.ScannetDataset
@@ -109,6 +145,36 @@ test_dataset:
         mode: 'test'
     matrixcity:
         _target_: datasets.matrixcity_dataset.MatrixCityDataset
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+    co3dv2:
+        _target_: datasets.co3dv2_dataset.CO3DV2Dataset
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+    # mapfree:
+    #     _target_: datasets.mapfree_dataset.MapFreeDataset
+    #     z_far: 0
+    #     frame_num: 8
+    #     resolution:
+    #         - [518, 336]
+    #     transform:
+    #         _partial_: true
+    #         _target_: datasets.base.transforms.ImgToTensor
+    #     mode: 'test'
+    midair:
+        _target_: datasets.midair_dataset.MidAirDataset
         z_far: 0
         frame_num: 8
         resolution:

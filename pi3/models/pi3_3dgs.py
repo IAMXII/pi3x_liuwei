@@ -555,7 +555,7 @@ class Pi3_3DGS(nn.Module):
     def _load_vggt_weights(self):
         print("Loading VGGT weights...")
         try:
-            vggt_weight = load_file('ckpts/pi3/model_pi3.safetensors')
+            vggt_weight = load_file('ckpts/model.safetensors')
             vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''): vggt_weight[k] for k in
                                list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
             self.encoder.load_state_dict(vggt_enc_weight, strict=False)
