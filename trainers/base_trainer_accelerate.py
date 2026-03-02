@@ -423,9 +423,15 @@ class BaseTrainer:
                     # if start_steps % log_interval == 0:
                     #     self.log_all(batch_output, start_steps, prefix='train')
                     # # ------------------- [修改结束] -------------------
-                    if start_steps % 10 == 0 :
+                    # ------------------- [修改开始] -------------------
+                    # 这里的 log_all 会调用 self.accelerator.log，进而同步到 WandB
+                    if start_steps % 40 == 0 : # 设置为 40 个 iter 刷新一次
                         self.log_all(batch_output, start_steps, prefix='train')
+                    # ------------------- [修改结束] -------------------
                     metric_logger.update(**batch_output)
+                    # if start_steps % 10 == 0 :
+                    #     self.log_all(batch_output, start_steps, prefix='train')
+                    # metric_logger.update(**batch_output)
 
                     min_lr = 10.0
                     max_lr = 0.0
@@ -588,23 +594,23 @@ class BaseTrainer:
         # self.logger.rank_zero_only = False
         self.log_info(accelerator.state)
         # self.logger.rank_zero_only = True
-        # # ------------------- [修改开始] -------------------
-        # if accelerator.is_main_process:
-        #     # 准备 WandB 的初始化参数
-        #     init_kwargs = {}
-        #     if self.cfg.log.use_wandb:
-        #         init_kwargs["wandb"] = {
-        #             "name": self.cfg.log.exp_name if "exp_name" in self.cfg.log else os.path.basename(
-        #                 self.cfg.log.output_dir),
-        #             "entity": self.cfg.log.wandb_entity if "wandb_entity" in self.cfg.log else None,
-        #             # 你可以在这里添加更多 wandb.init 的参数
-        #         }
+        # ------------------- [修改开始] -------------------
+        if accelerator.is_main_process:
+            # 准备 WandB 的初始化参数
+            init_kwargs = {}
+            if self.cfg.log.use_wandb:
+                init_kwargs["wandb"] = {
+                    "name": self.cfg.log.exp_name if "exp_name" in self.cfg.log else os.path.basename(
+                        self.cfg.log.output_dir),
+                    "entity": self.cfg.log.wandb_entity if "wandb_entity" in self.cfg.log else None,
+                    # 你可以在这里添加更多 wandb.init 的参数
+                }
 
-        #     # 使用项目名称初始化 Trackers
-        #     project_name = self.cfg.log.project_name if "project_name" in self.cfg.log else "Pi3_3DGS"
-        #     accelerator.init_trackers(project_name, config=OmegaConf.to_container(self.cfg, resolve=True),
-        #                                    init_kwargs=init_kwargs)
-        # # ------------------- [修改结束] -------------------
+            # 使用项目名称初始化 Trackers
+            project_name = self.cfg.log.project_name if "project_name" in self.cfg.log else "Pi3_3DGS"
+            accelerator.init_trackers(project_name, config=OmegaConf.to_container(self.cfg, resolve=True),
+                                           init_kwargs=init_kwargs)
+        # ------------------- [修改结束] -------------------
         if self.cfg.random_seed is not None:
             set_seed(self.cfg.random_seed, device_specific=True)
 
