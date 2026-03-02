@@ -447,7 +447,7 @@ class Pi3_3DGS(nn.Module):
             num_anchors=16384,
             num_sky_anchors=1024,
             K=4,
-            debug_mem=False 
+            debug_mem=False
     ):
         super().__init__()
         self.debug_mem = debug_mem 
@@ -527,7 +527,7 @@ class Pi3_3DGS(nn.Module):
             num_sky_anchors=num_sky_anchors,
             patch_size=self.patch_size,
             K=K,
-            global_dim=self.dec_embed_dim * 2 
+            global_dim=self.dec_embed_dim * 2
         )
 
         # Utils
@@ -672,7 +672,7 @@ class Pi3_3DGS(nn.Module):
         
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
-    def _forward_geometry_branch(self, hidden, pos, H, W, B, N, patch_h, patch_w, device):
+    def _forward_geometry_branch(self, hidden, pos, H, W, B, N, patch_h, patch_w,intrinsics, device):
         # 1. Run Decoders
         point_hidden = self.point_decoder(hidden, xpos=pos)
         conf_hidden = self.conf_decoder(hidden, xpos=pos)
@@ -685,10 +685,30 @@ class Pi3_3DGS(nn.Module):
             del point_hidden 
             
             ret = self.point_head([points_feat], (H, W)).reshape(B, N, H, W, -1)
-            xy, z = ret.split([2, 1], dim=-1)
-            z = torch.exp(z)
-            local_points = torch.cat([xy * z, z], dim=-1)
+            # xy, z = ret.split([2, 1], dim=-1)
+            # z = torch.exp(z)
+            # local_points = torch.cat([xy * z, z], dim=-1)   ### liuwei0219
+            # 【核心修改区开始】
+            # 不再使用网络预测的 xy，只取深度 z
+            z = torch.exp(ret[..., 2:3]) 
             
+            # 生成标准的图像像素网格 (u, v)，+0.5 定位到像素中心
+            grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+            u = grid_x.float().view(1, 1, H, W, 1).expand(B, N, H, W, 1) + 0.5
+            v = grid_y.float().view(1, 1, H, W, 1).expand(B, N, H, W, 1) + 0.5
+            
+            # 提取内参 (假设 intrinsics shape 为 [B, N, 3, 3])
+            fx = intrinsics[:, :, 0, 0].view(B, N, 1, 1, 1)
+            fy = intrinsics[:, :, 1, 1].view(B, N, 1, 1, 1)
+            cx = intrinsics[:, :, 0, 2].view(B, N, 1, 1, 1)
+            cy = intrinsics[:, :, 1, 2].view(B, N, 1, 1, 1)
+            
+            # 使用内参反投影到相机坐标系
+            x = (u - cx) * z / fx
+            y = (v - cy) * z / fy
+            
+            local_points = torch.cat([x, y, z], dim=-1)
+            # 【核心修改区结束】
             # --- Conf ---
             conf_hidden = conf_hidden.float()
             conf_feat = conf_hidden[:, self.patch_start_idx:].contiguous()
@@ -744,7 +764,7 @@ class Pi3_3DGS(nn.Module):
 
         return torch.stack(selected_anchors_list), torch.stack(selected_conf_list)
 
-    def forward(self, imgs):
+    def forward(self, imgs, intrinsics):
         mem = MemDebug(active=self.debug_mem)
         mem.step("Start Forward")
         
@@ -773,7 +793,7 @@ class Pi3_3DGS(nn.Module):
         # [优化 5] 彻底移除 Checkpoint
         # A6000 显存足够，直接运行以提升速度
         points_global, conf_logits, local_points, camera_poses = self._forward_geometry_branch(
-            hidden, pos, H, W, B, N, patch_h, patch_w, imgs.device
+            hidden, pos, H, W, B, N, patch_h, patch_w, intrinsics=intrinsics, device=imgs.device
         )
         mem.step("After Geo Branch")
 
@@ -787,6 +807,7 @@ class Pi3_3DGS(nn.Module):
         gaussians = self.gaussian_head(
             tokens=patch_tokens_flat,
             camera_poses=camera_poses,
+            intrinsics=intrinsics,
             img_shape=(H, W),
             selected_anchors=selected_anchors,
             global_tokens=global_tokens, 

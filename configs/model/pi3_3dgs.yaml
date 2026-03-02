@@ -48,7 +48,7 @@ train:
     rank: -1
     gpu: -1
     dist_on_itp: false
-    find_unused_parameters: false
+    find_unused_parameters: true
 
     # for distributed training
     distributed: false
