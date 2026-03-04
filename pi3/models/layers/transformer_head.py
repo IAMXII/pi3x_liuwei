@@ -364,8 +364,11 @@ class AnchorGaussianHead(nn.Module):
         if self.training:
             # --- 训练阶段：软掩码 (Soft Masking) ---
             # 1. 梯度保留：直接相乘，网络通过压低 split_prob 来使 opacity 趋近 0
-            final_opacity = final_opacity * split_prob_expanded
-            
+            # final_opacity = final_opacity * split_prob_expanded
+            epsilon = 0.01 
+            final_opacity = final_opacity * (split_prob_expanded + epsilon)
+            # 确保不会超过 1.0
+            final_opacity = torch.clamp(final_opacity, max=1.0)
             # 2. 展平张量，不进行任何丢弃
             flat_xyz = final_xyz.reshape(B, -1, 3)
             flat_opacity = final_opacity.reshape(B, -1, 1)

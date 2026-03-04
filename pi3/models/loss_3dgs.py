@@ -133,7 +133,7 @@ class Pi3LossGS(nn.Module):
 
         return loss / B
 
-    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None, enable_pose_loss=False, depth_only_ratio=0.2, rgb_depth_ratio=0.4):
+    def forward(self, pred, gt_raw, current_epoch=None, total_epochs=None, enable_pose_loss=False, depth_only_ratio=0, rgb_depth_ratio=0.5):
         """
         Args:
             pred: Model prediction output (must contain 'gaussians' and 'camera_poses')
@@ -229,7 +229,27 @@ class Pi3LossGS(nn.Module):
             )
             rgb_full = rgb_full.reshape(B * N, H, W, 3).permute(0, 3, 1, 2)
             gt_imgs_reshaped = gt_imgs.reshape(B * N, 3, H, W)
-
+            # # ===================================================================
+            # # 🔍 [DEBUG] 检查图像值域匹配度
+            # # ===================================================================
+            # with torch.no_grad():
+            #     gt_min, gt_max = gt_imgs.min().item(), gt_imgs.max().item()
+            #     pred_min, pred_max = rgb_full.min().item(), rgb_full.max().item()
+                
+            #     # 允许极微小的浮点误差 (1e-4)，如果超出则报警
+            #     if gt_min < -1e-4 or gt_max > 1.0001:
+            #         print("\n" + "!"*60, flush=True)
+            #         print("🚨 致命警告: 发现 GT 图像值域异常！这会导致 SSIM 失效！", flush=True)
+            #         print(f"👉 GT 图像 (gt_imgs) 值域范围:   [{gt_min:.4f}, {gt_max:.4f}]",flush=True)
+            #         print(f"👉 渲染图像 (rgb_full) 值域范围: [{pred_min:.4f}, {pred_max:.4f}]",flush=True)
+                    
+            #         if gt_min < 0:
+            #             print("💡 诊断: 你的 GT 图像似乎包含了负数！可能是因为 DataLoader 里的",flush=True)
+            #             print("   Normalize(mean=[0.485...], std=[0.229...]) 操作污染了 GT 数据。",flush=True)
+            #         elif gt_max > 2.0:
+            #             print("💡 诊断: 你的 GT 图像可能还是 [0, 255] 的 uint8/float 格式，未归一化！",flush=True)
+            #         print("!"*60 + "\n", flush=True)
+            # # ===================================================================
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
 

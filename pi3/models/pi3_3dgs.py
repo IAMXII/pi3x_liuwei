@@ -444,9 +444,9 @@ class Pi3_3DGS(nn.Module):
             # [优化 2] 默认禁用 checkpoint (设为极大值)
             num_dec_blk_not_to_checkpoint=1000, 
             ckpt=None,
-            num_anchors=16384,
-            num_sky_anchors=1024,
-            K=4,
+            num_anchors=131072,
+            num_sky_anchors=8196,
+            K=8,
             debug_mem=False
     ):
         super().__init__()
@@ -582,7 +582,7 @@ class Pi3_3DGS(nn.Module):
 
     def _load_vggt_weights(self):
         # 这里的路径可以改为你最新的 safetensors 路径
-        checkpoint_path = 'ckpts/model.safetensors'
+        checkpoint_path = 'ckpts/pi3/model_pi3.safetensors'
         print(f"Loading weights from {checkpoint_path}...")
         
         try:

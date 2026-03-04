@@ -380,14 +380,29 @@ class BaseTrainer:
 
                 self.accelerator.backward(loss)
 
+                # for item in batch_output:
+                #     if 'loss' in item:
+                #         batch_output[item] = self.accelerator.gather(batch_output[item]).mean().item()
+                #         if item in loss_details_dict:
+                #             loss_details_dict[item] += batch_output[item] / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
+                #         else:
+                #             loss_details_dict[item] = batch_output[item] / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
+                # ------------------- [修改开始: 收集所有数值标量] -------------------
                 for item in batch_output:
-                    if 'loss' in item:
-                        batch_output[item] = self.accelerator.gather(batch_output[item]).mean().item()
-                        if item in loss_details_dict:
-                            loss_details_dict[item] += batch_output[item] / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
-                        else:
-                            loss_details_dict[item] = batch_output[item] / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
-
+                    val = batch_output[item]
+                    
+                    # 如果是 tensor 标量，跨多卡 gather 取平均并转为 float
+                    if isinstance(val, torch.Tensor) and val.numel() == 1:
+                        # 使用 .view(-1) 防止 0-dim tensor 在 gather 时报错
+                        val = self.accelerator.gather(val.view(-1)).mean().item()
+                    elif not isinstance(val, (int, float)):
+                        continue # 跳过图片、字符串等非数值项
+                        
+                    if item in loss_details_dict:
+                        loss_details_dict[item] += val / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
+                    else:
+                        loss_details_dict[item] = val / self.cfg.train.gradient_accumulation_steps if loss_value != 0 else 0.0
+                # ------------------- [修改结束] -------------------
                 # clip the gradient
                 if self.accelerator.sync_gradients:
                     params_to_clip = self.model.parameters()
@@ -412,26 +427,20 @@ class BaseTrainer:
                     self.optimizer.zero_grad()
                 self.lr_scheduler.step()
 
-            if self.accelerator.sync_gradients:
+                if self.accelerator.sync_gradients:
                     start_steps += 1
 
-                    # Report to tensorboard
+                    # Report to tensorboard / WandB
                     batch_output.update(loss_details_dict)
                     loss_details_dict = {}
-                    # # ------------------- [修改开始] -------------------
-                    # # 这里的 log_all 会调用 self.accelerator.log，进而同步到 WandB
-                    # if start_steps % log_interval == 0:
-                    #     self.log_all(batch_output, start_steps, prefix='train')
-                    # # ------------------- [修改结束] -------------------
-                    # ------------------- [修改开始] -------------------
-                    # 这里的 log_all 会调用 self.accelerator.log，进而同步到 WandB
-                    if start_steps % 40 == 0 : # 设置为 40 个 iter 刷新一次
-                        self.log_all(batch_output, start_steps, prefix='train')
+                    
+                    # ------------------- [修改开始: 移除 40 步限制] -------------------
+                    # 每步都传给 WandB，保证没有任何 loss 数据遗漏。WandB 后台会异步上传，不卡训练。
+                    self.log_all(batch_output, start_steps, prefix='train')
                     # ------------------- [修改结束] -------------------
+                    
+                    # 控制台日志依然保留平滑打印（依赖你 config 中的 print_freq）
                     metric_logger.update(**batch_output)
-                    # if start_steps % 10 == 0 :
-                    #     self.log_all(batch_output, start_steps, prefix='train')
-                    # metric_logger.update(**batch_output)
 
                     min_lr = 10.0
                     max_lr = 0.0
@@ -474,9 +483,14 @@ class BaseTrainer:
         log_img = {}
         for k in log_keys:
             v = output[k]
-            if np.isscalar(v):
+            # ------------------- [修改开始: 增加对 Tensor 标量的兼容] -------------------
+            if isinstance(v, torch.Tensor) and v.numel() == 1:
+                v = v.item()
+                
+            if np.isscalar(v) or isinstance(v, (int, float)):
                 log_scaler[prefix+'/'+k] = v
                 continue
+            # ------------------- [修改结束] -------------------
             if Image.isImageType(v):
                 log_img[prefix+'/'+k] = v
 
