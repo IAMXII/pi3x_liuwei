@@ -1,7 +1,7 @@
 # @package _global_
 
 train_dataset:
-    length: 2500000         # dummy
+    length: 500000         # dummy
 
     weights: 
         # TarTanAir: 8000
