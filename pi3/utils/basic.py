@@ -82,6 +82,91 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     # --- 4. Stack the list of tensors into a single [N, C, H, W] batch tensor ---
     return torch.stack(tensor_list, dim=0)
 
+def load_images_and_intrinsics(path='data/truck', K=None, interval=1, PIXEL_LIMIT=255000):
+    """
+    加载图像并根据 Resize 比例同步修正相机内参。
+    K: 原始内参矩阵 [3, 3]，可以是 list, numpy array 或 torch tensor。
+    返回: (Stacked_Tensor, Updated_K)
+    """
+    import numpy as np
+    sources = []
+
+    # --- 1. 加载图像或视频帧 (保持不变) ---
+    if osp.isdir(path):
+        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        for i in range(0, len(filenames), interval):
+            img_path = osp.join(path, filenames[i])
+            try:
+                sources.append(Image.open(img_path).convert('RGB'))
+            except Exception as e:
+                print(f"Could not load image {filenames[i]}: {e}")
+    elif path.lower().endswith('.mp4'):
+        cap = cv2.VideoCapture(path)
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            if frame_idx % interval == 0:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                sources.append(Image.fromarray(rgb_frame))
+            frame_idx += 1
+        cap.release()
+    else:
+        raise ValueError(f"Unsupported path: {path}")
+
+    if not sources:
+        return torch.empty(0), None
+
+    # --- 2. 确定目标尺寸并计算内参变换 ---
+    first_img = sources[0]
+    W_orig, H_orig = first_img.size
+
+    # 原有的尺寸计算逻辑
+    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
+    W_target, H_target = W_orig * scale, H_orig * scale
+    k, m = round(W_target / 14), round(H_target / 14)
+    while (k * 14) * (m * 14) > PIXEL_LIMIT:
+        if k / m > W_target / H_target:
+            k -= 1
+        else:
+            m -= 1
+    TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
+
+    # --- 计算修正后的内参 ---
+    updated_K = None
+    if K is not None:
+        # 计算缩放比例
+        s_x = TARGET_W / W_orig
+        s_y = TARGET_H / H_orig
+
+        # 复制内参并更新 fx, fy, cx, cy
+        # K = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        updated_K = K
+        updated_K[0, 0] *= s_x  # fx
+        updated_K[1, 1] *= s_y  # fy
+        updated_K[0, 2] *= s_x  # cx
+        updated_K[1, 2] *= s_y  # cy
+
+        print(f"Resize: ({W_orig}, {H_orig}) -> ({TARGET_W}, {TARGET_H})")
+        print(f"Scale Factors: sx={s_x:.4f}, sy={s_y:.4f}")
+
+    # --- 3. Resize 和 转换 Tensor (保持不变) ---
+    tensor_list = []
+    to_tensor_transform = transforms.ToTensor()
+
+    for img_pil in sources:
+        try:
+            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            tensor_list.append(to_tensor_transform(resized_img))
+        except Exception as e:
+            print(f"Error processing image: {e}")
+
+    if not tensor_list:
+        return torch.empty(0), updated_K
+
+    # --- 4. 返回堆叠后的 Tensor 和 更新后的内参 ---
+    return torch.stack(tensor_list, dim=0), updated_K
+
 
 def tensor_to_pil(tensor):
     """
