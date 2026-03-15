@@ -9,6 +9,7 @@ import math
 import torch.nn.functional as F
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, depth_edge
+from .layers.conv_head import ConvHead
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
@@ -160,37 +161,42 @@ class Pi3_3DGS(nn.Module):
         # ----------------------
         #  Heads & Sub-Decoders
         # ----------------------
-        # 使用替换后的 ConvPts3dHead
-        self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
-        self.point_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[2, 1])
+        self.point_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim, dec_embed_dim=1024, dec_num_heads=16, out_dim=1024, rope=self.rope,
+        )
+        self.point_head = ConvHead(
+            num_features=4, dim_in=dec_embed_dim, projects=nn.Identity(), dim_out=[2, 1],
+            dim_proj=1024, dim_upsample=[256, 128, 64], dim_times_res_block_hidden=2,
+            num_res_blocks=2, res_block_norm='group_norm', last_res_blocks=0, last_conv_channels=32, last_conv_size=1, using_uv=True
+        )
 
-        self.camera_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=512, rope=self.rope, use_checkpoint=False)
+        self.camera_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim, dec_embed_dim=1024, dec_num_heads=16, out_dim=512, rope=self.rope,
+        )
         self.camera_head = CameraHead(dim=512)
 
-        # 同样使用 ConvPts3dHead 预测单个维度的置信度
-        self.conf_decoder = deepcopy(self.point_decoder)
-        self.conf_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[1])
+        self.conf_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim, dec_embed_dim=1024, dec_num_heads=16, out_dim=1024, rope=self.rope,
+        )
+        self.conf_head = ConvHead(
+            num_features=4, dim_in=dec_embed_dim, projects=nn.Identity(), dim_out=[1],
+            dim_proj=1024, dim_upsample=[256, 128, 64], dim_times_res_block_hidden=2,
+            num_res_blocks=2, res_block_norm='group_norm', last_res_blocks=0, last_conv_channels=32, last_conv_size=1, using_uv=True
+        )
 
-        # 使用 ConvDenseGaussianHead 预测高斯的所有属性
-        self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
+        self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024,dec_num_heads=16, out_dim=1024, rope=self.rope)
         self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3])
-        
-        # self.sky_head = SkyGaussianHead(
-        #     num_sky_anchors=num_sky_anchors, 
-        #     in_dim=2 * self.dec_embed_dim
-        # )
 
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         # ----------------------
-        #   VGGT Weight Loading
+        #   Weight Loading
         # ----------------------
         if load_vggt:
             vggt_weight = load_file('ckpts/pi3/model_pi3x.safetensors')
-            
             vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
-            print("Loading vggt encoder", self.encoder.load_state_dict(vggt_enc_weight, strict=False))
+            self.encoder.load_state_dict(vggt_enc_weight, strict=False)
 
             vggt_dec_weight = {k.replace('aggregator.global_blocks.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.global_blocks.')}
             vggt_dec_weight1 = {}
@@ -206,7 +212,7 @@ class Pi3_3DGS(nn.Module):
                 other = k[len(idx):]
                 vggt_dec_weight[f'{int(idx)*2}{other}'] = vggt_dec_weight_frame[k]
 
-            print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
+            self.decoder.load_state_dict(vggt_dec_weight, strict=False)
 
         if ckpt is not None:
             checkpoint_data = torch.load(ckpt, weights_only=False, map_location='cpu')
@@ -220,19 +226,21 @@ class Pi3_3DGS(nn.Module):
         self._set_stage_gradients()
 
     def _set_stage_gradients(self):
+        # ==========================================================
+        # [修改点 1] 强制冻结原始模型的 Camera(Pose) 和 Conf 相关网络参数
+        # ==========================================================
+        freeze_all_params([self.point_decoder, self.point_head])
+        freeze_all_params([self.camera_decoder, self.camera_head])
+        freeze_all_params([self.conf_decoder, self.conf_head])
+        print('Freezing the Camera (Pose) and Conf modules as requested.')
+
+        # 您的原始 Stage 控制逻辑保留
         if self.train_stage == 2:  # GS only
-            freeze_all_params([self.camera_decoder, self.camera_head])
-            freeze_all_params([self.conf_decoder, self.conf_head])
             freeze_all_params([self.decoder])
         elif self.train_stage == 3: # Conf only
-            freeze_all_params([
-                self.decoder, self.camera_decoder, self.camera_head
-            ])
+            freeze_all_params([self.decoder])
         elif self.train_stage == 1:
             freeze_all_params([self.decoder])
-            freeze_all_params([self.camera_decoder, self.camera_head])
-            freeze_all_params([self.conf_decoder, self.conf_head])
-            pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):
         BN, hw, _ = hidden.shape
@@ -276,9 +284,6 @@ class Pi3_3DGS(nn.Module):
         mem = MemDebug(active=self.debug_mem)
         B, N_total, C, H, W = imgs.shape
         
-        # ==========================================================
-        # [修改点 1] 所有图像输入 Encoder 并预测位姿
-        # ==========================================================
         imgs = (imgs - self.image_mean) / self.image_std
         imgs_flat = imgs.reshape(B * N_total, C, H, W)
         
@@ -290,56 +295,55 @@ class Pi3_3DGS(nn.Module):
         hidden, pos = self.decode(hidden, N_total, H, W, mem_debug=mem)
 
         # -----------------------------
-        # Branches: Camera Pose 对全量数据生效
+        # Branches: Camera Pose 
         # -----------------------------
         patch_h, patch_w = H // 14, W // 14
         cam_h = self.camera_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
         camera_poses = self.camera_head(cam_h, patch_h, patch_w).reshape(B, N_total, 4, 4)
         mem.step("Camera Decoder")
 
-        # ==========================================================
-        # [修改点 2] 提取 1/3 等间隔特征用于生成 Gaussian 与 Conf
-        # ==========================================================
+        # -----------------------------
+        # Geometry & Attributes
+        # -----------------------------
         sub_idx = torch.arange(0, N_total, 1, device=imgs.device)
         N_sub = len(sub_idx)
         hw = hidden.shape[1]
 
-        # 重塑并提取子集特征
         hidden_sub = hidden.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
+        # [修改点 1] 修复 Point Head 调用，使用显式的 patch_h, patch_w 和 .float()
         point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-        local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
+        xy, z = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)
+        xy = xy.permute(0, 2, 3, 1).reshape(B, N_sub, H, W, 2)
+        z = z.permute(0, 2, 3, 1).reshape(B, N_sub, H, W, 1)
+        local_xyz_raw = torch.cat([xy, z], dim=-1) # (B, N_sub, H, W, 3)
 
+        # (保留不变) gs_head 因为是 ConvDenseGaussianHead，可能确实接受 list 和 tuple 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
         gs_attrs = self.gs_head([gs_h], (H, W)).reshape(B, N_sub, H, W, 11)
 
-        if self.train_stage == 3:
-            conf_h = self.conf_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-            conf_logits = self.conf_head([conf_h], (H, W)).reshape(B, N_sub, H, W, 1)
-        else:
-            # 随便给个不占显存的 dummy tensor，防止后续取值报错
-            conf_logits = torch.zeros((B, N_sub, H, W, 1), device=hidden.device)
+        # [修改点 2] 修复 Conf Head 调用，与 Point Head 同理
+        conf_h = self.conf_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
+        conf_logits = self.conf_head(conf_h.float(), patch_h=patch_h, patch_w=patch_w)[0]
+        conf_logits = conf_logits.permute(0, 2, 3, 1).reshape(B, N_sub, H, W, 1)
+        
         mem.step("Geometry & Attributes")
-
-        # ==========================================================
-        # [修改点 3] 投影和旋转转换必须使用子集的位姿
-        # ==========================================================
+        # -----------------------------
+        # Transformation
+        # -----------------------------
         camera_poses_sub = camera_poses[:, sub_idx]
 
-        # 将 Local Point 提升至 Global
         xy, z = local_xyz_raw[..., :2], torch.exp(local_xyz_raw[..., 2:3])
         local_pts = torch.cat([xy * z, z], dim=-1)
         local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
         global_pts = torch.matmul(camera_poses_sub, local_pts_h).transpose(2, 3).reshape(B, N_sub, H, W, 4)[..., :3]
 
-        # 解析 Dense 高斯属性
         local_rot = F.normalize(gs_attrs[..., 0:4], dim=-1)
         scale = torch.exp(torch.clamp(gs_attrs[..., 4:7], min=-10.0, max=5.0)) * 0.01
         opacity = torch.sigmoid(gs_attrs[..., 7:8])
         color = torch.sigmoid(gs_attrs[..., 8:11])
 
-        # 本地旋转转全局旋转
         cam_quats_sub = matrix_to_quaternion(camera_poses_sub[..., :3, :3]).view(B, N_sub, 1, 1, 4).expand(-1, -1, H, W, -1)
         global_rot = F.normalize(quat_mult(cam_quats_sub, local_rot), dim=-1)
 
@@ -350,48 +354,48 @@ class Pi3_3DGS(nn.Module):
         d_color = color.reshape(B, -1, 3)
         d_conf = conf_logits.reshape(B, -1, 1)
 
-        # 根号 N 上限 + 置信度阈值动态概率筛选
-        num_dense = d_xyz.shape[1]
-        limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  # 这里改用 N_sub 的开方
+        # ==========================================================
+        # [修改点 2] Conf 使用逻辑重构：先掩模计算数量，再截断至满足最大限制
+        # ==========================================================
+        limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))
         if self.max_dense_gaussians is not None:
             limit_gaussians = min(limit_gaussians, self.max_dense_gaussians)
 
-        K_target = min(num_dense, limit_gaussians)
+        conf_prob = torch.sigmoid(d_conf.squeeze(-1))
+        conf_threshold = 0.1 
+        
+        # 步骤 1：先给高斯打掩模，统计满足阈值的有效数量
+        valid_mask = conf_prob > conf_threshold
+        valid_counts = valid_mask.sum(dim=1)  # 得到每个 Batch 的满足条件的高斯数
 
-        if K_target < num_dense or self.train_stage == 3:
-            if self.train_stage == 3:
-                conf_prob = torch.sigmoid(d_conf.squeeze(-1))
-                conf_threshold = 0.5 
-                
-                max_valid_in_batch = (conf_prob > conf_threshold).sum(dim=1).max().item()
-                K_target = max(min(max_valid_in_batch, limit_gaussians), 1) 
-                _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
-            else:
-                _, topk_indices = torch.topk(d_opacity.squeeze(-1), k=K_target, dim=1)
+        # 步骤 2：判断掩模后的高斯是否满足最大高斯数限制
+        # 如果有效数量超标，则截断为 limit_gaussians；未超标则保留该批次最大有效数
+        K_target = min(valid_counts.max().item(), limit_gaussians)
+        K_target = max(K_target, 1)  # 至少保留 1 个，防止维度崩溃报错
 
-            def filter_topk(tensor):
-                C = tensor.shape[-1]
-                expanded_indices = topk_indices.unsqueeze(-1).expand(-1, -1, C)
-                return torch.gather(tensor, 1, expanded_indices)
+        # 使用 topk 提取前 K_target 个高斯，确保 batch 张量维度一致对齐
+        _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
 
-            d_xyz = filter_topk(d_xyz)
-            d_rot = filter_topk(d_rot)
-            d_scale = filter_topk(d_scale)
-            d_opacity = filter_topk(d_opacity)
-            d_color = filter_topk(d_color)
-            d_conf_filtered = filter_topk(d_conf)
-            
-            if self.train_stage == 3:
-                survived_prob = torch.sigmoid(d_conf_filtered.squeeze(-1))
-                invalid_mask = (survived_prob <= conf_threshold).unsqueeze(-1)
-                d_opacity = torch.where(invalid_mask, torch.zeros_like(d_opacity), d_opacity)
+        def filter_topk(tensor):
+            C = tensor.shape[-1]
+            expanded_indices = topk_indices.unsqueeze(-1).expand(-1, -1, C)
+            return torch.gather(tensor, 1, expanded_indices)
 
-            d_conf = d_conf_filtered
-            mem.step("Dynamic Probability & Top-K Filtering")
+        d_xyz = filter_topk(d_xyz)
+        d_rot = filter_topk(d_rot)
+        d_scale = filter_topk(d_scale)
+        d_opacity = filter_topk(d_opacity)
+        d_color = filter_topk(d_color)
+        d_conf_filtered = filter_topk(d_conf)
+        
+        # 步骤 3：真正应用掩模（因为如果一个 Batch 中某个样本有效数量不足 K_target，
+        # Top-K 可能会把低于置信度的也选进来，所以必须强行将透明度置 0）
+        survived_prob = torch.sigmoid(d_conf_filtered.squeeze(-1))
+        invalid_mask = (survived_prob <= conf_threshold).unsqueeze(-1)
+        d_opacity = torch.where(invalid_mask, torch.zeros_like(d_opacity), d_opacity)
 
-        # 提取全量场景特征并传入 Sky Head (使用 N_total)
-        # global_scene_feat = hidden.view(B, N_total, hw, -1).mean(dim=(1, 2))
-        # s_xyz, s_rot, s_scale, s_opacity, s_color, s_conf_sky = self.sky_head(global_scene_feat)
+        d_conf = d_conf_filtered
+        mem.step("Masking & Limit Filtering")
         
         gaussians = {
             "xyz": d_xyz,

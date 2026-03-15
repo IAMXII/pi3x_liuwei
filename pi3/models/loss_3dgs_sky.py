@@ -253,7 +253,7 @@ class Pi3LossGS(nn.Module):
         gt = self.prepare_gt(gt_raw)
         
         B, N_total, C, H, W = gt['imgs'].shape
-        sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
+        sub_idx = torch.arange(0, N_total, 2, device=gt['imgs'].device)
         N_sub = len(sub_idx)
 
         gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
@@ -328,6 +328,25 @@ class Pi3LossGS(nn.Module):
             
         gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
         mask_depth = (gt_depth_reshaped > 1e-4)
+        ###### matrixcity depth#############
+        # 假设 max_sky_depth 是你的仿真数据集里天空深度的阈值 (比如 100.0)
+        max_sky_depth = 200
+
+        # gt_depth_reshaped 形状 [B*N, 1, H, W]
+        mask_missing = (gt_depth_reshaped < 1e-4)
+        mask_far = (gt_depth_reshaped > max_sky_depth)
+        print(gt_depth_reshaped.min(), gt_depth_reshaped.max(), mask_missing.sum(), mask_far.sum(),flush=True)
+        # 疑似天空区域：没打到的地方 + 明确是很远的地方
+        suspect_mask = mask_missing | mask_far
+        # 剔除 sky_head 的高斯，只保留 Dense 部分
+        num_sky = gauss_raw.get("num_sky", self.num_sky_anchors)
+        dense_gauss_render = {k: v[:, :-num_sky] for k, v in gauss_render.items() if k != "num_sky"}
+
+        # 渲染 Dense 部分的 Alpha (这里只需渲染 ED 或专门的 Alpha 模式以节省性能)
+        # 如果你的光栅化器支持直接吐出 transmittance 或 alpha 最好，否则可以用深度渲染通道占位
+        _, dense_alpha, _ = self._render_gs(dense_gauss_render, render_w2c, gt_ks, H, W, render_mode='ED') # 或者自定义的 Alpha 模式
+        dense_alpha = dense_alpha.reshape(B * N_total, 1, H, W)
+        ###### matrixcity depth#############
         # invalid_depth_mask = ~mask_depth
         
         # loss_dense_sparsity = torch.tensor(0.0, device=pred_c2w.device)
@@ -364,7 +383,14 @@ class Pi3LossGS(nn.Module):
             mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
             if self.lambda_depth > 0 and mask_depth.sum() > 10:
                 loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
-
+            ###### matrixcity depth#############
+            
+            loss_opacity_decay = torch.tensor(0.0, device=pred_c2w.device)
+            if suspect_mask.sum() > 0:
+                print("yes")
+                alpha_in_suspect = dense_alpha[suspect_mask]
+                # 施加 L1 惩罚，迫使这些高斯变透明
+                loss_opacity_decay = torch.mean(torch.abs(alpha_in_suspect))
             # if self.train_stage == 1:
             #     # ==========================================================
             #     # [修改点 6] Pose loss 对所有 N_total 张相机位姿生效
@@ -396,6 +422,7 @@ class Pi3LossGS(nn.Module):
             self.lambda_depth * loss_depth +
             # self.lambda_pose * loss_pose + 
             # self.lambda_scale * loss_scale + 
+            0.1 * loss_opacity_decay +
             self.lambda_pts * loss_pts 
             # loss_conf
             # lambda_sparsity * loss_dense_sparsity + 
@@ -407,7 +434,7 @@ class Pi3LossGS(nn.Module):
 
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
+            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts, "loss_opacity_decay": loss_opacity_decay,
             "loss_conf": loss_conf, "total_loss": final_loss
         })
 

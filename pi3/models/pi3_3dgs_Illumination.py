@@ -7,6 +7,8 @@ from safetensors.torch import load_file
 import sys
 import math
 import torch.nn.functional as F
+import torchvision.transforms as T # [新增] 用于光照一致性增强
+
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, depth_edge
 from .layers.pos_embed import RoPE2D, PositionGetter
@@ -160,25 +162,30 @@ class Pi3_3DGS(nn.Module):
         # ----------------------
         #  Heads & Sub-Decoders
         # ----------------------
-        # 使用替换后的 ConvPts3dHead
         self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
         self.point_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[2, 1])
 
         self.camera_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=512, rope=self.rope, use_checkpoint=False)
         self.camera_head = CameraHead(dim=512)
 
-        # 同样使用 ConvPts3dHead 预测单个维度的置信度
         self.conf_decoder = deepcopy(self.point_decoder)
         self.conf_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[1])
 
-        # 使用 ConvDenseGaussianHead 预测高斯的所有属性
         self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
         self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3])
+
+        # ====== [新增: WildGaussians Appearance Modeling] ======
+        self.light_proj = nn.Linear(self.dec_embed_dim, 256)
+        # 输入: gs_h (1024) + light_code (256) = 1280. 输出: \Delta\gamma (3) + \beta (3) = 6
+        self.appearance_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024 + 256, dim_out=[3, 3])
         
-        # self.sky_head = SkyGaussianHead(
-        #     num_sky_anchors=num_sky_anchors, 
-        #     in_dim=2 * self.dec_embed_dim
-        # )
+        # 零初始化：保证预训练权重无损过渡
+        for param in self.appearance_head.parameters():
+            nn.init.zeros_(param)
+            
+        # 孪生一致性增强
+        self.color_jitter = T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+        # ========================================================
 
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -220,11 +227,11 @@ class Pi3_3DGS(nn.Module):
         self._set_stage_gradients()
 
     def _set_stage_gradients(self):
-        if self.train_stage == 2:  # GS only
+        if self.train_stage == 2:  
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
             freeze_all_params([self.decoder])
-        elif self.train_stage == 3: # Conf only
+        elif self.train_stage == 3: 
             freeze_all_params([
                 self.decoder, self.camera_decoder, self.camera_head
             ])
@@ -276,9 +283,9 @@ class Pi3_3DGS(nn.Module):
         mem = MemDebug(active=self.debug_mem)
         B, N_total, C, H, W = imgs.shape
         
-        # ==========================================================
-        # [修改点 1] 所有图像输入 Encoder 并预测位姿
-        # ==========================================================
+        # [新增] 留存一份原始图像用于 Jitter 增强
+        imgs_raw = imgs.clone()
+
         imgs = (imgs - self.image_mean) / self.image_std
         imgs_flat = imgs.reshape(B * N_total, C, H, W)
         
@@ -289,22 +296,15 @@ class Pi3_3DGS(nn.Module):
 
         hidden, pos = self.decode(hidden, N_total, H, W, mem_debug=mem)
 
-        # -----------------------------
-        # Branches: Camera Pose 对全量数据生效
-        # -----------------------------
         patch_h, patch_w = H // 14, W // 14
         cam_h = self.camera_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
         camera_poses = self.camera_head(cam_h, patch_h, patch_w).reshape(B, N_total, 4, 4)
         mem.step("Camera Decoder")
 
-        # ==========================================================
-        # [修改点 2] 提取 1/3 等间隔特征用于生成 Gaussian 与 Conf
-        # ==========================================================
         sub_idx = torch.arange(0, N_total, 1, device=imgs.device)
         N_sub = len(sub_idx)
         hw = hidden.shape[1]
 
-        # 重塑并提取子集特征
         hidden_sub = hidden.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
@@ -318,28 +318,37 @@ class Pi3_3DGS(nn.Module):
             conf_h = self.conf_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
             conf_logits = self.conf_head([conf_h], (H, W)).reshape(B, N_sub, H, W, 1)
         else:
-            # 随便给个不占显存的 dummy tensor，防止后续取值报错
             conf_logits = torch.zeros((B, N_sub, H, W, 1), device=hidden.device)
         mem.step("Geometry & Attributes")
 
-        # ==========================================================
-        # [修改点 3] 投影和旋转转换必须使用子集的位姿
-        # ==========================================================
         camera_poses_sub = camera_poses[:, sub_idx]
 
-        # 将 Local Point 提升至 Global
         xy, z = local_xyz_raw[..., :2], torch.exp(local_xyz_raw[..., 2:3])
         local_pts = torch.cat([xy * z, z], dim=-1)
         local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
         global_pts = torch.matmul(camera_poses_sub, local_pts_h).transpose(2, 3).reshape(B, N_sub, H, W, 4)[..., :3]
 
-        # 解析 Dense 高斯属性
         local_rot = F.normalize(gs_attrs[..., 0:4], dim=-1)
         scale = torch.exp(torch.clamp(gs_attrs[..., 4:7], min=-10.0, max=5.0)) * 0.01
         opacity = torch.sigmoid(gs_attrs[..., 7:8])
-        color = torch.sigmoid(gs_attrs[..., 8:11])
+        
+        # ====== [修改: 颜色解析替换为 Appearance 仿射变换] ======
+        base_color_logits = gs_attrs[..., 8:11] 
+        
+        reg_tokens = hidden_sub[:, :self.patch_start_idx, :]
+        light_code = self.light_proj(reg_tokens.mean(dim=1)) 
+        light_code_expanded = light_code.unsqueeze(1).expand(-1, hw, -1)
+        
+        app_in = torch.cat([gs_h, light_code_expanded], dim=-1) 
+        app_out = self.appearance_head([app_in], (H, W)).reshape(B, N_sub, H, W, 6)
+        
+        gamma = torch.exp(app_out[..., 0:3])
+        beta = app_out[..., 3:6]
+        
+        toned_color_logits = gamma * base_color_logits + beta
+        color = torch.sigmoid(toned_color_logits) 
+        # ========================================================
 
-        # 本地旋转转全局旋转
         cam_quats_sub = matrix_to_quaternion(camera_poses_sub[..., :3, :3]).view(B, N_sub, 1, 1, 4).expand(-1, -1, H, W, -1)
         global_rot = F.normalize(quat_mult(cam_quats_sub, local_rot), dim=-1)
 
@@ -350,9 +359,40 @@ class Pi3_3DGS(nn.Module):
         d_color = color.reshape(B, -1, 3)
         d_conf = conf_logits.reshape(B, -1, 1)
 
-        # 根号 N 上限 + 置信度阈值动态概率筛选
+        # ====== [新增: Jitter 一致性增强支路] ======
+        d_color_jitter = None
+        imgs_jitter_gt = None
+        
+        if self.training and self.train_stage in [1, 2]:
+            with torch.no_grad():
+                imgs_jitter = self.color_jitter(imgs_raw.view(B * N_total, C, H, W))
+                imgs_jitter_gt = imgs_jitter.view(B, N_total, C, H, W)[:, sub_idx]
+                imgs_jitter_norm = (imgs_jitter - self.image_mean) / self.image_std
+                
+            # 仅过 Encoder 抽特征
+            hidden_jitter = self.encoder(imgs_jitter_norm, is_training=True)
+            if isinstance(hidden_jitter, dict): hidden_jitter = hidden_jitter["x_norm_patchtokens"]
+            hidden_jitter_sub = hidden_jitter.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
+            reg_tokens_jitter = hidden_jitter_sub[:, :self.patch_start_idx, :]
+            
+            # 提 Jitter 光照
+            light_code_jitter = self.light_proj(reg_tokens_jitter.mean(dim=1))
+            light_jitter_expanded = light_code_jitter.unsqueeze(1).expand(-1, hw, -1)
+            
+            # 重新调色 (复用原图 gs_h 和 base_color)
+            app_in_jitter = torch.cat([gs_h, light_jitter_expanded], dim=-1)
+            app_out_jitter = self.appearance_head([app_in_jitter], (H, W)).reshape(B, N_sub, H, W, 6)
+            
+            gamma_jitter = torch.exp(app_out_jitter[..., 0:3])
+            beta_jitter = app_out_jitter[..., 3:6]
+            
+            toned_color_logits_jitter = gamma_jitter * base_color_logits + beta_jitter
+            color_jitter = torch.sigmoid(toned_color_logits_jitter)
+            d_color_jitter = color_jitter.reshape(B, -1, 3)
+        # ========================================================
+
         num_dense = d_xyz.shape[1]
-        limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  # 这里改用 N_sub 的开方
+        limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  
         if self.max_dense_gaussians is not None:
             limit_gaussians = min(limit_gaussians, self.max_dense_gaussians)
 
@@ -362,7 +402,6 @@ class Pi3_3DGS(nn.Module):
             if self.train_stage == 3:
                 conf_prob = torch.sigmoid(d_conf.squeeze(-1))
                 conf_threshold = 0.5 
-                
                 max_valid_in_batch = (conf_prob > conf_threshold).sum(dim=1).max().item()
                 K_target = max(min(max_valid_in_batch, limit_gaussians), 1) 
                 _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
@@ -378,8 +417,12 @@ class Pi3_3DGS(nn.Module):
             d_rot = filter_topk(d_rot)
             d_scale = filter_topk(d_scale)
             d_opacity = filter_topk(d_opacity)
-            d_color = filter_topk(d_color)
             d_conf_filtered = filter_topk(d_conf)
+            
+            # [修改] 同步过滤原图颜色和 Jitter 颜色
+            d_color = filter_topk(d_color)
+            if d_color_jitter is not None:
+                d_color_jitter = filter_topk(d_color_jitter)
             
             if self.train_stage == 3:
                 survived_prob = torch.sigmoid(d_conf_filtered.squeeze(-1))
@@ -389,24 +432,25 @@ class Pi3_3DGS(nn.Module):
             d_conf = d_conf_filtered
             mem.step("Dynamic Probability & Top-K Filtering")
 
-        # 提取全量场景特征并传入 Sky Head (使用 N_total)
-        # global_scene_feat = hidden.view(B, N_total, hw, -1).mean(dim=(1, 2))
-        # s_xyz, s_rot, s_scale, s_opacity, s_color, s_conf_sky = self.sky_head(global_scene_feat)
-        
         gaussians = {
-            "xyz": d_xyz,
-            "rotation": d_rot,
-            "scale": d_scale,
-            "opacity": d_opacity,
-            "color": d_color,
-            "conf": d_conf,
-            "num_sky": 0 
+            "xyz": d_xyz, "rotation": d_rot, "scale": d_scale,
+            "opacity": d_opacity, "color": d_color, "conf": d_conf, "num_sky": 0 
         }
+        
+        # [新增] 组装 Jitter 高斯字典
+        gaussians_jitter = None
+        if d_color_jitter is not None:
+            gaussians_jitter = {
+                "xyz": d_xyz, "rotation": d_rot, "scale": d_scale,
+                "opacity": d_opacity, "color": d_color_jitter, "conf": d_conf, "num_sky": 0 
+            }
         mem.step("GS Concat")
 
         return dict(
             gaussians=gaussians, 
             camera_poses=camera_poses, 
             local_points=local_pts, 
-            conf=conf_logits
+            conf=conf_logits,
+            gaussians_jitter=gaussians_jitter,  # [新增] 抛出供 Loss 使用
+            imgs_jitter_gt=imgs_jitter_gt       # [新增] 抛出供 Loss 使用
         )

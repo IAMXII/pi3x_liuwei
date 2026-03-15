@@ -145,8 +145,38 @@ class MatrixCityDataset(BaseDataset):
 
         # 采样逻辑
         should_replace = num_valid < self.frame_num
-        idxs = rng.choice(valid_indices, self.frame_num, replace=should_replace)
-        idxs.sort()
+        # idxs = rng.choice(valid_indices, self.frame_num, replace=should_replace)
+        # idxs.sort()
+
+        # --- 针对户外大场景的连续轨迹采样逻辑 ---
+        # 设定最大步长 (Stride)。步长决定了相机的 Baseline。
+        # 步长太大 -> 失去 Overlap；步长太小 (如 1) -> 视角几乎没变，Baseline 太窄。
+        # 经验值：对于 30fps 的轨迹数据集，步长设为 3~10 之间通常比较合适。
+        MAX_STRIDE = 5  
+        
+        # 计算在当前序列长度下，实际允许的最大步长
+        if self.frame_num > 1:
+            available_max_stride = (len(valid_indices) - 1) // (self.frame_num - 1)
+        else:
+            available_max_stride = 1
+            
+        actual_max_stride = min(MAX_STRIDE, max(1, available_max_stride))
+
+        # 随机选择一个步长 (或者你也可以去掉 rng.choice 直接固定 stride = actual_max_stride)
+        stride = int(rng.choice(range(1, actual_max_stride + 1)))
+
+        # 根据确定的步长，计算采样窗口的总长度
+        window_size = (self.frame_num - 1) * stride + 1
+
+        # 在有效的范围内随机选择起始帧的索引
+        max_start_idx = len(valid_indices) - window_size
+        start_idx = int(rng.choice(max_start_idx + 1))
+
+        # 生成连续且等距的帧索引
+        selected_indices = [start_idx + i * stride for i in range(self.frame_num)]
+        # ----------------------------------------
+        
+        idxs = [valid_indices[i] for i in selected_indices]
 
         views = []
         for idx in idxs:
@@ -193,6 +223,7 @@ class MatrixCityDataset(BaseDataset):
                     depthmap = depthmap[:, :, 0]
                 
                 depthmap = depthmap.astype(np.float32)
+                print(depthmap.min(), depthmap.max())
 
             # --- 3. Load Camera Parameters from NPZ ---
             # 直接使用 load_camera_from_npz 读取

@@ -115,9 +115,34 @@ class MidAirDataset(BaseDataset):
              # 如果某种原因帧数不够（初始化时检查过，但为了安全再次检查）
              raise RuntimeError(f"Not enough frames in {scan['scan_id']}")
 
-        # 随机采样
-        selected_indices = rng.choice(len(frames), size=self.frame_num, replace=False)
-        selected_indices.sort()
+        # --- 针对户外大场景的连续轨迹采样逻辑 ---
+        # 设定最大步长 (Stride)。步长决定了相机的 Baseline。
+        # 步长太大 -> 失去 Overlap；步长太小 (如 1) -> 视角几乎没变，Baseline 太窄。
+        # 经验值：对于 30fps 的轨迹数据集，步长设为 3~10 之间通常比较合适。
+        MAX_STRIDE = 5  
+        
+        # 计算在当前序列长度下，实际允许的最大步长
+        if self.frame_num > 1:
+            available_max_stride = (len(frames) - 1) // (self.frame_num - 1)
+        else:
+            available_max_stride = 1
+            
+        actual_max_stride = min(MAX_STRIDE, max(1, available_max_stride))
+
+        # 随机选择一个步长 (或者你也可以去掉 rng.choice 直接固定 stride = actual_max_stride)
+        stride = int(rng.choice(range(1, actual_max_stride + 1)))
+
+        # 根据确定的步长，计算采样窗口的总长度
+        window_size = (self.frame_num - 1) * stride + 1
+
+        # 在有效的范围内随机选择起始帧的索引
+        max_start_idx = len(frames) - window_size
+        start_idx = int(rng.choice(max_start_idx + 1))
+
+        # 生成连续且等距的帧索引
+        selected_indices = [start_idx + i * stride for i in range(self.frame_num)]
+        # ----------------------------------------
+        
         selected_frames = [frames[i] for i in selected_indices]
 
         views = []

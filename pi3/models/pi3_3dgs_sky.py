@@ -175,10 +175,10 @@ class Pi3_3DGS(nn.Module):
         self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
         self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3])
         
-        # self.sky_head = SkyGaussianHead(
-        #     num_sky_anchors=num_sky_anchors, 
-        #     in_dim=2 * self.dec_embed_dim
-        # )
+        self.sky_head = SkyGaussianHead(
+            num_sky_anchors=num_sky_anchors, 
+            in_dim=2 * self.dec_embed_dim
+        )
 
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -187,7 +187,7 @@ class Pi3_3DGS(nn.Module):
         #   VGGT Weight Loading
         # ----------------------
         if load_vggt:
-            vggt_weight = load_file('ckpts/pi3/model_pi3x.safetensors')
+            vggt_weight = load_file('outputs/pi3_lowres_free/ckpts/best_model/model.safetensors')
             
             vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
             print("Loading vggt encoder", self.encoder.load_state_dict(vggt_enc_weight, strict=False))
@@ -300,7 +300,7 @@ class Pi3_3DGS(nn.Module):
         # ==========================================================
         # [修改点 2] 提取 1/3 等间隔特征用于生成 Gaussian 与 Conf
         # ==========================================================
-        sub_idx = torch.arange(0, N_total, 1, device=imgs.device)
+        sub_idx = torch.arange(0, N_total, 2, device=imgs.device)
         N_sub = len(sub_idx)
         hw = hidden.shape[1]
 
@@ -355,6 +355,7 @@ class Pi3_3DGS(nn.Module):
         limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  # 这里改用 N_sub 的开方
         if self.max_dense_gaussians is not None:
             limit_gaussians = min(limit_gaussians, self.max_dense_gaussians)
+            # limit_gaussians = min(limit_gaussians, int(N_sub * H * W / 2))  # 确保至少保留一个高斯
 
         K_target = min(num_dense, limit_gaussians)
 
@@ -390,17 +391,17 @@ class Pi3_3DGS(nn.Module):
             mem.step("Dynamic Probability & Top-K Filtering")
 
         # 提取全量场景特征并传入 Sky Head (使用 N_total)
-        # global_scene_feat = hidden.view(B, N_total, hw, -1).mean(dim=(1, 2))
-        # s_xyz, s_rot, s_scale, s_opacity, s_color, s_conf_sky = self.sky_head(global_scene_feat)
+        global_scene_feat = hidden.view(B, N_total, hw, -1).mean(dim=(1, 2))
+        s_xyz, s_rot, s_scale, s_opacity, s_color, s_conf_sky = self.sky_head(global_scene_feat)
         
         gaussians = {
-            "xyz": d_xyz,
-            "rotation": d_rot,
-            "scale": d_scale,
-            "opacity": d_opacity,
-            "color": d_color,
-            "conf": d_conf,
-            "num_sky": 0 
+            "xyz": torch.cat([d_xyz, s_xyz], dim=1),
+            "rotation": torch.cat([d_rot, s_rot], dim=1),
+            "scale": torch.cat([d_scale, s_scale], dim=1),
+            "opacity": torch.cat([d_opacity, s_opacity], dim=1),
+            "color": torch.cat([d_color, s_color], dim=1),
+            "conf": torch.cat([d_conf, s_conf_sky], dim=1),
+            "num_sky": s_xyz.shape[1] 
         }
         mem.step("GS Concat")
 

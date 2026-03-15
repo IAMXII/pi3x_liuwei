@@ -119,14 +119,14 @@ class SkyGaussianHead(nn.Module):
     """
     动态天空高斯头：几何和透明度维持半固定，但颜色由当前场景的图像特征动态预测。
     """
-    def __init__(self, num_sky_anchors=8196, sky_radius=100.0, in_dim=1024):
+    def __init__(self, num_sky_anchors=8196, sky_radius=1000.0, in_dim=1024):
         super().__init__()
         self.num_sky_anchors = num_sky_anchors
         self.sky_radius = sky_radius
         
         # 几何方向依然固定
         sky_dirs = torch.randn(num_sky_anchors, 3)
-        sky_dirs[:, 2] = torch.abs(sky_dirs[:, 2]) 
+        sky_dirs[:, 2] = -torch.abs(sky_dirs[:, 1]) 
         self.register_buffer("sky_dirs", F.normalize(sky_dirs, dim=-1))
         
         self.sky_rotation = nn.Parameter(torch.randn(num_sky_anchors, 4))
@@ -152,7 +152,7 @@ class SkyGaussianHead(nn.Module):
         
         xyz = (self.sky_dirs * self.sky_radius).unsqueeze(0).expand(B, -1, -1)
         
-        scale = torch.exp(torch.clamp(self.sky_scale, min=-10.0, max=5.0))*0.05
+        scale = torch.exp(torch.clamp(self.sky_scale, min=-10.0, max=5.0))*0.5
         scale = scale * 51.0 
         scale = scale.unsqueeze(0).expand(B, -1, -1)
         

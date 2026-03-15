@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torchvision
 from gsplat import rasterization
 from torchmetrics.functional import structural_similarity_index_measure as ssim
+import lpips # [保留上一次修改] 导入 lpips
+
 from .pi3_3dgs import matrix_to_quaternion, quat_mult
 from ..utils.alignment import align_points_scale
 from ..utils.geometry import depth_edge, homogenize_points
@@ -68,7 +70,6 @@ class Pi3LossGS(nn.Module):
         self.lambda_scale = lambda_scale
         self.lambda_pts = lambda_pts 
         
-        # 强制转换为 int，防止 YAML 解析为字符串导致的幽灵 Bug
         self.train_stage = int(train_stage) 
         self.local_align_res = local_align_res
         
@@ -76,9 +77,11 @@ class Pi3LossGS(nn.Module):
         self.num_sky_anchors = num_sky_anchors
         self.camera_loss_fn = CameraPoseLoss()
 
+        self.lpips_loss_fn = lpips.LPIPS(net='alex')
+        for param in self.lpips_loss_fn.parameters():
+            param.requires_grad = False
+
     def prepare_gt(self, gt):
-        """支持自动从 Depth+Pose+Intrinsics 反投影生成 pts3d 的对齐与 norm 逻辑"""
-        # 1. 安全提取 Dataloader 传来的基础数据
         imgs = torch.stack([view['img'] for view in gt], dim=1)
         gt_depths = torch.stack([view['depthmap'] for view in gt], dim=1)
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
@@ -87,13 +90,8 @@ class Pi3LossGS(nn.Module):
         B, N, H, W = gt_depths.shape
         device = gt_depths.device
 
-        # ==========================================
-        # 核心补全：动态生成 valid_mask 和 pts3d
-        # ==========================================
-        # A. 生成掩模: 深度值有效的区域 (大于极小值)
-        masks = (gt_depths > 1e-4).unsqueeze(-1) # [B, N, H, W, 1]
+        masks = (gt_depths > 1e-4).unsqueeze(-1)
 
-        # B. 像素坐标网格反投影
         grid_y, grid_x = torch.meshgrid(
             torch.arange(H, device=device), 
             torch.arange(W, device=device), 
@@ -102,62 +100,44 @@ class Pi3LossGS(nn.Module):
         grid_x = grid_x.expand(B, N, -1, -1).float()
         grid_y = grid_y.expand(B, N, -1, -1).float()
 
-        # 提取内参
         fx = gt_ks[..., 0, 0].view(B, N, 1, 1)
         fy = gt_ks[..., 1, 1].view(B, N, 1, 1)
         cx = gt_ks[..., 0, 2].view(B, N, 1, 1)
         cy = gt_ks[..., 1, 2].view(B, N, 1, 1)
 
-        # 计算相机局部坐标 (Local Points)
         local_x = (grid_x - cx) * gt_depths / fx
         local_y = (grid_y - cy) * gt_depths / fy
         local_z = gt_depths
-        gt_local_pts_raw = torch.stack([local_x, local_y, local_z], dim=-1) # [B, N, H, W, 3]
+        gt_local_pts_raw = torch.stack([local_x, local_y, local_z], dim=-1)
 
-        # 转换到全局坐标 (Global Points)
-        gt_local_pts_h = homogenize_points(gt_local_pts_raw).view(B, N, -1, 4).transpose(2, 3) # [B, N, 4, H*W]
-        # 假设 poses 是 Camera-to-World (c2w)
+        gt_local_pts_h = homogenize_points(gt_local_pts_raw).view(B, N, -1, 4).transpose(2, 3)
         gt_pts = torch.matmul(poses, gt_local_pts_h).transpose(2, 3).reshape(B, N, H, W, 4)[..., :3] 
-        # ==========================================
 
-        # --- 以下无缝衔接你原本的坐标系统一与对齐逻辑 ---
-        # 统一坐标系到第一个视角
         w2c_target = se3_inverse(poses[:, 0])
         gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
         poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
 
-        # ==========================================
-        # 规范化全局尺度 (极其关键，防止 NaN)
-        # ==========================================
-        # [修复 1]: 确保 valid_batch 是一维张量 [B]
         valid_batch = masks.view(B, -1).sum(dim=-1) > 0 
         
         if valid_batch.sum() > 0:
             B_ = valid_batch.sum()
-            all_pts = gt_pts[valid_batch].clone() # 形状: [B_, N, H, W, 3]
+            all_pts = gt_pts[valid_batch].clone() 
             
-            # 使用展开后的布尔掩模置零无效点
-            mask_bool = masks[valid_batch].squeeze(-1) # 形状: [B_, N, H, W]
+            mask_bool = masks[valid_batch].squeeze(-1) 
             all_pts[~mask_bool] = 0
             
-            # [修复 2]: 将 N 和 H*W 展平，避免复杂的维度计算
-            all_pts = all_pts.reshape(B_, -1, 3) # 形状: [B_, N*H*W, 3]
-            all_dis = all_pts.norm(dim=-1)       # 形状: [B_, N*H*W]
+            all_pts = all_pts.reshape(B_, -1, 3)
+            all_dis = all_pts.norm(dim=-1)      
             
-            # 分母：计算每个 Batch 有多少个有效点
-            num_valid_pts = mask_bool.view(B_, -1).float().sum(dim=-1) # 形状: [B_]
+            num_valid_pts = mask_bool.view(B_, -1).float().sum(dim=-1) 
             
-            # 计算缩放因子
-            norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) # 形状: [B_]
+            norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8)
             norm_factor = norm_factor.clamp_min(1e-4)
 
-            # 执行缩放 (利用 None 自动对齐广播维度)
             gt_pts[valid_batch] = gt_pts[valid_batch] / norm_factor[..., None, None, None, None]
             poses[valid_batch, ..., :3, 3] /= norm_factor[..., None, None]
             gt_depths[valid_batch] /= norm_factor[..., None, None, None]
-        # ==========================================
 
-        # 重新转换出安全的 local_pts 供后续 loss 使用
         extrinsics = se3_inverse(poses)
         gt_local_pts = torch.einsum('bnij, bnhwj -> bnhwi', extrinsics, homogenize_points(gt_pts))[..., :3]
 
@@ -172,40 +152,31 @@ class Pi3LossGS(nn.Module):
         )
 
     def normalize_pred(self, pred, gt):
-        """恢复原版预测结果的尺度对齐 (已彻底修复维度匹配问题)"""
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
         B, N, H, W, _ = local_points.shape
-        masks = gt['masks'] # 原始形状: [B, N, H, W, 1]
+        masks = gt['masks']
         
-        # 1. 挤掉最后一维，变成纯纯的布尔掩模 [B, N, H, W]
         mask_bool = masks.squeeze(-1) 
 
         all_pts = local_points.clone()
-        # 此时形状完美匹配，不会报错了！
         all_pts[~mask_bool] = 0 
         
-        # 2. 展平空间维度，避免复杂的多维 sum
-        all_pts = all_pts.reshape(B, -1, 3) # 形状: [B, N*H*W, 3]
-        all_dis = all_pts.norm(dim=-1)      # 形状: [B, N*H*W]
+        all_pts = all_pts.reshape(B, -1, 3)
+        all_dis = all_pts.norm(dim=-1)      
         
-        # 3. 精准计算每个 Batch 有多少个有效点
-        num_valid_pts = mask_bool.view(B, -1).float().sum(dim=-1) # 形状: [B]
+        num_valid_pts = mask_bool.view(B, -1).float().sum(dim=-1)
         
-        # 计算缩放因子
-        norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) # 形状: [B]
-        norm_factor = norm_factor.clamp_min(1e-4) # 防护除零
+        norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8)
+        norm_factor = norm_factor.clamp_min(1e-4)
         
-        # 4. 执行缩放对齐
         local_points = local_points / norm_factor[..., None, None, None, None]
-        
         camera_poses_normalized = camera_poses.clone()
         camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
 
         pred['local_points'] = local_points
         pred['camera_poses'] = camera_poses_normalized
 
-        # 同步缩放高斯
         if 'gaussians' in pred:
             pred['gaussians']['xyz'] = pred['gaussians']['xyz'] / norm_factor.view(B, 1, 1)
             pred['gaussians']['scale'] = pred['gaussians']['scale'] / norm_factor.view(B, 1, 1)
@@ -266,11 +237,11 @@ class Pi3LossGS(nn.Module):
         gt_local_pts_sub = gt_local_pts[:, sub_idx]
 
         gauss_raw = pred['gaussians']
-        pred_c2w = pred['camera_poses'] # 此时全量位姿预测为 [B, N_total, 4, 4]
+        pred_c2w = pred['camera_poses']
         
         pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
 
-        loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_pts = torch.tensor(0.0, device=pred_c2w.device)
+        loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_pts = loss_lpips = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
         scale_opt = torch.ones((B,), device=pred_c2w.device)
@@ -284,26 +255,16 @@ class Pi3LossGS(nn.Module):
                 xyz_gt_ROE = self.prepare_ROE(gt_local_pts_sub.reshape(B, N_sub, H, W, 3), valid_masks_sub, target_size=self.local_align_res)
                 xyz_w_ROE = self.prepare_ROE((weights_[..., None]).reshape(B, N_sub, H, W, 1), valid_masks_sub, target_size=self.local_align_res)[..., 0]
             
+            # [说明] 这里的 scale_opt 必须保留计算，尽管 pts 冻结了，
+            # 但算出的 scale_opt 后续用来缩放 gauss_render 以对齐 GT，进而才能计算出正确的 rgb 和 depth loss
             scale_opt = align_points_scale(xyz_pred_ROE, xyz_gt_ROE, xyz_w_ROE)
-            
-            # scale_opt = torch.nan_to_num(scale_opt, nan=1.0, posinf=1.0, neginf=1.0)
-            # scale_opt = torch.where(scale_opt <= 0, -scale_opt, scale_opt)
-            # scale_opt = torch.clamp(scale_opt, min=1e-3, max=100.0) 
 
-            # loss_scale = F.l1_loss(scale_opt, torch.ones_like(scale_opt))
+            # ==========================================================
+            # [修改点] 删除了下方计算 loss_pts 的模块块
+            # ==========================================================
+            # 删除了 F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
 
-            if valid_masks_sub.sum() > 0:
-                aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
-                
-                loss_pts = F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
-            else:
-                loss_pts = (pred_local_pts.sum() * 0.0)
-
-        # ==========================================================
-        # [修改点 5] 高斯渲染时全面使用 PRED Pose (覆盖所有 N_total 视角)
-        # ==========================================================
         gauss_render = {k: v for k, v in gauss_raw.items()} 
-        # 直接使用全网预测的 N_total 相机位姿（此处无需利用 GT 锚定，相机渲染是相对系）
         render_c2w = pred_c2w.clone()
 
         if self.train_stage in [1, 2]:
@@ -328,23 +289,7 @@ class Pi3LossGS(nn.Module):
             
         gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
         mask_depth = (gt_depth_reshaped > 1e-4)
-        # invalid_depth_mask = ~mask_depth
-        
-        # loss_dense_sparsity = torch.tensor(0.0, device=pred_c2w.device)
-        # loss_push_back = torch.tensor(0.0, device=pred_c2w.device)
 
-        # if self.train_stage in [1, 2] and invalid_depth_mask.sum() > 0:
-        #     num_sky = gauss_raw.get("num_sky", self.num_sky_anchors)
-        #     dense_gauss_render = {k: v[:, :-num_sky] for k, v in gauss_render.items() if k != "num_sky"}
-        #     _, dense_alpha, _ = self._render_gs(dense_gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB')
-        #     dense_alpha = dense_alpha.reshape(B * N_total, 1, H, W)
-            
-        #     alpha_in_invalid = dense_alpha[invalid_depth_mask]
-        #     loss_dense_sparsity = torch.mean(torch.abs(alpha_in_invalid))
-            
-        #     z_pred_in_invalid = aligned_depth_map[invalid_depth_mask]
-        #     loss_push_back = torch.mean(torch.exp(-z_pred_in_invalid / 10.0))
-            
         with torch.no_grad():
             num_viz = min(4, B * N_total)
             rgb_viz = torch.cat([gt_imgs_reshaped[:num_viz], rgb_full[:num_viz]], dim=2) 
@@ -360,25 +305,16 @@ class Pi3LossGS(nn.Module):
         if self.train_stage in [1, 2]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
+
+            self.lpips_loss_fn.to(rgb_full.device)
+            rgb_full_norm = rgb_full * 2.0 - 1.0
+            gt_imgs_norm = gt_imgs_reshaped * 2.0 - 1.0
+            lpips_val = self.lpips_loss_fn(rgb_full_norm, gt_imgs_norm)
+            loss_lpips = lpips_val.mean()
             
-            mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
+            mask_depth = (gt_depth_reshaped > 1e-4)
             if self.lambda_depth > 0 and mask_depth.sum() > 10:
                 loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
-
-            # if self.train_stage == 1:
-            #     # ==========================================================
-            #     # [修改点 6] Pose loss 对所有 N_total 张相机位姿生效
-            #     # ==========================================================
-            #     # loss_pose, t_err, r_err = self.camera_loss_fn(pred_c2w, gt_c2w, scale_opt.detach())
-            #     # details['pose_trans_err'] = t_err
-            #     # details['pose_rot_err'] = r_err
-
-            #     rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     gt_imgs_sub = gt_imgs[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     pixel_error = torch.abs(rgb_sub - gt_imgs_sub).mean(dim=1, keepdim=True).detach()
-            #     valid_target = (pixel_error < 0.1).float() 
-            #     dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
-            #     loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
 
         elif self.train_stage == 3:
             rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
@@ -388,18 +324,14 @@ class Pi3LossGS(nn.Module):
             dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
             loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
             
-        # lambda_sparsity = 0.05 
-        # lambda_push_back = 0.02
         final_loss = (
             self.lambda_rgb * loss_rgb + 
             self.lambda_ssim * loss_ssim + 
             self.lambda_depth * loss_depth +
-            # self.lambda_pose * loss_pose + 
-            # self.lambda_scale * loss_scale + 
-            self.lambda_pts * loss_pts 
-            # loss_conf
-            # lambda_sparsity * loss_dense_sparsity + 
-            # lambda_push_back * loss_push_back       
+            # ==========================================================
+            # [修改点] 从最终损失汇总中去掉了 self.lambda_pts * loss_pts 
+            # ==========================================================
+            0.2 * loss_lpips 
         )
 
         if final_loss == 0.0:
@@ -407,8 +339,9 @@ class Pi3LossGS(nn.Module):
 
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
-            "loss_conf": loss_conf, "total_loss": final_loss
+            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts, # [说明] 依然传回 0.0 防止外界记录报错
+            "loss_conf": loss_conf, "loss_lpips": loss_lpips,
+            "total_loss": final_loss
         })
 
         return final_loss, details
