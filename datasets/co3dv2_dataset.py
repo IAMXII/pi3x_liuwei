@@ -113,51 +113,54 @@ class CO3DV2Dataset(BaseDataset):
         image_dir = osp.join(seq_dir, 'images')
         depth_dir = osp.join(seq_dir, 'depths')
 
-        # 随机采样
-        replace = len(valid_frames) < self.frame_num
-        selected_indices = rng.choice(len(valid_frames), size=self.frame_num, replace=replace)
-        selected_frames = [valid_frames[i] for i in selected_indices]
+        # ====== [新增: 提前过滤掉文件不齐全的坏帧] ======
+        actually_valid_frames = []
+        for f in valid_frames:
+            frame_name = osp.splitext(f)[0]
+            rgb_path = osp.join(image_dir, f)
+            meta_path = osp.join(image_dir, f"{frame_name}.npz")
+            # 【修改点 1】: 将 f 替换为 frame_name，防止变成 .jpg.geometric.png
+            depth_path = osp.join(depth_dir, f"{f}.geometric.png") 
+            
+            if osp.exists(rgb_path) and osp.exists(meta_path) and osp.exists(depth_path):
+                actually_valid_frames.append(f)
+
+        if len(actually_valid_frames) == 0:
+            raise ValueError(f"Sequence {seq_dir} 没有任何包含完整 RGB/Depth/Pose 的帧！")
+        # ===============================================
 
         views = []
-        for img_file in selected_frames:
+        candidate_frames = actually_valid_frames.copy()
+        self._rng.shuffle(candidate_frames)
+        
+        if len(candidate_frames) < self.frame_num:
+            candidate_frames = self._rng.choice(actually_valid_frames, size=self.frame_num*2, replace=True).tolist()
+
+        for img_file in candidate_frames:
+            if len(views) >= self.frame_num:
+                break 
+
             frame_name = osp.splitext(img_file)[0]
-            
             rgb_path = osp.join(image_dir, img_file)
             meta_path = osp.join(image_dir, f"{frame_name}.npz")
-            depth_path = osp.join(depth_dir, f"{img_file}.geometric.png")
+            # 【修改点 2】: 同样将 img_file 替换为 frame_name
+            depth_path = osp.join(depth_dir, f"{img_file}.geometric.png") 
             
-            # Load RGB
+            # Load RGB & Depth & Camera
             rgb_image = Image.open(rgb_path)
-            
-            # Load Depth
-            if osp.exists(depth_path):
-                depthmap = np.array(Image.open(depth_path)).astype(np.float32)
-            else:
-                w, h = rgb_image.size
-                depthmap = np.zeros((h, w), dtype=np.float32)
-
-            # Load Camera
-            # 这里加个 try-except 防止单个坏文件中断训练
-            try:
-                camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
-            except Exception as e:
-                print(f"Warning: Failed to load {meta_path}: {e}")
-                # 如果失败，这里需要一种回退机制，或者直接报错重试
-                # 为了简单起见，这里抛出错误，让 DataLoader 的 collate_fn 或 BaseDataset 里的重试机制处理
-                raise e
-
+            depthmap = np.array(Image.open(depth_path)).astype(np.float32)
+            camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
             camera_pose = camera_pose.astype(np.float32)
             camera_intrinsics = camera_intrinsics.astype(np.float32)
 
             # Crop/Resize
             processed_img, processed_depth, processed_intrinsics = self._crop_resize_if_necessary(
-                rgb_image, 
-                depthmap, 
-                camera_intrinsics.copy(), 
-                resolution, 
-                rng=rng, 
-                info=rgb_path
+                rgb_image, depthmap, camera_intrinsics.copy(), resolution, rng=self._rng, info=rgb_path
             )
+
+            # 遇到无效深度图跳过
+            if processed_depth.sum() <= 1e-4:
+                continue 
 
             views.append(dict(
                 img=processed_img,
@@ -165,5 +168,8 @@ class CO3DV2Dataset(BaseDataset):
                 camera_pose=camera_pose,
                 camera_intrinsics=processed_intrinsics,
             ))
+
+        if len(views) < self.frame_num:
+             raise ValueError(f"{seq_dir} 内部有效帧不足 {self.frame_num} 个！")
 
         return views

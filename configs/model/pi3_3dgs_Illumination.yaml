@@ -1,7 +1,7 @@
 # @package _global_
 
 model:
-    _target_: pi3.models.pi3_3dgs.Pi3_3DGS
+    _target_: pi3.models.pi3_3dgs_Illumination.Pi3_3DGS
     pos_type: rope100
     decoder_size: large
     load_vggt: false
@@ -9,15 +9,15 @@ model:
     # use_global_points: false
     train_conf: false
     num_dec_blk_not_to_checkpoint: 4
-    ckpt: "ckpts/pi3/model_pi3x.safetensors" # <path-to-your-pretrain-checkpoint>
+    ckpt: 'outputs/pi3_lowres_free/ckpts/best_model/model.safetensors' # <path-to-your-pretrain-checkpoint>
 
 loss:
     train_loss:
-        _target_: pi3.models.loss_3dgs.Pi3LossGS
+        _target_: pi3.models.loss_3dgs_Illumination.Pi3LossGS
         # train_conf: false
 
     test_loss:
-        _target_: pi3.models.loss_3dgs.Pi3LossGS
+        _target_: pi3.models.loss_3dgs_Illumination.Pi3LossGS
         # train_conf: false
 
 train:
@@ -35,9 +35,9 @@ train:
     dynamic_compile: true
 
     # Training config
-    gradient_accumulation_steps: 1
+    gradient_accumulation_steps: 2
     clip_grad: 1.0
-    clip_loss: 10
+    clip_loss: 20
 
     seed: 42
     resume: null

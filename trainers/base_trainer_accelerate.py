@@ -286,24 +286,24 @@ class BaseTrainer:
 
         self.log_info(f"Start validation for epoch {epoch}")
         with torch.no_grad():
-            for batch in metric_logger.log_every(
+            # [修改点 1]: 加上 enumerate 取出局部 batch_idx (这里命名为 it)
+            for it, batch in enumerate(metric_logger.log_every(
                 self.test_loader, self.cfg.train.print_freq, header
-            ):
+            )):
                 batch = move_to_device(batch, self.accelerator.device)
 
                 # Forward pass
                 outputs = self.forward_batch(batch, mode='test')
                 
-                # [修改点 1] 传递 current_epoch 和 total_epochs 到 calculate_loss
                 outputs = self.calculate_loss(
                     outputs, 
                     batch, 
-                    mode='test',  # 注意：保持 mode='train' 意味着计算 Loss，如果不需要计算 Loss 可改为 'test'
+                    mode='test', 
                     current_epoch=epoch, 
-                    total_epochs=self.cfg.train.num_epoch
+                    total_epochs=self.cfg.train.num_epoch,
+                    batch_idx=it  # <--- [修改点 2]: 传入局部 batch_idx
                 )
                 loss = outputs.loss
-
                 # Gather statistics
                 loss_value = loss.item()
                 val_loss += loss_value * len(batch)
@@ -361,7 +361,8 @@ class BaseTrainer:
                     batch, 
                     mode='train', 
                     current_epoch=epoch, 
-                    total_epochs=self.cfg.train.num_epoch
+                    total_epochs=self.cfg.train.num_epoch,
+                    batch_idx=self.global_step
                 )
                 
                 loss = batch_output.loss
@@ -440,7 +441,13 @@ class BaseTrainer:
                     # ------------------- [修改结束] -------------------
                     
                     # 控制台日志依然保留平滑打印（依赖你 config 中的 print_freq）
-                    metric_logger.update(**batch_output)
+                    # 过滤掉多元素的张量（如图像），只保留标量用于平滑计算和终端打印
+                    scalar_metrics = {
+                        k: v for k, v in batch_output.items() 
+                        if not (isinstance(v, torch.Tensor) and v.numel() > 1)
+                    }
+                    metric_logger.update(**scalar_metrics)
+                    # metric_logger.update(**batch_output)
 
                     min_lr = 10.0
                     max_lr = 0.0
@@ -491,7 +498,7 @@ class BaseTrainer:
                 log_scaler[prefix+'/'+k] = v
                 continue
             # ------------------- [修改结束] -------------------
-            if Image.isImageType(v):
+            if isinstance(v, Image.Image):
                 log_img[prefix+'/'+k] = v
 
         self.accelerator.log(log_scaler, step)
@@ -504,7 +511,8 @@ class BaseTrainer:
         return output
 
     # [修改点 3] 更新函数签名，接收 current_epoch 和 total_epochs
-    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None):
+    # [修改点 4] 更新函数签名，增加 batch_idx
+    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None, batch_idx=0):
         pass
 
     def build_accelerator(self):

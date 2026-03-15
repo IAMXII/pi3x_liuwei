@@ -1,9 +1,9 @@
 # @package _global_
 
 defaults:
-  - model: pi3_3dgs_sky.yaml
+  - model: pi3_3dgs_Illumination.yaml
   - train: train_pi3_lowres
-  - data: example_matrix.yaml
+  - data: example.yaml
   - general: default.yaml
   - extras: default.yaml
   - override hydra/job_logging: custom

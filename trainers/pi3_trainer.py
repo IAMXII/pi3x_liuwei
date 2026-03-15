@@ -84,15 +84,23 @@ class Pi3Trainer(BaseTrainer):
 
         return [pred, batch]
     
-    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None):
+    def calculate_loss(self, output, batch, mode='train', current_epoch=None, total_epochs=None, batch_idx=0):
         output, batch = output
 
         if mode == 'train':
-            loss, details = self.train_loss(output, batch,current_epoch=current_epoch, 
-            total_epochs=total_epochs)
+            loss, details = self.train_loss(
+                output, batch,
+                current_epoch=current_epoch, 
+                total_epochs=total_epochs,
+                batch_idx=batch_idx  # <--- [修改点 6]: 透传给 train_loss
+            )
         else:
-            loss, details = self.test_loss(output, batch,current_epoch=current_epoch, 
-            total_epochs=total_epochs)
+            loss, details = self.test_loss(
+                output, batch,
+                current_epoch=current_epoch, 
+                total_epochs=total_epochs,
+                batch_idx=batch_idx  # <--- [修改点 7]: 透传给 test_loss
+            )
 
         return EasyDict(
             loss=loss,

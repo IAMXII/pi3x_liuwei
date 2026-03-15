@@ -91,10 +91,9 @@ class Pi3LossGS(nn.Module):
         # 核心补全：动态生成 valid_mask 和 pts3d
         # ==========================================
         # A. 生成掩模: 深度值有效的区域 (大于极小值)
-        far = 60000
-        masks = (gt_depths > 1e-4) & (gt_depths < far)
-        masks = masks.unsqueeze(-1) # [B, N, H, W, 1]
-        masks_far = (gt_depths >= far).unsqueeze(-1) # 另一个掩模，标记极远的点（疑似天空）
+        # masks = (gt_depths > 1e-4).unsqueeze(-1) # [B, N, H, W, 1]
+        masks = ((gt_depths > 1e-4) & (gt_depths < 58982.4)).unsqueeze(-1) # [B, N, H, W, 1]
+
         # B. 像素坐标网格反投影
         grid_y, grid_x = torch.meshgrid(
             torch.arange(H, device=device), 
@@ -170,7 +169,6 @@ class Pi3LossGS(nn.Module):
             global_points = gt_pts,
             gt_local_pts = gt_local_pts, 
             masks = masks,
-            masks_far = masks_far,
             gt_c2w = poses
         )
 
@@ -232,7 +230,7 @@ class Pi3LossGS(nn.Module):
     def _render_gs(self, gaussians, w2c, ks, H, W, render_mode='RGB'):
         opacities = gaussians["opacity"].clone()
         
-        if self.train_stage == 3 or not self.training:
+        if self.train_stage == 3:
             means = gaussians["xyz"].detach().contiguous()
             quats = gaussians["rotation"].detach().contiguous()
             scales = gaussians["scale"].detach().contiguous()
@@ -252,25 +250,27 @@ class Pi3LossGS(nn.Module):
             viewmats=w2c, Ks=ks, width=W, height=H, render_mode=render_mode, packed=False
         )
 
+    # ... (前面的类定义和 prepare_gt 等工具函数保持原样) ...
+
     def forward(self, pred, gt_raw, batch_idx=0, current_epoch=None, total_epochs=None, **kwargs):
         gt = self.prepare_gt(gt_raw)
         
+        # ... (对齐、缩放逻辑保持原样) ...
         B, N_total, C, H, W = gt['imgs'].shape
-        sub_idx = torch.arange(0, N_total, 2, device=gt['imgs'].device)
+        sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
         N_sub = len(sub_idx)
 
         gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
         pred = self.normalize_pred(pred, gt_sub_mask) 
         
-        gt_ks, gt_c2w, gt_imgs, gt_depths, valid_masks, masks_far = gt['gt_ks'], gt['gt_c2w'], gt['imgs'], gt['gt_depths'], gt['masks'], gt['masks_far']
+        gt_ks, gt_c2w, gt_imgs, gt_depths, valid_masks = gt['gt_ks'], gt['gt_c2w'], gt['imgs'], gt['gt_depths'], gt['masks']
         gt_local_pts = gt['gt_local_pts']
         
         valid_masks_sub = valid_masks[:, sub_idx].squeeze(-1)
         gt_local_pts_sub = gt_local_pts[:, sub_idx]
 
         gauss_raw = pred['gaussians']
-        pred_c2w = pred['camera_poses'] # 此时全量位姿预测为 [B, N_total, 4, 4]
-        
+        pred_c2w = pred['camera_poses'] 
         pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
 
         loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_pts = torch.tensor(0.0, device=pred_c2w.device)
@@ -279,6 +279,7 @@ class Pi3LossGS(nn.Module):
         scale_opt = torch.ones((B,), device=pred_c2w.device)
         
         if self.train_stage in [1, 2]:
+            # ... (这部分的 scale_opt 计算和 loss_pts 保持原样) ...
             weights_ = gt_local_pts_sub[..., 2].clamp_min(1e-3)
             weights_ = 1 / (weights_ + 1e-6)
             
@@ -288,25 +289,14 @@ class Pi3LossGS(nn.Module):
                 xyz_w_ROE = self.prepare_ROE((weights_[..., None]).reshape(B, N_sub, H, W, 1), valid_masks_sub, target_size=self.local_align_res)[..., 0]
             
             scale_opt = align_points_scale(xyz_pred_ROE, xyz_gt_ROE, xyz_w_ROE)
-            
-            # scale_opt = torch.nan_to_num(scale_opt, nan=1.0, posinf=1.0, neginf=1.0)
-            # scale_opt = torch.where(scale_opt <= 0, -scale_opt, scale_opt)
-            # scale_opt = torch.clamp(scale_opt, min=1e-3, max=100.0) 
 
-            # loss_scale = F.l1_loss(scale_opt, torch.ones_like(scale_opt))
+            # if valid_masks_sub.sum() > 0:
+            #     aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
+            #     loss_pts = F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
+            # else:
+            #     loss_pts = (pred_local_pts.sum() * 0.0)
 
-            if valid_masks_sub.sum() > 0:
-                aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
-                
-                loss_pts = F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
-            else:
-                loss_pts = (pred_local_pts.sum() * 0.0)
-
-        # ==========================================================
-        # [修改点 5] 高斯渲染时全面使用 PRED Pose (覆盖所有 N_total 视角)
-        # ==========================================================
         gauss_render = {k: v for k, v in gauss_raw.items()} 
-        # 直接使用全网预测的 N_total 相机位姿（此处无需利用 GT 锚定，相机渲染是相对系）
         render_c2w = pred_c2w.clone()
 
         if self.train_stage in [1, 2]:
@@ -317,6 +307,7 @@ class Pi3LossGS(nn.Module):
 
         render_w2c = se3_inverse(render_c2w)
         
+        # 渲染原图分支
         rgb_full, _, _ = self._render_gs(gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB')
         rgb_full = rgb_full.reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
         gt_imgs_reshaped = gt_imgs.reshape(B * N_total, 3, H, W)
@@ -330,86 +321,98 @@ class Pi3LossGS(nn.Module):
             aligned_depth_map = depth_map
             
         gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
-        mask_depth = (gt_depth_reshaped > 1e-4)
-        # ###### matrixcity depth#############
-        # # 假设 max_sky_depth 是你的仿真数据集里天空深度的阈值 (比如 100.0)
-        # max_sky_depth = 
-
-        # # gt_depth_reshaped 形状 [B*N, 1, H, W]
-        # mask_missing = (gt_depth_reshaped < 1e-4)
-        # mask_far = (gt_depth_reshaped > max_sky_depth)
-        # print(gt_depth_reshaped.min(), gt_depth_reshaped.max(), mask_missing.sum(), mask_far.sum(),flush=True)
-        # # 疑似天空区域：没打到的地方 + 明确是很远的地方
-        # suspect_mask = mask_missing | mask_far
-        # 剔除 sky_head 的高斯，只保留 Dense 部分
-        num_sky = gauss_raw.get("num_sky", self.num_sky_anchors)
-        dense_gauss_render = {k: v[:, :-num_sky] for k, v in gauss_render.items() if k != "num_sky"}
-
-        # 渲染 Dense 部分的 Alpha (这里只需渲染 ED 或专门的 Alpha 模式以节省性能)
-        # 如果你的光栅化器支持直接吐出 transmittance 或 alpha 最好，否则可以用深度渲染通道占位
-        _, dense_alpha, _ = self._render_gs(dense_gauss_render, render_w2c, gt_ks, H, W, render_mode='ED') # 或者自定义的 Alpha 模式
-        dense_alpha = dense_alpha.reshape(B * N_total, 1, H, W)
-        ###### matrixcity depth#############
-        # invalid_depth_mask = ~mask_depth
         
-        # loss_dense_sparsity = torch.tensor(0.0, device=pred_c2w.device)
-        # loss_push_back = torch.tensor(0.0, device=pred_c2w.device)
-
-        # if self.train_stage in [1, 2] and invalid_depth_mask.sum() > 0:
-        #     num_sky = gauss_raw.get("num_sky", self.num_sky_anchors)
-        #     dense_gauss_render = {k: v[:, :-num_sky] for k, v in gauss_render.items() if k != "num_sky"}
-        #     _, dense_alpha, _ = self._render_gs(dense_gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB')
-        #     dense_alpha = dense_alpha.reshape(B * N_total, 1, H, W)
+        # ====== [新增: 渲染 Jitter 分支并计算 Loss] ======
+        loss_rgb_jitter = torch.tensor(0.0, device=pred_c2w.device)
+        loss_ssim_jitter = torch.tensor(0.0, device=pred_c2w.device)
+        rgb_jitter = None # 预先声明，供可视化使用
+        
+        if self.train_stage in [1, 2] and pred.get('gaussians_jitter') is not None:
+            gauss_jitter = pred['gaussians_jitter']
+            imgs_jitter_gt = pred['imgs_jitter_gt'].reshape(B * N_sub, 3, H, W)
             
-        #     alpha_in_invalid = dense_alpha[invalid_depth_mask]
-        #     loss_dense_sparsity = torch.mean(torch.abs(alpha_in_invalid))
+            # 同步缩放
+            gauss_jitter["xyz"] = gauss_jitter["xyz"] * detach_scale
+            gauss_jitter["scale"] = gauss_jitter["scale"] * detach_scale
             
-        #     z_pred_in_invalid = aligned_depth_map[invalid_depth_mask]
-        #     loss_push_back = torch.mean(torch.exp(-z_pred_in_invalid / 10.0))
+            # 取出 sub_idx 的位姿和内参进行渲染
+            # 取出 sub_idx 的位姿和内参进行渲染 (保持 [B, N_sub, 4, 4] 和 [B, N_sub, 3, 3] 形状)
+            w2c_sub = render_w2c[:, sub_idx]
+            ks_sub = gt_ks[:, sub_idx]
             
+            rgb_jitter, _, _ = self._render_gs(gauss_jitter, w2c_sub, ks_sub, H, W, render_mode='RGB')
+            
+            # 此时 rgb_jitter 的形状为 [B, N_sub, H, W, 3]
+            # 先将其展平为 [B*N_sub, H, W, 3]，然后再将通道维前置变为 [B*N_sub, 3, H, W]
+            rgb_jitter = rgb_jitter.reshape(B * N_sub, H, W, 3).permute(0, 3, 1, 2)
+            
+            loss_rgb_jitter = F.l1_loss(rgb_jitter, imgs_jitter_gt)
+            loss_ssim_jitter = 1.0 - ssim(rgb_jitter, imgs_jitter_gt, data_range=1.0)
+        # ========================================================
+            
+        # ====== [扩充: 丰富的可视化内容] ======
         with torch.no_grad():
+            import os
+            os.makedirs("debug_output", exist_ok=True)
             num_viz = min(4, B * N_total)
+            
+            # 1. 基础 RGB (上: GT, 下: Pred)
             rgb_viz = torch.cat([gt_imgs_reshaped[:num_viz], rgb_full[:num_viz]], dim=2) 
+            
+            # 2. 基础 Depth (上: GT, 下: Pred)
             d_pred_viz = aligned_depth_map[:num_viz] / (aligned_depth_map[:num_viz].max() + 1e-5)
             d_gt_viz = gt_depth_reshaped[:num_viz] / (gt_depth_reshaped[:num_viz].max() + 1e-5)
-            d_pred_viz = d_pred_viz.repeat(1, 3, 1, 1)
-            d_gt_viz = d_gt_viz.repeat(1, 3, 1, 1)
-            depth_viz = torch.cat([d_gt_viz, d_pred_viz], dim=2)
+            depth_viz = torch.cat([d_gt_viz.repeat(1, 3, 1, 1), d_pred_viz.repeat(1, 3, 1, 1)], dim=2)
             
-            final_viz = torch.cat([rgb_viz, depth_viz], dim=3)
-            torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}.png")
+            # 3. 新增: Error Map (计算 L1 误差，越亮误差越大，上: 空白占位, 下: 误差图)
+            error_map = torch.abs(rgb_full[:num_viz] - gt_imgs_reshaped[:num_viz]).mean(dim=1, keepdim=True)
+            error_viz = error_map.repeat(1, 3, 1, 1) * 3.0 # 乘一个系数让误差看起来更明显
+            error_viz = torch.clamp(error_viz, 0, 1)
+            error_viz_padded = torch.cat([torch.zeros_like(error_viz), error_viz], dim=2)
+            
+            # 初始化拼接列表 [RGB列, Depth列, Error列]
+            viz_list = [rgb_viz, depth_viz, error_viz_padded]
+
+            # 4. 新增: Jitter 分支可视化 (上: GT Jitter, 下: Pred Jitter)
+            if rgb_jitter is not None:
+                num_viz_jitter = min(4, B * N_sub)
+                jitter_viz = torch.cat([imgs_jitter_gt[:num_viz_jitter], rgb_jitter[:num_viz_jitter]], dim=2)
+                # 应对 N_sub < N_total 时的 batch size 对齐问题
+                if jitter_viz.shape[0] < num_viz:
+                    pad = torch.zeros((num_viz - jitter_viz.shape[0], *jitter_viz.shape[1:]), device=jitter_viz.device)
+                    jitter_viz = torch.cat([jitter_viz, pad], dim=0)
+                viz_list.append(jitter_viz)
+
+            # 5. 新增: Confidence Map (仅在 Stage 3, 上: 空白占位, 下: 置信度热力图)
+            if self.train_stage == 3 and 'conf' in pred:
+                num_viz_conf = min(4, B * N_sub)
+                conf_prob = torch.sigmoid(pred['conf'].reshape(B * N_sub, 1, H, W)[:num_viz_conf])
+                conf_viz = conf_prob.repeat(1, 3, 1, 1)
+                conf_viz_padded = torch.cat([torch.zeros_like(conf_viz), conf_viz], dim=2)
+                if conf_viz_padded.shape[0] < num_viz:
+                    pad = torch.zeros((num_viz - conf_viz_padded.shape[0], *conf_viz_padded.shape[1:]), device=conf_viz_padded.device)
+                    conf_viz_padded = torch.cat([conf_viz_padded, pad], dim=0)
+                viz_list.append(conf_viz_padded)
+
+            # 横向拼接所有列
+            final_viz = torch.cat(viz_list, dim=3)
+            
+            # 频率控制: 避免每一步都写入硬盘导致 I/O 瓶颈，比如每 100 step 存一次
+            if batch_idx % 100 == 0:
+                torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}_jitter.png")
+            
+            # 将组装好的大图写入 details，可以直接在外部传给 WandB/Tensorboard
+            details["viz_img"] = final_viz
+        # ========================================================
 
         if self.train_stage in [1, 2]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
             
-            mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
-            if self.lambda_depth > 0 and gt['masks'].sum() > 10:
-                valid_mask_reshaped = gt['masks'].reshape(B * N_total, 1, H, W)
-                loss_depth = F.l1_loss(aligned_depth_map[valid_mask_reshaped], gt_depth_reshaped[valid_mask_reshaped])
-            ###### matrixcity depth#############
-            
-            loss_opacity_decay = torch.tensor(0.0, device=pred_c2w.device)
-            if masks_far.sum() > 0:
-                # print("yes")
-                masks_far = masks_far.reshape(B * N_total, 1, H, W)
-                alpha_in_suspect = dense_alpha[masks_far]
-                # 施加 L1 惩罚，迫使这些高斯变透明
-                loss_opacity_decay = torch.mean(torch.abs(alpha_in_suspect))
-            # if self.train_stage == 1:
-            #     # ==========================================================
-            #     # [修改点 6] Pose loss 对所有 N_total 张相机位姿生效
-            #     # ==========================================================
-            #     # loss_pose, t_err, r_err = self.camera_loss_fn(pred_c2w, gt_c2w, scale_opt.detach())
-            #     # details['pose_trans_err'] = t_err
-            #     # details['pose_rot_err'] = r_err
-
-            #     rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     gt_imgs_sub = gt_imgs[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     pixel_error = torch.abs(rgb_sub - gt_imgs_sub).mean(dim=1, keepdim=True).detach()
-            #     valid_target = (pixel_error < 0.1).float() 
-            #     dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
-            #     loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
+            # mask_depth = (gt_depth_reshaped > 1e-4)
+            mask_depth = valid_masks.reshape(B * N_total, 1, H, W)
+            if self.lambda_depth > 0 and mask_depth.sum() > 10:
+                loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
 
         elif self.train_stage == 3:
             rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
@@ -419,27 +422,24 @@ class Pi3LossGS(nn.Module):
             dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
             loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
             
-        # lambda_sparsity = 0.05 
-        # lambda_push_back = 0.02
+        # ====== [修改: 将 Jitter 的误差合并进主 Loss] ======
         final_loss = (
-            self.lambda_rgb * loss_rgb + 
-            self.lambda_ssim * loss_ssim + 
-            self.lambda_depth * loss_depth +
-            # self.lambda_pose * loss_pose + 
+            self.lambda_rgb * (loss_rgb + loss_rgb_jitter) + 
+            self.lambda_ssim * (loss_ssim + loss_ssim_jitter)
+            # self.lambda_depth * loss_depth
+            # self.lambda_pts * loss_pts
             # self.lambda_scale * loss_scale + 
-            0.1 * loss_opacity_decay +
-            self.lambda_pts * loss_pts 
-            # loss_conf
-            # lambda_sparsity * loss_dense_sparsity + 
-            # lambda_push_back * loss_push_back       
+            # 1.0 * loss_conf # 补充缺失的置信度loss权重，如果不需要可以删掉
         )
+        # ========================================================
 
         if final_loss == 0.0:
              final_loss = (pred_local_pts.sum() * 0.0)
 
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts, "loss_opacity_decay": loss_opacity_decay,
+            "loss_rgb_jitter": loss_rgb_jitter, "loss_ssim_jitter": loss_ssim_jitter, # [新增] 用于监控
+            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
             "loss_conf": loss_conf, "total_loss": final_loss
         })
 

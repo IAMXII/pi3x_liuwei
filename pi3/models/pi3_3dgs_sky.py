@@ -355,7 +355,7 @@ class Pi3_3DGS(nn.Module):
         limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  # 这里改用 N_sub 的开方
         if self.max_dense_gaussians is not None:
             limit_gaussians = min(limit_gaussians, self.max_dense_gaussians)
-            # limit_gaussians = min(limit_gaussians, int(N_sub * H * W / 2))  # 确保至少保留一个高斯
+            limit_gaussians = min(limit_gaussians, int(N_sub * H * W / 2))  # 确保至少保留一个高斯
 
         K_target = min(num_dense, limit_gaussians)
 

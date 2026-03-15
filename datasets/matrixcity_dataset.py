@@ -223,7 +223,7 @@ class MatrixCityDataset(BaseDataset):
                     depthmap = depthmap[:, :, 0]
                 
                 depthmap = depthmap.astype(np.float32)
-                print(depthmap.min(), depthmap.max())
+                # print(depthmap.min(), depthmap.max())
 
             # --- 3. Load Camera Parameters from NPZ ---
             # 直接使用 load_camera_from_npz 读取

@@ -8,6 +8,7 @@ import sys
 import math
 import torch.nn.functional as F
 import torchvision.transforms as T # [新增] 用于光照一致性增强
+from safetensors.torch import load_file
 
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, depth_edge
@@ -15,6 +16,7 @@ from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 # 导入更新后的包装头
+from .layers.conv_head import ConvHead
 from .layers.transformer_head import TransformerDecoder, ConvPts3dHead, ConvDenseGaussianHead, SkyGaussianHead
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14_reg
@@ -86,13 +88,13 @@ class Pi3_3DGS(nn.Module):
             self, 
             pos_type='rope100', 
             decoder_size='large', 
-            load_vggt=True, 
+            load_vggt=False, 
             freeze_encoder=True,
             train_conf=False, 
             train_cam=False, 
             train_geo=False, 
             num_dec_blk_not_to_checkpoint=4,
-            ckpt=None, 
+            ckpt="outputs/pi3_lowres_free/ckpts/best_model/model.safetensors", 
             anchors_per_view=100000, 
             num_sky_anchors=8196, 
             K=8,                    
@@ -168,6 +170,7 @@ class Pi3_3DGS(nn.Module):
         self.camera_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=512, rope=self.rope, use_checkpoint=False)
         self.camera_head = CameraHead(dim=512)
 
+
         self.conf_decoder = deepcopy(self.point_decoder)
         self.conf_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[1])
 
@@ -175,7 +178,7 @@ class Pi3_3DGS(nn.Module):
         self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3])
 
         # ====== [新增: WildGaussians Appearance Modeling] ======
-        self.light_proj = nn.Linear(self.dec_embed_dim, 256)
+        self.light_proj = nn.Linear(self.dec_embed_dim*2, 256)
         # 输入: gs_h (1024) + light_code (256) = 1280. 输出: \Delta\gamma (3) + \beta (3) = 6
         self.appearance_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024 + 256, dim_out=[3, 3])
         
@@ -214,11 +217,49 @@ class Pi3_3DGS(nn.Module):
                 vggt_dec_weight[f'{int(idx)*2}{other}'] = vggt_dec_weight_frame[k]
 
             print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
+            # 1. 加载 camera_decoder
+            cam_dec_weight = {k.replace('camera_decoder.', ''): v for k, v in vggt_weight.items() if k.startswith('camera_decoder.')}
+            if cam_dec_weight:
+                print("Loading camera_decoder", self.camera_decoder.load_state_dict(cam_dec_weight, strict=False))
+            else:
+                print("⚠️ Warning: 在权重文件中未找到 camera_decoder 的参数！")
+
+            # 2. 加载 camera_head
+            cam_head_weight = {k.replace('camera_head.', ''): v for k, v in vggt_weight.items() if k.startswith('camera_head.')}
+            if cam_head_weight:
+                print("Loading camera_head", self.camera_head.load_state_dict(cam_head_weight, strict=False))
+            else:
+                print("⚠️ Warning: 在权重文件中未找到 camera_head 的参数！")
+
+            # 3. 加载 point_decoder
+            pt_dec_weight = {k.replace('point_decoder.', ''): v for k, v in vggt_weight.items() if k.startswith('point_decoder.')}
+            if pt_dec_weight:
+                print("Loading point_decoder", self.point_decoder.load_state_dict(pt_dec_weight, strict=False))
+            else:
+                print("⚠️ Warning: 在权重文件中未找到 point_decoder 的参数！")
+
+            # 4. 加载 point_head
+            pt_head_weight = {k.replace('point_head.', ''): v for k, v in vggt_weight.items() if k.startswith('point_head.')}
+            if pt_head_weight:
+                print("Loading point_head", self.point_head.load_state_dict(pt_head_weight, strict=False))
+            else:
+                print("⚠️ Warning: 在权重文件中未找到 point_head 的参数！")
+            
+            # ========================================================
+
+
 
         if ckpt is not None:
-            checkpoint_data = torch.load(ckpt, weights_only=False, map_location='cpu')
-            res = self.load_state_dict(checkpoint_data, strict=False)
+            if ckpt.endswith(".safetensors"):
+                checkpoint = load_file(ckpt, device="cpu")
+            else:
+                checkpoint = torch.load(ckpt, map_location="cpu")
+
+            res = self.load_state_dict(checkpoint, strict=False)
             print(f'[Pi3] Load checkpoints from {ckpt}: {res}')
+
+            del checkpoint
+            torch.cuda.empty_cache()
 
         if freeze_encoder:
             freeze_all_params([self.encoder])
@@ -239,7 +280,9 @@ class Pi3_3DGS(nn.Module):
             freeze_all_params([self.decoder])
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
-            pass
+            freeze_all_params([self.point_decoder, self.point_head])
+            freeze_all_params([self.gs_decoder, self.gs_head])
+            # pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):
         BN, hw, _ = hidden.shape
@@ -309,6 +352,7 @@ class Pi3_3DGS(nn.Module):
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
         point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
+        # local_xyz_raw = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)# .reshape(B, N_sub, H, W, 3)
         local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
@@ -323,6 +367,7 @@ class Pi3_3DGS(nn.Module):
 
         camera_poses_sub = camera_poses[:, sub_idx]
 
+        # xy, z = local_xyz_raw[0].reshape(B, N_sub, H, W, -1), torch.exp(local_xyz_raw[1].reshape(B, N_sub, H, W, -1))
         xy, z = local_xyz_raw[..., :2], torch.exp(local_xyz_raw[..., 2:3])
         local_pts = torch.cat([xy * z, z], dim=-1)
         local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
@@ -337,7 +382,7 @@ class Pi3_3DGS(nn.Module):
         
         reg_tokens = hidden_sub[:, :self.patch_start_idx, :]
         light_code = self.light_proj(reg_tokens.mean(dim=1)) 
-        light_code_expanded = light_code.unsqueeze(1).expand(-1, hw, -1)
+        light_code_expanded = light_code.unsqueeze(1).expand(-1, 256, -1)
         
         app_in = torch.cat([gs_h, light_code_expanded], dim=-1) 
         app_out = self.appearance_head([app_in], (H, W)).reshape(B, N_sub, H, W, 6)
@@ -372,12 +417,23 @@ class Pi3_3DGS(nn.Module):
             # 仅过 Encoder 抽特征
             hidden_jitter = self.encoder(imgs_jitter_norm, is_training=True)
             if isinstance(hidden_jitter, dict): hidden_jitter = hidden_jitter["x_norm_patchtokens"]
-            hidden_jitter_sub = hidden_jitter.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
-            reg_tokens_jitter = hidden_jitter_sub[:, :self.patch_start_idx, :]
             
+            # [修复点] 必须经过 decode()，拼接 register_tokens，并将维度升至 dec_embed_dim*2
+            hidden_jitter, _ = self.decode(hidden_jitter, N_total, H, W, mem_debug=mem)
+            
+            # 此时 hidden_jitter 的 hw (261) 与通道数 (2048) 已与主干对齐，可以安全 reshape
+            hidden_jitter_sub = hidden_jitter.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
+            
+            # 现在切片拿到的是真正的 register_tokens
+            reg_tokens_jitter = hidden_jitter_sub[:, :self.patch_start_idx, :]
             # 提 Jitter 光照
             light_code_jitter = self.light_proj(reg_tokens_jitter.mean(dim=1))
-            light_jitter_expanded = light_code_jitter.unsqueeze(1).expand(-1, hw, -1)
+            
+            # 原代码:
+            # light_jitter_expanded = light_code_jitter.unsqueeze(1).expand(-1, hw, -1)
+            
+            # 修改为:
+            light_jitter_expanded = light_code_jitter.unsqueeze(1).expand(-1, gs_h.shape[1], -1)
             
             # 重新调色 (复用原图 gs_h 和 base_color)
             app_in_jitter = torch.cat([gs_h, light_jitter_expanded], dim=-1)

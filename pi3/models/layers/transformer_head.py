@@ -47,7 +47,9 @@ class ConvPts3dHead(nn.Module):
             dim_in=dec_embed_dim,
             projects=nn.Identity(),
             dim_out=dim_out, 
-            dim_proj=1024,
+            # ====== [修改点: 解除 1024 维度锁定，随输入变化] ======
+            dim_proj=dec_embed_dim, 
+            # ======================================================
             dim_upsample=[256, 128, 64],
             dim_times_res_block_hidden=2,
             num_res_blocks=2,

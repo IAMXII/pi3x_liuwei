@@ -3,8 +3,8 @@
 trainer: trainers.pi3_trainer.Pi3Trainer
 
 train:
-  image_num_range: [4, 32]     # hres
-  max_img_per_gpu: 32             # hres
+  image_num_range: [2, 12]     # hres
+  max_img_per_gpu: 12             # hres
 
   # low resolution
   resolution: 

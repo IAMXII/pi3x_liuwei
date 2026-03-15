@@ -91,7 +91,8 @@ class Pi3LossGS(nn.Module):
         # 核心补全：动态生成 valid_mask 和 pts3d
         # ==========================================
         # A. 生成掩模: 深度值有效的区域 (大于极小值)
-        masks = (gt_depths > 1e-4).unsqueeze(-1) # [B, N, H, W, 1]
+        # masks = (gt_depths > 1e-4).unsqueeze(-1) # [B, N, H, W, 1]
+        masks = ((gt_depths > 1e-4) & (gt_depths < 58982.4)).unsqueeze(-1) # [B, N, H, W, 1]
 
         # B. 像素坐标网格反投影
         grid_y, grid_x = torch.meshgrid(
@@ -346,6 +347,7 @@ class Pi3LossGS(nn.Module):
         #     loss_push_back = torch.mean(torch.exp(-z_pred_in_invalid / 10.0))
             
         with torch.no_grad():
+            batch_idx =0
             num_viz = min(4, B * N_total)
             rgb_viz = torch.cat([gt_imgs_reshaped[:num_viz], rgb_full[:num_viz]], dim=2) 
             d_pred_viz = aligned_depth_map[:num_viz] / (aligned_depth_map[:num_viz].max() + 1e-5)
@@ -361,7 +363,8 @@ class Pi3LossGS(nn.Module):
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
             
-            mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
+            # mask_depth = (gt_depth_reshaped > 1e-4)
+            mask_depth = valid_masks.reshape(B * N_total, 1, H, W)
             if self.lambda_depth > 0 and mask_depth.sum() > 10:
                 loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
 
@@ -393,7 +396,7 @@ class Pi3LossGS(nn.Module):
         final_loss = (
             self.lambda_rgb * loss_rgb + 
             self.lambda_ssim * loss_ssim + 
-            self.lambda_depth * loss_depth +
+            self.lambda_depth * loss_depth+
             # self.lambda_pose * loss_pose + 
             # self.lambda_scale * loss_scale + 
             self.lambda_pts * loss_pts 

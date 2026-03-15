@@ -12,6 +12,7 @@ from ..utils.geometry import homogenize_points, depth_edge
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
+from .layers.conv_head import ConvHead
 # 导入更新后的包装头
 from .layers.transformer_head import TransformerDecoder, ConvPts3dHead, ConvDenseGaussianHead, SkyGaussianHead
 from .layers.camera_head import CameraHead
@@ -84,13 +85,13 @@ class Pi3_3DGS(nn.Module):
             self, 
             pos_type='rope100', 
             decoder_size='large', 
-            load_vggt=True, 
+            load_vggt=False, 
             freeze_encoder=True,
             train_conf=False, 
             train_cam=False, 
             train_geo=False, 
             num_dec_blk_not_to_checkpoint=4,
-            ckpt=None, 
+            ckpt="ckpts/pi3/model_pi3x.safetensors", 
             anchors_per_view=100000, 
             num_sky_anchors=8196, 
             K=8,                    
@@ -161,10 +162,31 @@ class Pi3_3DGS(nn.Module):
         #  Heads & Sub-Decoders
         # ----------------------
         # 使用替换后的 ConvPts3dHead
-        self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
-        self.point_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[2, 1])
+        self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_num_heads=16,dec_embed_dim=1024, out_dim=1024, rope=self.rope)
+        self.point_head = self.point_head = ConvHead(
+                num_features=4, 
+                dim_in=dec_embed_dim,
+                # projects=nn.Linear(1024, 1024),
+                projects=nn.Identity(),
+                dim_out=[2, 1], 
+                dim_proj=1024,
+                dim_upsample=[256, 128, 64],
+                dim_times_res_block_hidden=2,
+                num_res_blocks=2,
+                res_block_norm='group_norm',
+                last_res_blocks=0,
+                last_conv_channels=32,
+                last_conv_size=1,
+                using_uv=True
+            )
 
-        self.camera_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=512, rope=self.rope, use_checkpoint=False)
+        self.camera_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=16,                # 8
+            out_dim=512,
+            rope=self.rope,
+        )
         self.camera_head = CameraHead(dim=512)
 
         # 同样使用 ConvPts3dHead 预测单个维度的置信度
@@ -209,9 +231,16 @@ class Pi3_3DGS(nn.Module):
             print("Loading vggt decoder", self.decoder.load_state_dict(vggt_dec_weight, strict=False))
 
         if ckpt is not None:
-            checkpoint_data = torch.load(ckpt, weights_only=False, map_location='cpu')
-            res = self.load_state_dict(checkpoint_data, strict=False)
+            if ckpt.endswith(".safetensors"):
+                checkpoint = load_file(ckpt, device="cpu")
+            else:
+                checkpoint = torch.load(ckpt, map_location="cpu")
+
+            res = self.load_state_dict(checkpoint, strict=False)
             print(f'[Pi3] Load checkpoints from {ckpt}: {res}')
+
+            del checkpoint
+            torch.cuda.empty_cache()
 
         if freeze_encoder:
             freeze_all_params([self.encoder])
@@ -232,6 +261,8 @@ class Pi3_3DGS(nn.Module):
             freeze_all_params([self.decoder])
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
+            # freeze_all_params([self.point_decoder, self.point_head])
+            # freeze_all_params
             pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):
@@ -309,7 +340,7 @@ class Pi3_3DGS(nn.Module):
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
         point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-        local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
+        local_xyz_raw = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
         gs_attrs = self.gs_head([gs_h], (H, W)).reshape(B, N_sub, H, W, 11)
@@ -328,7 +359,7 @@ class Pi3_3DGS(nn.Module):
         camera_poses_sub = camera_poses[:, sub_idx]
 
         # 将 Local Point 提升至 Global
-        xy, z = local_xyz_raw[..., :2], torch.exp(local_xyz_raw[..., 2:3])
+        xy, z = local_xyz_raw[0].reshape(B, N_sub, H, W, -1), torch.exp(local_xyz_raw[1].reshape(B, N_sub, H, W, -1))
         local_pts = torch.cat([xy * z, z], dim=-1)
         local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
         global_pts = torch.matmul(camera_poses_sub, local_pts_h).transpose(2, 3).reshape(B, N_sub, H, W, 4)[..., :3]
