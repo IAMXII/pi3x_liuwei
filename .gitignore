@@ -24,4 +24,4 @@ ckpts
 
 resize_demo_imgs.py
 img_dir_to_video.py
-/wandb
+/wandb/
