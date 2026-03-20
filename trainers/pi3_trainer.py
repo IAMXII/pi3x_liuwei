@@ -79,8 +79,10 @@ class Pi3Trainer(BaseTrainer):
             
     def forward_batch(self, batch, mode='train'):
         imgs = torch.stack([view['img'] for view in batch], dim=1)
+        # imgs_paired = torch.stack([view['img_paired'] for view in batch], dim=1) if 'img_paired' in batch[0] else None
+        imgs_paired = torch.stack([view['img_paired'] for view in batch], dim=1) if ('img_paired' in batch[0] and isinstance(batch[0]['img_paired'], torch.Tensor)) else None
         intrinsics = torch.stack([view['camera_intrinsics'] for view in batch], dim=1)
-        pred = self.model(imgs,intrinsics)
+        pred = self.model(imgs, imgs_paired, intrinsics)
 
         return [pred, batch]
     

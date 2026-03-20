@@ -80,6 +80,12 @@ class Pi3LossGS(nn.Module):
         """支持自动从 Depth+Pose+Intrinsics 反投影生成 pts3d 的对齐与 norm 逻辑"""
         # 1. 安全提取 Dataloader 传来的基础数据
         imgs = torch.stack([view['img'] for view in gt], dim=1)
+        imgs_paired = None
+        imgs_paired = None
+        # 👇 修改了这里：不仅检查键存在，还检查值必须是 Tensor
+        if 'img_paired' in gt[0] and isinstance(gt[0]['img_paired'], torch.Tensor):
+            # print("[Pi3LossGS] Detected 'img_paired' in GT, will use it for paired branch supervision.")
+            imgs_paired = torch.stack([view['img_paired'] for view in gt], dim=1)
         gt_depths = torch.stack([view['depthmap'] for view in gt], dim=1)
         poses = torch.stack([view['camera_pose'] for view in gt], dim=1)
         gt_ks = torch.stack([view['camera_intrinsics'] for view in gt], dim=1)
@@ -164,6 +170,7 @@ class Pi3LossGS(nn.Module):
 
         return dict(
             imgs = imgs,
+            imgs_paired = imgs_paired,
             gt_ks = gt_ks,
             gt_depths = gt_depths,
             global_points = gt_pts,
@@ -263,7 +270,7 @@ class Pi3LossGS(nn.Module):
         gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
         pred = self.normalize_pred(pred, gt_sub_mask) 
         
-        gt_ks, gt_c2w, gt_imgs, gt_depths, valid_masks = gt['gt_ks'], gt['gt_c2w'], gt['imgs'], gt['gt_depths'], gt['masks']
+        gt_ks, gt_c2w, gt_imgs,gt_imgs_paired, gt_depths, valid_masks = gt['gt_ks'], gt['gt_c2w'], gt['imgs'], gt['imgs_paired'], gt['gt_depths'], gt['masks']
         gt_local_pts = gt['gt_local_pts']
         
         valid_masks_sub = valid_masks[:, sub_idx].squeeze(-1)
@@ -290,11 +297,11 @@ class Pi3LossGS(nn.Module):
             
             scale_opt = align_points_scale(xyz_pred_ROE, xyz_gt_ROE, xyz_w_ROE)
 
-            # if valid_masks_sub.sum() > 0:
-            #     aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
-            #     loss_pts = F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
-            # else:
-            #     loss_pts = (pred_local_pts.sum() * 0.0)
+            if valid_masks_sub.sum() > 0:
+                aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
+                loss_pts = F.l1_loss(aligned_local_pts[valid_masks_sub], gt_local_pts_sub[valid_masks_sub])
+            else:
+                loss_pts = (pred_local_pts.sum() * 0.0)
 
         gauss_render = {k: v for k, v in gauss_raw.items()} 
         render_c2w = pred_c2w.clone()
@@ -322,32 +329,32 @@ class Pi3LossGS(nn.Module):
             
         gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
         
-        # ====== [新增: 渲染 Jitter 分支并计算 Loss] ======
-        loss_rgb_jitter = torch.tensor(0.0, device=pred_c2w.device)
-        loss_ssim_jitter = torch.tensor(0.0, device=pred_c2w.device)
-        rgb_jitter = None # 预先声明，供可视化使用
+        # ====== [新增: 渲染 paired 分支并计算 Loss] ======
+        loss_rgb_paired = torch.tensor(0.0, device=pred_c2w.device)
+        loss_ssim_paired = torch.tensor(0.0, device=pred_c2w.device)
+        rgb_paired = None # 预先声明，供可视化使用
         
-        if self.train_stage in [1, 2] and pred.get('gaussians_jitter') is not None:
-            gauss_jitter = pred['gaussians_jitter']
-            imgs_jitter_gt = pred['imgs_jitter_gt'].reshape(B * N_sub, 3, H, W)
+        if self.train_stage in [1, 2] and pred.get('gaussians_paired') is not None:
+            # 【核心修复】：完全复用主分支已经经过所有对齐、缩放处理的完美几何体
+            gauss_render_paired = {k: v for k, v in gauss_render.items()} 
             
-            # 同步缩放
-            gauss_jitter["xyz"] = gauss_jitter["xyz"] * detach_scale
-            gauss_jitter["scale"] = gauss_jitter["scale"] * detach_scale
+            # 仅仅把颜色替换为 paired 分支预测出的颜色
+            gauss_render_paired['color'] = pred['gaussians_paired']['color']
             
-            # 取出 sub_idx 的位姿和内参进行渲染
-            # 取出 sub_idx 的位姿和内参进行渲染 (保持 [B, N_sub, 4, 4] 和 [B, N_sub, 3, 3] 形状)
+            imgs_paired_gt = gt_imgs_paired.reshape(B * N_total, 3, H, W)
+            
             w2c_sub = render_w2c[:, sub_idx]
             ks_sub = gt_ks[:, sub_idx]
             
-            rgb_jitter, _, _ = self._render_gs(gauss_jitter, w2c_sub, ks_sub, H, W, render_mode='RGB')
+            # 使用完美几何 + paired颜色 进行渲染
+            rgb_paired, _, _ = self._render_gs(gauss_render_paired, render_w2c, gt_ks, H, W, render_mode='RGB')
             
-            # 此时 rgb_jitter 的形状为 [B, N_sub, H, W, 3]
+            # 此时 rgb_paired 的形状为 [B, N_sub, H, W, 3]
             # 先将其展平为 [B*N_sub, H, W, 3]，然后再将通道维前置变为 [B*N_sub, 3, H, W]
-            rgb_jitter = rgb_jitter.reshape(B * N_sub, H, W, 3).permute(0, 3, 1, 2)
+            rgb_paired = rgb_paired.reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
             
-            loss_rgb_jitter = F.l1_loss(rgb_jitter, imgs_jitter_gt)
-            loss_ssim_jitter = 1.0 - ssim(rgb_jitter, imgs_jitter_gt, data_range=1.0)
+            loss_rgb_paired = F.l1_loss(rgb_paired, imgs_paired_gt)
+            loss_ssim_paired = 1.0 - ssim(rgb_paired, imgs_paired_gt, data_range=1.0)
         # ========================================================
             
         # ====== [扩充: 丰富的可视化内容] ======
@@ -373,15 +380,15 @@ class Pi3LossGS(nn.Module):
             # 初始化拼接列表 [RGB列, Depth列, Error列]
             viz_list = [rgb_viz, depth_viz, error_viz_padded]
 
-            # 4. 新增: Jitter 分支可视化 (上: GT Jitter, 下: Pred Jitter)
-            if rgb_jitter is not None:
-                num_viz_jitter = min(4, B * N_sub)
-                jitter_viz = torch.cat([imgs_jitter_gt[:num_viz_jitter], rgb_jitter[:num_viz_jitter]], dim=2)
+            # 4. 新增: paired 分支可视化 (上: GT paired, 下: Pred paired)
+            if rgb_paired is not None:
+                num_viz_paired = min(4, B * N_total)
+                paired_viz = torch.cat([imgs_paired_gt[:num_viz_paired], rgb_paired[:num_viz_paired]], dim=2)
                 # 应对 N_sub < N_total 时的 batch size 对齐问题
-                if jitter_viz.shape[0] < num_viz:
-                    pad = torch.zeros((num_viz - jitter_viz.shape[0], *jitter_viz.shape[1:]), device=jitter_viz.device)
-                    jitter_viz = torch.cat([jitter_viz, pad], dim=0)
-                viz_list.append(jitter_viz)
+                if paired_viz.shape[0] < num_viz:
+                    pad = torch.zeros((num_viz - paired_viz.shape[0], *paired_viz.shape[1:]), device=paired_viz.device)
+                    paired_viz = torch.cat([paired_viz, pad], dim=0)
+                viz_list.append(paired_viz)
 
             # 5. 新增: Confidence Map (仅在 Stage 3, 上: 空白占位, 下: 置信度热力图)
             if self.train_stage == 3 and 'conf' in pred:
@@ -398,8 +405,8 @@ class Pi3LossGS(nn.Module):
             final_viz = torch.cat(viz_list, dim=3)
             
             # 频率控制: 避免每一步都写入硬盘导致 I/O 瓶颈，比如每 100 step 存一次
-            if batch_idx % 100 == 0:
-                torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}_jitter.png")
+            if batch_idx % 40 == 0:
+                torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}_paired.png")
             
             # 将组装好的大图写入 details，可以直接在外部传给 WandB/Tensorboard
             details["viz_img"] = final_viz
@@ -422,11 +429,11 @@ class Pi3LossGS(nn.Module):
             dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
             loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
             
-        # ====== [修改: 将 Jitter 的误差合并进主 Loss] ======
+        # ====== [修改: 将 paired 的误差合并进主 Loss] ======
         final_loss = (
-            self.lambda_rgb * (loss_rgb + loss_rgb_jitter) + 
-            self.lambda_ssim * (loss_ssim + loss_ssim_jitter)
-            # self.lambda_depth * loss_depth
+            self.lambda_rgb * (loss_rgb+0.6*loss_rgb_paired) + 
+            self.lambda_ssim * (loss_ssim+0.6*loss_ssim_paired)
+            # self.lambda_depth * loss_depth +
             # self.lambda_pts * loss_pts
             # self.lambda_scale * loss_scale + 
             # 1.0 * loss_conf # 补充缺失的置信度loss权重，如果不需要可以删掉
@@ -435,12 +442,14 @@ class Pi3LossGS(nn.Module):
 
         if final_loss == 0.0:
              final_loss = (pred_local_pts.sum() * 0.0)
+        illum_cos_sim = pred.get('illum_cos_sim', torch.tensor(1.0, device=pred_c2w.device))
+        illum_l2_dist = pred.get('illum_l2_dist', torch.tensor(0.0, device=pred_c2w.device))
 
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_rgb_jitter": loss_rgb_jitter, "loss_ssim_jitter": loss_ssim_jitter, # [新增] 用于监控
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
-            "loss_conf": loss_conf, "total_loss": final_loss
+            "loss_rgb_paired": loss_rgb_paired, "loss_ssim_paired": loss_ssim_paired, 
+            "loss_depth": loss_depth, "loss_pts": loss_pts, 
+            "total_loss": final_loss,
+            "illum_cos_sim": illum_cos_sim, "illum_l2_dist": illum_l2_dist  # 添加到字典中输出
         })
-
         return final_loss, details

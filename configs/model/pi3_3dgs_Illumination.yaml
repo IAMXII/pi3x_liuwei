@@ -24,7 +24,7 @@ train:
     num_workers: 16
     batch_size: 1              # not use, dynamic batch size
     num_epoch: 12 #80
-    iters_per_epoch: 20000 # 800
+    iters_per_epoch: 10000 # 800
 
     print_freq: 40
     base_seed: 666
@@ -35,7 +35,7 @@ train:
     dynamic_compile: true
 
     # Training config
-    gradient_accumulation_steps: 2
+    gradient_accumulation_steps: 1
     clip_grad: 1.0
     clip_loss: 20
 

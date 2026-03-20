@@ -310,8 +310,12 @@ class BaseTrainer:
                 total_samples += len(batch)
 
                 # self.log_all(outputs, self.global_step, prefix='val')
-
-                metric_logger.update(**outputs)
+                scalar_metrics = {
+                        k: v for k, v in outputs.items() 
+                        if not (isinstance(v, torch.Tensor) and v.numel() > 1)
+                    }
+                metric_logger.update(**scalar_metrics)
+                # metric_logger.update(**outputs)
 
         # Average the validation loss
         val_loss /= total_samples

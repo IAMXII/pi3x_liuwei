@@ -637,6 +637,8 @@ class BaseDataset(EasyDataset):
 
                 for view in views:
                     view['img'] = self.transform(view['img'])
+                    if 'img_paired' in view:
+                        view['img_paired'] = self.transform(view['img_paired'])
 
                 # # last thing done!
                 # for view in views:

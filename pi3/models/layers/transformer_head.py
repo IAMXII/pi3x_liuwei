@@ -116,7 +116,59 @@ class ConvDenseGaussianHead(nn.Module):
         # 转换回 [B, H, W, 11]
         return feat.permute(0, 2, 3, 1)
 
+class AppearanceModulationHead(nn.Module):
+    def __init__(self, patch_size=14, dec_embed_dim=1024, light_dim=512): # changed light_dim to match CLIP
+        super().__init__()
+        # 1. 光照提取器 (可以直接降维，不需要像 DINO 那样池化)
+        self.light_extractor = nn.Sequential(
+            nn.Linear(light_dim, 256),
+            nn.GELU(),
+            nn.Linear(256, 256) # 内部使用的特征维度
+        )
 
+        # 2. FiLM 生成器
+        self.film_scale = nn.Linear(256, dec_embed_dim)
+        self.film_shift = nn.Linear(256, dec_embed_dim)
+
+        self.conv_head = ConvPts3dHead(
+            patch_size=patch_size, 
+            dec_embed_dim=dec_embed_dim, 
+            dim_out=[3, 3] 
+        )
+        self.zero_proj = nn.Linear(6, 6)
+        self._init_weights()
+
+    def _init_weights(self):
+        # 初始化 FiLM 层为恒等映射
+        nn.init.zeros_(self.film_scale.weight)
+        nn.init.zeros_(self.film_scale.bias)
+        nn.init.zeros_(self.film_shift.weight)
+        nn.init.zeros_(self.film_shift.bias)
+
+        # 【核心修正】彻底摒弃去内部寻找 final_conv 的危险做法
+        # 只将外部拦截的零投影层置零
+        nn.init.zeros_(self.zero_proj.weight)
+        nn.init.zeros_(self.zero_proj.bias)
+
+    def forward(self, light_code, gs_h, img_shape):
+        # light_code shape: [B*N, 512]
+        # 1. 处理 CLIP 提取的全局光照向量
+        light_feat = self.light_extractor(light_code) 
+
+        # 2. 生成 FiLM 参数
+        scale = self.film_scale(light_feat).unsqueeze(1) 
+        shift = self.film_shift(light_feat).unsqueeze(1) 
+
+        # 3. 调制 3D 几何特征
+        gs_h_modulated = gs_h * (1.0 + scale) + shift 
+
+        # 4. CNN 上采样
+        cnn_out = self.conv_head([gs_h_modulated], img_shape) 
+
+        # 5. 零投影拦截
+        app_out = self.zero_proj(cnn_out)
+
+        return app_out
 class SkyGaussianHead(nn.Module):
     """
     动态天空高斯头：几何和透明度维持半固定，但颜色由当前场景的图像特征动态预测。

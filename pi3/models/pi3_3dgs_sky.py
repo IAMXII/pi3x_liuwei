@@ -16,7 +16,7 @@ from .layers.attention import FlashAttentionRope
 from .layers.transformer_head import TransformerDecoder, ConvPts3dHead, ConvDenseGaussianHead, SkyGaussianHead
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14_reg
-
+from .layers.conv_head import ConvHead
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -161,10 +161,39 @@ class Pi3_3DGS(nn.Module):
         #  Heads & Sub-Decoders
         # ----------------------
         # 使用替换后的 ConvPts3dHead
-        self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
-        self.point_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[2, 1])
+        self.point_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=16,                # 8
+            out_dim=1024,
+            rope=self.rope,
+        )
+        # self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
+        self.point_head = ConvHead(
+                num_features=4, 
+                dim_in=dec_embed_dim,
+                # projects=nn.Linear(1024, 1024),
+                projects=nn.Identity(),
+                dim_out=[2, 1], 
+                dim_proj=1024,
+                dim_upsample=[256, 128, 64],
+                dim_times_res_block_hidden=2,
+                num_res_blocks=2,
+                res_block_norm='group_norm',
+                last_res_blocks=0,
+                last_conv_channels=32,
+                last_conv_size=1,
+                using_uv=True
+            )
 
-        self.camera_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=512, rope=self.rope, use_checkpoint=False)
+        ## --------------- Camera ---------------
+        self.camera_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=16,                # 8
+            out_dim=512,
+            rope=self.rope,
+        )
         self.camera_head = CameraHead(dim=512)
 
         # 同样使用 ConvPts3dHead 预测单个维度的置信度
@@ -309,7 +338,7 @@ class Pi3_3DGS(nn.Module):
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
         point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-        local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
+        local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)#.reshape(B, N_sub, H, W, 3)
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
         gs_attrs = self.gs_head([gs_h], (H, W)).reshape(B, N_sub, H, W, 11)
@@ -328,7 +357,7 @@ class Pi3_3DGS(nn.Module):
         camera_poses_sub = camera_poses[:, sub_idx]
 
         # 将 Local Point 提升至 Global
-        xy, z = local_xyz_raw[..., :2], torch.exp(local_xyz_raw[..., 2:3])
+        xy, z = local_xyz_raw[0].reshape(B, N_sub, H, W, 1), torch.exp(local_xyz_raw[1]).reshape(B, N_sub, H, W, 1)
         local_pts = torch.cat([xy * z, z], dim=-1)
         local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
         global_pts = torch.matmul(camera_poses_sub, local_pts_h).transpose(2, 3).reshape(B, N_sub, H, W, 4)[..., :3]

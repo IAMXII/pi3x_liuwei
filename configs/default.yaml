@@ -1,8 +1,8 @@
 # @package _global_
 
 defaults:
-  - model: pi3_3dgs_Illumination.yaml
-  - train: train_pi3_lowres
+  - model: pi3_3dgs.yaml
+  - train: train_pi3_highres
   - data: example.yaml
   - general: default.yaml
   - extras: default.yaml

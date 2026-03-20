@@ -47,6 +47,11 @@ def create_dataloader(cfg, mode):
             print('Initialized resolution', resolutions)
             num_resolution = len(resolutions)
             for dataset_name, weight in weights.items():
+                # 👇 [新增这一段] 根据全局开关拦截：如果开关设为 false，直接跳过不实例化
+                if hasattr(cfg, 'dataset_switches') and dataset_name.lower() in cfg.dataset_switches:
+                    if not cfg.dataset_switches[dataset_name.lower()]:
+                        continue
+                # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name], resolution=resolutions)
                 dataset_i.convert_attributes()
                 datasets_all.append(weight @ dataset_i)
@@ -54,11 +59,21 @@ def create_dataloader(cfg, mode):
             resolutions = cfg.train.resolution
             print('Setting dataset resolution', resolutions)
             for dataset_name, weight in weights.items():
+                # 👇 [新增这一段] 根据全局开关拦截：如果开关设为 false，直接跳过不实例化
+                if hasattr(cfg, 'dataset_switches') and dataset_name.lower() in cfg.dataset_switches:
+                    if not cfg.dataset_switches[dataset_name.lower()]:
+                        continue
+                # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name], resolution=resolutions)
                 dataset_i.convert_attributes()
                 datasets_all.append(weight @ dataset_i)
         else:
             for dataset_name, weight in weights.items():
+                # 👇 [新增这一段] 根据全局开关拦截：如果开关设为 false，直接跳过不实例化
+                if hasattr(cfg, 'dataset_switches') and dataset_name.lower() in cfg.dataset_switches:
+                    if not cfg.dataset_switches[dataset_name.lower()]:
+                        continue
+                # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name])
                 dataset_i.convert_attributes()
                 datasets_all.append(weight @ dataset_i)

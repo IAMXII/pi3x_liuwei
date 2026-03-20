@@ -85,13 +85,13 @@ class Pi3_3DGS(nn.Module):
             self, 
             pos_type='rope100', 
             decoder_size='large', 
-            load_vggt=False, 
+            load_vggt=True, 
             freeze_encoder=True,
             train_conf=False, 
             train_cam=False, 
             train_geo=False, 
             num_dec_blk_not_to_checkpoint=4,
-            ckpt="ckpts/pi3/model_pi3x.safetensors", 
+            ckpt="outputs/pi3_lowres_free/ckpts/best_model/model.safetensors", 
             anchors_per_view=100000, 
             num_sky_anchors=8196, 
             K=8,                    
@@ -162,8 +162,15 @@ class Pi3_3DGS(nn.Module):
         #  Heads & Sub-Decoders
         # ----------------------
         # 使用替换后的 ConvPts3dHead
-        self.point_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_num_heads=16,dec_embed_dim=1024, out_dim=1024, rope=self.rope)
-        self.point_head = self.point_head = ConvHead(
+        self.point_decoder = TransformerDecoder(
+            in_dim=2*self.dec_embed_dim, 
+            dec_embed_dim=1024,
+            dec_num_heads=16,                # 8
+            out_dim=1024,
+            rope=self.rope,
+        )
+        # self.point_head = LinearPts3d(patch_size=14, dec_embed_dim=1024, output_dim=3)
+        self.point_head = ConvHead(
                 num_features=4, 
                 dim_in=dec_embed_dim,
                 # projects=nn.Linear(1024, 1024),
@@ -180,6 +187,7 @@ class Pi3_3DGS(nn.Module):
                 using_uv=True
             )
 
+        ## --------------- Camera ---------------
         self.camera_decoder = TransformerDecoder(
             in_dim=2*self.dec_embed_dim, 
             dec_embed_dim=1024,
@@ -189,12 +197,13 @@ class Pi3_3DGS(nn.Module):
         )
         self.camera_head = CameraHead(dim=512)
 
+
         # 同样使用 ConvPts3dHead 预测单个维度的置信度
         self.conf_decoder = deepcopy(self.point_decoder)
         self.conf_head = ConvPts3dHead(patch_size=14, dec_embed_dim=1024, dim_out=[1])
 
         # 使用 ConvDenseGaussianHead 预测高斯的所有属性
-        self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, out_dim=1024, rope=self.rope)
+        self.gs_decoder = TransformerDecoder(in_dim=2*self.dec_embed_dim, dec_embed_dim=1024, dec_num_heads=16,out_dim=1024, rope=self.rope)
         self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3])
         
         # self.sky_head = SkyGaussianHead(
@@ -209,7 +218,7 @@ class Pi3_3DGS(nn.Module):
         #   VGGT Weight Loading
         # ----------------------
         if load_vggt:
-            vggt_weight = load_file('ckpts/pi3/model_pi3x.safetensors')
+            vggt_weight = load_file('outputs/pi3_lowres_free/ckpts/best_model/model.safetensors')
             
             vggt_enc_weight = {k.replace('aggregator.patch_embed.', ''):vggt_weight[k] for k in list(vggt_weight.keys()) if k.startswith('aggregator.patch_embed.')}
             print("Loading vggt encoder", self.encoder.load_state_dict(vggt_enc_weight, strict=False))
@@ -238,6 +247,7 @@ class Pi3_3DGS(nn.Module):
 
             res = self.load_state_dict(checkpoint, strict=False)
             print(f'[Pi3] Load checkpoints from {ckpt}: {res}')
+            print(f'[Pi3] Load checkpoints from {ckpt}')
 
             del checkpoint
             torch.cuda.empty_cache()
@@ -261,8 +271,6 @@ class Pi3_3DGS(nn.Module):
             freeze_all_params([self.decoder])
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
-            # freeze_all_params([self.point_decoder, self.point_head])
-            # freeze_all_params
             pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):
@@ -340,6 +348,7 @@ class Pi3_3DGS(nn.Module):
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
         point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
+        # local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
         local_xyz_raw = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
