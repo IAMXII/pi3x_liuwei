@@ -271,6 +271,7 @@ class Pi3_3DGS(nn.Module):
             freeze_all_params([self.decoder])
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
+            freeze_all_params([self.point_decoder,self.point_head])
             pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):

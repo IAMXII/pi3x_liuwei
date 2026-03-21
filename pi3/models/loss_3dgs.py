@@ -393,11 +393,11 @@ class Pi3LossGS(nn.Module):
         # lambda_push_back = 0.02
         final_loss = (
             self.lambda_rgb * loss_rgb + 
-            self.lambda_ssim * loss_ssim + 
-            self.lambda_depth * loss_depth +
+            self.lambda_ssim * loss_ssim
+            # self.lambda_depth * loss_depth +
             # self.lambda_pose * loss_pose + 
             # self.lambda_scale * loss_scale + 
-            self.lambda_pts * loss_pts 
+            # self.lambda_pts * loss_pts 
             # loss_conf
             # lambda_sparsity * loss_dense_sparsity + 
             # lambda_push_back * loss_push_back       
@@ -408,7 +408,7 @@ class Pi3LossGS(nn.Module):
 
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
+            # "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
             "loss_conf": loss_conf, "total_loss": final_loss
         })
 

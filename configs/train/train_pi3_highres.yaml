@@ -3,8 +3,8 @@
 trainer: trainers.pi3_trainer.Pi3Trainer
 
 train:
-  image_num_range: [2, 8]     # hres
-  max_img_per_gpu: 8             # hres
+  image_num_range: [2, 12]     # hres
+  max_img_per_gpu: 12             # hres
 
   # dynamic resolution and 
   random_reslution: true
@@ -14,4 +14,4 @@ train:
   num_resolution: -1
 
 model:
-  ckpt: "outputs/pi3_lowres_Illumination/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
+  ckpt: "outputs/pi3_highres/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>

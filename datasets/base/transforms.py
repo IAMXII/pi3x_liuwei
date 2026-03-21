@@ -139,3 +139,6 @@ JitterJpegLossBlurring = tvf.Compose([
     Blurring(prob=0.5, resize_ratio_range=(0.25, 1)), 
     tvf.ToTensor() 
 ])
+NoTransform = tvf.Compose([
+    tvf.ToTensor()
+])
