@@ -14,37 +14,114 @@ class Pi3Trainer(BaseTrainer):
         self.train_loss = hydra.utils.instantiate(cfg.loss.train_loss)
         self.test_loss = hydra.utils.instantiate(cfg.loss.train_loss)
 
+    # def build_optimizer(self, cfg_optimizer, model):
+    #     def param_group_fn(model_):
+    #         encoder_params = [param for param in model_.encoder.named_parameters()]
+    #         other_params = [
+    #             (name, param) for name, param in model_.named_parameters()
+    #             if not name.startswith("encoder.") and not '.encoder.' in name
+    #         ]
+
+    #         print(f'Number of trainable encoder parameters:', sum(p.numel() for _, p in encoder_params if p.requires_grad))
+    #         print(f'Length of trainable others:', sum(p.numel() for _, p in other_params if p.requires_grad))
+
+    #         def handle_weight_decay(params, weight_decay, lr):
+    #             decay = []
+    #             no_decay = []
+    #             for name, param in params:
+    #                 if not param.requires_grad:
+    #                     continue
+
+    #                 if param.ndim <= 1 or name.endswith(".bias"):
+    #                     no_decay.append(param)
+    #                 else:
+    #                     decay.append(param)
+
+    #             return [
+    #                 {"params": no_decay, "weight_decay": 0.0, 'lr': lr},
+    #                 {"params": decay, "weight_decay": weight_decay, 'lr': lr},
+    #             ]
+
+    #         res = []
+    #         res.extend(handle_weight_decay(encoder_params, cfg_optimizer.weight_decay, cfg_optimizer.encoder_lr))
+    #         res.extend(handle_weight_decay(other_params, cfg_optimizer.weight_decay, cfg_optimizer.lr))
+
+    #         return res
+        
+    #     return super().build_optimizer(cfg_optimizer, model, param_group_fn=param_group_fn)
     def build_optimizer(self, cfg_optimizer, model):
         def param_group_fn(model_):
-            encoder_params = [param for param in model_.encoder.named_parameters()]
-            other_params = [
-                (name, param) for name, param in model_.named_parameters()
-                if not name.startswith("encoder.") and not '.encoder.' in name
-            ]
+            # 1. 精细化参数分组容器
+            encoder_params = []
+            point_decoder_params = []
+            gs_decoder_params = []
+            camera_decoder_params = []
+            other_params = []
 
-            print(f'Number of trainable encoder parameters:', sum(p.numel() for _, p in encoder_params if p.requires_grad))
-            print(f'Length of trainable others:', sum(p.numel() for _, p in other_params if p.requires_grad))
+            # 2. 遍历并分类参数
+            for name, param in model_.named_parameters():
+                if not param.requires_grad:
+                    continue  # 跳过已经物理冻结的参数（如 encoder）
+
+                if name.startswith("encoder.") or '.encoder.' in name:
+                    encoder_params.append((name, param))
+                elif 'point_decoder' in name:
+                    point_decoder_params.append((name, param))
+                elif 'gs_decoder' in name:
+                    gs_decoder_params.append((name, param))
+                elif 'camera_decoder' in name:
+                    camera_decoder_params.append((name, param))
+                else:
+                    other_params.append((name, param))
+
+            # 打印各组可训练参数的数量，方便你 debug 检查
+            print(f'Trainable encoder params:', sum(p.numel() for _, p in encoder_params))
+            print(f'Trainable point_decoder params:', sum(p.numel() for _, p in point_decoder_params))
+            print(f'Trainable gs_decoder params:', sum(p.numel() for _, p in gs_decoder_params))
+            print(f'Trainable camera_decoder params:', sum(p.numel() for _, p in camera_decoder_params))
+            print(f'Trainable other params:', sum(p.numel() for _, p in other_params))
 
             def handle_weight_decay(params, weight_decay, lr):
                 decay = []
                 no_decay = []
                 for name, param in params:
-                    if not param.requires_grad:
-                        continue
-
                     if param.ndim <= 1 or name.endswith(".bias"):
                         no_decay.append(param)
                     else:
                         decay.append(param)
 
-                return [
-                    {"params": no_decay, "weight_decay": 0.0, 'lr': lr},
-                    {"params": decay, "weight_decay": weight_decay, 'lr': lr},
-                ]
+                groups = []
+                # 增加非空判断，避免 PyTorch 优化器收到空的 param_group 报错
+                if no_decay:
+                    groups.append({"params": no_decay, "weight_decay": 0.0, 'lr': lr})
+                if decay:
+                    groups.append({"params": decay, "weight_decay": weight_decay, 'lr': lr})
+                return groups
 
             res = []
-            res.extend(handle_weight_decay(encoder_params, cfg_optimizer.weight_decay, cfg_optimizer.encoder_lr))
-            res.extend(handle_weight_decay(other_params, cfg_optimizer.weight_decay, cfg_optimizer.lr))
+            base_lr = cfg_optimizer.lr
+            
+            # 3. 分配差异化学习率 (核心精进策略)
+            
+            # Encoder: 如果有解冻层，用专门的 encoder_lr
+            if encoder_params:
+                res.extend(handle_weight_decay(encoder_params, cfg_optimizer.weight_decay, getattr(cfg_optimizer, 'encoder_lr', base_lr * 0.01)))
+            
+            # Point Decoder (几何): 极低学习率 (5%)，实现“软冻结”，只允许微小形变
+            if point_decoder_params:
+                res.extend(handle_weight_decay(point_decoder_params, cfg_optimizer.weight_decay, base_lr * 0.05))
+            
+            # # Camera Decoder (相机姿态): 收敛后期通常不需要大动 (1%)
+            # if camera_decoder_params:
+            #     res.extend(handle_weight_decay(camera_decoder_params, cfg_optimizer.weight_decay, base_lr * 0.01))
+            
+            # GS Decoder (颜色/透明度等): 现阶段的优化主力，保持 100% 基础学习率
+            if gs_decoder_params:
+                res.extend(handle_weight_decay(gs_decoder_params, cfg_optimizer.weight_decay, base_lr * 1.0))
+            
+            # 其他主干网络 (如 Transformer 主体): 压低学习率 (10%)，稳定已有的特征空间
+            if other_params:
+                res.extend(handle_weight_decay(other_params, cfg_optimizer.weight_decay, base_lr * 0.1))
 
             return res
         

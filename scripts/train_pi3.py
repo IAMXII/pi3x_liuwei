@@ -1,6 +1,11 @@
 import sys
 sys.path.append('.')
-
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 import hydra
 import trainers
 

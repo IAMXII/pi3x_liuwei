@@ -15,7 +15,7 @@ dataset_switches:
 # =========================================================
 
 train_dataset:
-    length: 500000         # dummy
+    length: 300000         # dummy
 
     # 这里的权重都会保留，但在代码中可以通过读取 enabled 状态来决定是否使用该权重
     weights: 
@@ -32,7 +32,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -43,7 +43,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -54,7 +54,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -65,7 +65,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
     
@@ -76,7 +76,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -87,7 +87,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -98,7 +98,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 
@@ -109,7 +109,7 @@ train_dataset:
         aug_crop: 16
         transform:
             _partial_: true
-            _target_: datasets.base.transforms.JitterJpegLossBlurring
+            _target_: datasets.base.transforms.NoTransform
         aug_focal: 0.9
         mode: 'train'
 

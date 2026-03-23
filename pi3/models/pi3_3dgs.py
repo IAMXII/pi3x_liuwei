@@ -271,7 +271,7 @@ class Pi3_3DGS(nn.Module):
             freeze_all_params([self.decoder])
             freeze_all_params([self.camera_decoder, self.camera_head])
             freeze_all_params([self.conf_decoder, self.conf_head])
-            freeze_all_params([self.point_decoder,self.point_head])
+            # freeze_all_params([self.point_decoder,self.point_head])
             pass
 
     def decode(self, hidden, N, H, W, mem_debug=None):
@@ -408,8 +408,63 @@ class Pi3_3DGS(nn.Module):
                 K_target = max(min(max_valid_in_batch, limit_gaussians), 1) 
                 _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
             else:
-                _, topk_indices = torch.topk(d_opacity.squeeze(-1), k=K_target, dim=1)
-
+                # 【修改这里】：在 Stage 1, 2 加入 Gumbel 随机探索，打破死神经元
+                if self.training:
+                    # 获取 Sigmoid 前的 Logits (gs_attrs[..., 7:8] 即为 Opacity Logits)
+                    opacity_logits = gs_attrs[..., 7:8].reshape(B, -1)
+                    # 生成 Gumbel 噪声
+                    noise = torch.rand_like(opacity_logits)
+                    gumbel_noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
+                    # 打分 = 原始 Logits + 适度噪声 (Temperature设为1.0左右)
+                    scores = opacity_logits + gumbel_noise * 1.0 
+                    _, topk_indices = torch.topk(scores, k=K_target, dim=1)
+                else:
+                    # 推理时保持确定性硬截断
+                    _, topk_indices = torch.topk(d_opacity.squeeze(-1), k=K_target, dim=1)
+            # else:
+            #     if self.training:
+            #         # ==========================================================
+            #         # 极速优化版：阈值截断 + 随机探索 (替代 Gumbel TopK)
+            #         # ==========================================================
+            #         # 提取 Logits，形状为 [B, N]
+            #         opacity_logits = gs_attrs[..., 7:8].squeeze(-1).reshape(B, -1)
+                    
+            #         # 设定存活阈值：Sigmoid(x) > 0.05 等价于 logits > -2.944
+            #         # 这是一个合理的“微弱可见”界限
+            #         thresh = -2.944 
+                    
+            #         topk_indices_list = []
+            #         for b in range(B):
+            #             logits_b = opacity_logits[b]
+                        
+            #             # 1. 划分优质点池
+            #             valid_mask = logits_b > thresh
+            #             valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            #             M = valid_idx.shape[0]
+                        
+            #             if M >= K_target:
+            #                 # 优质点过多：执行极速随机下采样 (Dropout regularizer)
+            #                 perm = torch.randperm(M, device=logits_b.device)[:K_target]
+            #                 final_idx = valid_idx[perm]
+            #             else:
+            #                 # 优质点不足：从死神经元中随机抽取填补空缺 (Exploration)
+            #                 dead_idx = (~valid_mask).nonzero(as_tuple=True)[0]
+            #                 need_more = K_target - M
+                            
+            #                 if dead_idx.shape[0] > need_more:
+            #                     perm = torch.randperm(dead_idx.shape[0], device=logits_b.device)[:need_more]
+            #                     resurrect_idx = dead_idx[perm]
+            #                 else:
+            #                     resurrect_idx = dead_idx
+                                
+            #                 final_idx = torch.cat([valid_idx, resurrect_idx], dim=0)
+                            
+            #             topk_indices_list.append(final_idx)
+                        
+            #         topk_indices = torch.stack(topk_indices_list, dim=0)
+            #     else:
+            #         # 推理时保持确定性硬截断
+            #         _, topk_indices = torch.topk(d_opacity.squeeze(-1), k=K_target, dim=1)
             def filter_topk(tensor):
                 C = tensor.shape[-1]
                 expanded_indices = topk_indices.unsqueeze(-1).expand(-1, -1, C)

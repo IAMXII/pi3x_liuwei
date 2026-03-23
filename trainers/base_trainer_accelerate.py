@@ -104,8 +104,16 @@ class BaseTrainer:
         # Create the LR scheduler
         self.iters_per_epoch = self.cfg.train.iters_per_epoch if self.cfg.train.iters_per_epoch > 0 else len(self.train_loader)
         self.iters_per_test = self.cfg.test.iters_per_test if self.cfg.test.iters_per_test > 0 else len(self.test_loader)
-        self.cfg.train.lr_scheduler.total_steps = self.cfg.train.num_epoch * self.iters_per_epoch
-        self.log_info(f"Total step for lr scheduler: {self.cfg.train.lr_scheduler.total_steps} ({self.cfg.train.num_epoch} * {self.iters_per_epoch})")
+        # self.cfg.train.lr_scheduler.total_steps = self.cfg.train.num_epoch * self.iters_per_epoch
+        # 【修改点】：只有当 yaml 中存在 total_steps 时，才动态计算并赋值，兼容 OneCycleLR
+        if 'total_steps' in self.cfg.train.lr_scheduler:
+            # 临时解除 OmegaConf 的结构锁定
+            with open_dict(self.cfg.train.lr_scheduler):
+                self.cfg.train.lr_scheduler.total_steps = self.cfg.train.num_epoch * self.iters_per_epoch
+            self.log_info(f"Total step for lr scheduler: {self.cfg.train.lr_scheduler.total_steps} ({self.cfg.train.num_epoch} * {self.iters_per_epoch})")
+        else:
+            self.log_info(f"Using scheduler {self.cfg.train.lr_scheduler.type} without dynamic total_steps.")
+        # self.log_info(f"Total step for lr scheduler: {self.cfg.train.lr_scheduler.total_steps} ({self.cfg.train.num_epoch} * {self.iters_per_epoch})")
         self.lr_scheduler = build_scheduler(
             self.cfg.train.lr_scheduler, optimizer=self.optimizer
         )
@@ -189,7 +197,39 @@ class BaseTrainer:
     def prepare_model(self):
         model = hydra.utils.instantiate(self.cfg.model)
         count_parameters(model)
+        # model.encoder = torch.compile(model.encoder)
+        # model.decoder = torch.compile(model.decoder)
         return model
+    # def prepare_model(self):
+    #     model = hydra.utils.instantiate(self.cfg.model)
+    #     count_parameters(model)
+        
+    #     try:
+    #         import torch._dynamo
+    #         torch._dynamo.config.suppress_errors = True 
+            
+    #         self.log_info("Applying torch.compile to decoder modules...")
+            
+    #         # 【修改点】：取消 max-autotune，改用 default，防止极端融合导致 NaN
+    #         compile_mode = "default" 
+            
+    #         if hasattr(model, 'decoder') and isinstance(model.decoder, torch.nn.ModuleList):
+    #             for i in range(len(model.decoder)):
+    #                 model.decoder[i] = torch.compile(model.decoder[i], mode=compile_mode)
+            
+    #         if hasattr(model, 'point_decoder'):
+    #             model.point_decoder = torch.compile(model.point_decoder, mode=compile_mode)
+    #         if hasattr(model, 'gs_decoder'):
+    #             model.gs_decoder = torch.compile(model.gs_decoder, mode=compile_mode)
+    #         if hasattr(model, 'camera_decoder'):
+    #             model.camera_decoder = torch.compile(model.camera_decoder, mode=compile_mode)
+    #         if hasattr(model, 'conf_decoder'):
+    #             model.conf_decoder = torch.compile(model.conf_decoder, mode=compile_mode)
+                
+    #     except Exception as e:
+    #         self.log_info(f"torch.compile failed or skipped. Error: {e}")
+
+    #     return model
     
     def before_epoch(self, epoch):
         pass
