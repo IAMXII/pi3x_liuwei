@@ -7,7 +7,7 @@ from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .pi3_3dgs import matrix_to_quaternion, quat_mult
 from ..utils.alignment import align_points_scale
 from ..utils.geometry import depth_edge, homogenize_points
-
+import lpips
 def se3_inverse(T):
     R = T[..., :3, :3]
     t = T[..., :3, 3:4]
@@ -67,6 +67,7 @@ class Pi3LossGS(nn.Module):
         self.lambda_pose = lambda_pose
         self.lambda_scale = lambda_scale
         self.lambda_pts = lambda_pts 
+        self.lambda_lpips = 0.1
         
         # 强制转换为 int，防止 YAML 解析为字符串导致的幽灵 Bug
         self.train_stage = int(train_stage) 
@@ -75,6 +76,8 @@ class Pi3LossGS(nn.Module):
         self.train_conf = train_conf 
         self.num_sky_anchors = num_sky_anchors
         self.camera_loss_fn = CameraPoseLoss()
+        self.lpips_loss_fn = lpips.LPIPS(net='alex').to('cuda')
+        
 
     def prepare_gt(self, gt):
         """支持自动从 Depth+Pose+Intrinsics 反投影生成 pts3d 的对齐与 norm 逻辑"""
@@ -275,6 +278,7 @@ class Pi3LossGS(nn.Module):
         B, N_total, C, H, W = gt['imgs'].shape
         sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
         N_sub = len(sub_idx)
+        # lpips_loss_fn = lpips.LPIPS(net='alex').to(gt['imgs'].device)
 
         gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
         pred = self.normalize_pred(pred, gt_sub_mask) 
@@ -387,7 +391,7 @@ class Pi3LossGS(nn.Module):
         if self.train_stage in [1, 2]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
-            
+            loss_lpips = self.lpips_loss_fn(rgb_full, gt_imgs_reshaped).mean()
             mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
             if self.lambda_depth > 0 and mask_depth.sum() > 10:
                 loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
@@ -421,6 +425,7 @@ class Pi3LossGS(nn.Module):
             self.lambda_rgb * loss_rgb + 
             self.lambda_ssim * loss_ssim +
             self.lambda_depth * loss_depth +
+            self.lambda_lpips * loss_lpips +
             # self.lambda_pose * loss_pose + 
             # self.lambda_scale * loss_scale + 
             self.lambda_pts * loss_pts 
@@ -435,6 +440,7 @@ class Pi3LossGS(nn.Module):
         details.update({
             "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
             "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
+            "loss_lpips": loss_lpips,
             "total_loss": final_loss
         })
 

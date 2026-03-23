@@ -109,7 +109,7 @@ class Pi3Trainer(BaseTrainer):
             
             # Point Decoder (几何): 极低学习率 (5%)，实现“软冻结”，只允许微小形变
             if point_decoder_params:
-                res.extend(handle_weight_decay(point_decoder_params, cfg_optimizer.weight_decay, base_lr * 0.05))
+                res.extend(handle_weight_decay(point_decoder_params, cfg_optimizer.weight_decay, base_lr * 0.07))
             
             # # Camera Decoder (相机姿态): 收敛后期通常不需要大动 (1%)
             # if camera_decoder_params:

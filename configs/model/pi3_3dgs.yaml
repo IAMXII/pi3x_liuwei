@@ -23,7 +23,7 @@ loss:
 train:
     num_workers: 16
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 12 #80
+    num_epoch: 2 #80
     iters_per_epoch: 10000 # 800
 
     print_freq: 40
@@ -35,7 +35,7 @@ train:
     dynamic_compile: true
 
     # Training config
-    gradient_accumulation_steps: 1
+    gradient_accumulation_steps: 4
     clip_grad: 1.0
     clip_loss: 10
 
@@ -58,7 +58,7 @@ train:
     # Optimizer config
     optimizer:
         type: AdamW
-        lr: 5e-5
+        lr: 4e-5
         weight_decay: 5e-2
         betas: [0.9, 0.95]
         verbose: true
@@ -77,7 +77,7 @@ train:
     # 彻底抛弃坑人的 OneCycleLR
     lr_scheduler:
         type: CosineAnnealingLR
-        total_steps: 100000    # 12个epoch * 10000步。这里直接写死，最安全！
+        total_steps: -1    # 12个epoch * 10000步。这里直接写死，最安全！
         eta_min: 1e-7
 
 test:
