@@ -8,7 +8,7 @@ train:
 
   # low resolution
   resolution: 
-    - [574, 434]
+    - [224, 224]
 
 model:
   ckpt: "outputs/pi3_highres_0324/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
