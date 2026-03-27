@@ -416,7 +416,7 @@ class Pi3_3DGS(nn.Module):
                     noise = torch.rand_like(opacity_logits)
                     gumbel_noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
                     # 打分 = 原始 Logits + 适度噪声 (Temperature设为1.0左右)
-                    scores = opacity_logits + gumbel_noise * 1.0 
+                    scores = opacity_logits + gumbel_noise * 0.0 
                     _, topk_indices = torch.topk(scores, k=K_target, dim=1)
                 else:
                     # 推理时保持确定性硬截断

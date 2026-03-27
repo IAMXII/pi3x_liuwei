@@ -8,6 +8,8 @@ from .pi3_3dgs import matrix_to_quaternion, quat_mult
 from ..utils.alignment import align_points_scale
 from ..utils.geometry import depth_edge, homogenize_points
 import lpips
+from math import exp
+
 def se3_inverse(T):
     R = T[..., :3, :3]
     t = T[..., :3, 3:4]
@@ -18,6 +20,82 @@ def se3_inverse(T):
     T_inv[..., :3, 3:4] = t_inv
     T_inv[..., 3, 3] = 1.0
     return T_inv
+
+# def gaussian(window_size, sigma):
+#     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+#     return gauss / gauss.sum()
+
+# def create_window(window_size, channel):
+#     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+#     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+#     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+#     return window
+
+# def cs_ssim(img1, img2, window_size=11):
+#     """
+#     只计算对比度(Contrast)和结构(Structure)的相似度，完全忽略亮度差异。
+#     输入 img1, img2: 形状为 [B, C, H, W]，值域通常在 [0, 1]
+#     """
+#     channel = img1.size(1)
+#     window = create_window(window_size, channel).to(img1.device)
+    
+#     # 计算局部均值 (mu)
+#     mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+#     mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    
+#     mu1_sq = mu1.pow(2)
+#     mu2_sq = mu2.pow(2)
+#     mu1_mu2 = mu1 * mu2
+    
+#     # 计算局部方差 (sigma^2) 和 协方差 (sigma_12)
+#     sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
+#     sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
+#     sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+    
+#     # 常数 C2，防止分母为 0 (通常设为 (K2 * L)^2，其中 K2=0.03, L=1.0)
+#     C2 = 0.0009 
+    
+#     # 核心：只计算 CS 映射，忽略 L 映射
+#     cs_map = (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)
+    
+#     return cs_map.mean()
+
+# ==========================================
+# === 新增：Sobel 边缘损失提取函数 ===
+# ==========================================
+def sobel_edge_loss(pred, gt):
+    """
+    计算图像的 Sobel 边缘/梯度 L1 Loss。
+    输入: pred, gt 形状均为 [B, C, H, W]
+    """
+    device = pred.device
+    channels = pred.size(1)
+    
+    # 定义 3x3 Sobel 算子
+    sobel_x = torch.tensor([[-1., 0., 1.], 
+                            [-2., 0., 2.], 
+                            [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1., -2., -1.], 
+                            [0.,  0.,  0.], 
+                            [1.,  2.,  1.]], device=device).view(1, 1, 3, 3)
+    
+    # 扩展到所有通道，使用分组卷积 (groups=channels) 独立计算每个通道的梯度
+    sobel_x = sobel_x.repeat(channels, 1, 1, 1)
+    sobel_y = sobel_y.repeat(channels, 1, 1, 1)
+    
+    # 提取水平和垂直梯度
+    pred_dx = F.conv2d(pred, sobel_x, padding=1, groups=channels)
+    pred_dy = F.conv2d(pred, sobel_y, padding=1, groups=channels)
+    
+    gt_dx = F.conv2d(gt, sobel_x, padding=1, groups=channels)
+    gt_dy = F.conv2d(gt, sobel_y, padding=1, groups=channels)
+    
+    # 计算梯度域的 L1 损失
+    loss_dx = F.l1_loss(pred_dx, gt_dx)
+    loss_dy = F.l1_loss(pred_dy, gt_dy)
+    
+    return loss_dx + loss_dy
+# ==========================================
 
 class CameraPoseLoss(nn.Module):
     def __init__(self, alpha=10000):
@@ -56,8 +134,8 @@ class CameraPoseLoss(nn.Module):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1.2, lambda_ssim=0.7, lambda_depth=0.5, 
-            lambda_pose=0.2, lambda_scale=0.1, lambda_pts=0.5, train_stage=1, local_align_res=4096,
+            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=0.3, 
+            lambda_pose=0.2, lambda_scale=0.1, lambda_pts=0.3, train_stage=1, local_align_res=4096,
             train_conf=False, num_sky_anchors=8196 
     ):
         super().__init__()
@@ -68,6 +146,7 @@ class Pi3LossGS(nn.Module):
         self.lambda_scale = lambda_scale
         self.lambda_pts = lambda_pts 
         self.lambda_lpips = 0.1
+        self.lambda_edge = 0.15 # === 新增：Edge Loss 权重，可调 ===
         
         # 强制转换为 int，防止 YAML 解析为字符串导致的幽灵 Bug
         self.train_stage = int(train_stage) 
@@ -215,19 +294,6 @@ class Pi3LossGS(nn.Module):
 
         return pred
 
-    # def prepare_ROE(self, pts, mask, target_size=4096):
-    #     B, N, H, W, C = pts.shape
-    #     output = []
-    #     for i in range(B):
-    #         valid_pts = pts[i][mask[i]]
-    #         if valid_pts.shape[0] > 0:
-    #             valid_pts = valid_pts.permute(1, 0).unsqueeze(0)
-    #             valid_pts = F.interpolate(valid_pts, size=target_size, mode='nearest')
-    #             valid_pts = valid_pts.squeeze(0).permute(1, 0)
-    #         else:
-    #             valid_pts = torch.ones((target_size, C), device=valid_pts.device)
-    #         output.append(valid_pts)
-    #     return torch.stack(output, dim=0)
     def prepare_ROE(self, pts, mask, target_size=4096):
         """
         优化版：消除 for 循环中因 shape[0] 动态导致的 CPU-GPU 同步阻塞
@@ -278,7 +344,6 @@ class Pi3LossGS(nn.Module):
         B, N_total, C, H, W = gt['imgs'].shape
         sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
         N_sub = len(sub_idx)
-        # lpips_loss_fn = lpips.LPIPS(net='alex').to(gt['imgs'].device)
 
         gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
         pred = self.normalize_pred(pred, gt_sub_mask) 
@@ -294,7 +359,8 @@ class Pi3LossGS(nn.Module):
         
         pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
 
-        loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_pts = torch.tensor(0.0, device=pred_c2w.device)
+        # === 新增：初始化 loss_edge 为 0 ===
+        loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_pts = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
         scale_opt = torch.ones((B,), device=pred_c2w.device)
@@ -310,12 +376,6 @@ class Pi3LossGS(nn.Module):
             
             scale_opt = align_points_scale(xyz_pred_ROE, xyz_gt_ROE, xyz_w_ROE)
             
-            # scale_opt = torch.nan_to_num(scale_opt, nan=1.0, posinf=1.0, neginf=1.0)
-            # scale_opt = torch.where(scale_opt <= 0, -scale_opt, scale_opt)
-            # scale_opt = torch.clamp(scale_opt, min=1e-3, max=100.0) 
-
-            # loss_scale = F.l1_loss(scale_opt, torch.ones_like(scale_opt))
-
             if valid_masks_sub.sum() > 0:
                 aligned_local_pts = pred_local_pts * scale_opt.view(B, 1, 1, 1, 1)
                 
@@ -323,11 +383,7 @@ class Pi3LossGS(nn.Module):
             else:
                 loss_pts = (pred_local_pts.sum() * 0.0)
 
-        # ==========================================================
-        # [修改点 5] 高斯渲染时全面使用 PRED Pose (覆盖所有 N_total 视角)
-        # ==========================================================
         gauss_render = {k: v for k, v in gauss_raw.items()} 
-        # 直接使用全网预测的 N_total 相机位姿（此处无需利用 GT 锚定，相机渲染是相对系）
         render_c2w = pred_c2w.clone()
 
         if self.train_stage in [1, 2]:
@@ -336,15 +392,10 @@ class Pi3LossGS(nn.Module):
             gauss_render["xyz"] = gauss_raw["xyz"] * detach_scale
             gauss_render["scale"] = gauss_raw["scale"] * detach_scale
 
-        # ==========================================================
-        # 优化点 2：使用 gsplat 原生支持的 RGB+ED 一次性渲染
-        # ==========================================================
         render_w2c = se3_inverse(render_c2w)
         
-        # 只调用一次 _render_gs，拿到的 render_out 形状为 [B*N_total, H, W, 4]
         render_out, _, _ = self._render_gs(gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB+ED')
         
-        # 拆解 RGB (前3个通道) 和 ED 深度 (第4个通道)
         rgb_full = render_out[..., :3].reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
         depth_map = render_out[..., 3:4].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
         
@@ -358,22 +409,6 @@ class Pi3LossGS(nn.Module):
             
         gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
         mask_depth = (gt_depth_reshaped > 1e-4)
-        # invalid_depth_mask = ~mask_depth
-        
-        # loss_dense_sparsity = torch.tensor(0.0, device=pred_c2w.device)
-        # loss_push_back = torch.tensor(0.0, device=pred_c2w.device)
-
-        # if self.train_stage in [1, 2] and invalid_depth_mask.sum() > 0:
-        #     num_sky = gauss_raw.get("num_sky", self.num_sky_anchors)
-        #     dense_gauss_render = {k: v[:, :-num_sky] for k, v in gauss_render.items() if k != "num_sky"}
-        #     _, dense_alpha, _ = self._render_gs(dense_gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB')
-        #     dense_alpha = dense_alpha.reshape(B * N_total, 1, H, W)
-            
-        #     alpha_in_invalid = dense_alpha[invalid_depth_mask]
-        #     loss_dense_sparsity = torch.mean(torch.abs(alpha_in_invalid))
-            
-        #     z_pred_in_invalid = aligned_depth_map[invalid_depth_mask]
-        #     loss_push_back = torch.mean(torch.exp(-z_pred_in_invalid / 10.0))
             
         with torch.no_grad():
             batch_idx = 0
@@ -390,26 +425,15 @@ class Pi3LossGS(nn.Module):
 
         if self.train_stage in [1, 2]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
-            loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
+            loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped,data_range=1.0)
             loss_lpips = self.lpips_loss_fn(rgb_full, gt_imgs_reshaped).mean()
+            
+            # === 新增：计算 Sobel Edge Loss ===
+            loss_edge = sobel_edge_loss(rgb_full, gt_imgs_reshaped)
+            
             mask_depth = (gt_depth_reshaped > 1e-4) & (gt_depth_reshaped < 58982.4)
             if self.lambda_depth > 0 and mask_depth.sum() > 10:
                 loss_depth = F.l1_loss(aligned_depth_map[mask_depth], gt_depth_reshaped[mask_depth])
-
-            # if self.train_stage == 1:
-            #     # ==========================================================
-            #     # [修改点 6] Pose loss 对所有 N_total 张相机位姿生效
-            #     # ==========================================================
-            #     # loss_pose, t_err, r_err = self.camera_loss_fn(pred_c2w, gt_c2w, scale_opt.detach())
-            #     # details['pose_trans_err'] = t_err
-            #     # details['pose_rot_err'] = r_err
-
-            #     rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     gt_imgs_sub = gt_imgs[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            #     pixel_error = torch.abs(rgb_sub - gt_imgs_sub).mean(dim=1, keepdim=True).detach()
-            #     valid_target = (pixel_error < 0.1).float() 
-            #     dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
-            #     loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
 
         elif self.train_stage == 3:
             rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
@@ -419,28 +443,24 @@ class Pi3LossGS(nn.Module):
             dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
             loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
             
-        # lambda_sparsity = 0.05 
-        # lambda_push_back = 0.02
         final_loss = (
             self.lambda_rgb * loss_rgb + 
             self.lambda_ssim * loss_ssim +
             self.lambda_depth * loss_depth +
             self.lambda_lpips * loss_lpips +
-            # self.lambda_pose * loss_pose + 
-            # self.lambda_scale * loss_scale + 
+            self.lambda_edge * loss_edge +  # === 新增：将 Edge Loss 加入总 Loss ===
             self.lambda_pts * loss_pts 
-            # loss_conf
-            # lambda_sparsity * loss_dense_sparsity + 
-            # lambda_push_back * loss_push_back       
         )
 
         if final_loss == 0.0:
              final_loss = (pred_local_pts.sum() * 0.0)
 
         details.update({
-            "loss_rgb": loss_rgb, "loss_ssim": loss_ssim, 
-            "loss_depth": loss_depth, "loss_scale": loss_scale, "loss_pts": loss_pts,
-            "loss_lpips": loss_lpips,
+            "loss_rgb": loss_rgb,
+            "loss_ssim": loss_ssim,
+            "loss_depth": loss_depth, "loss_pts": loss_pts,
+            "loss_lpips": loss_lpips, 
+            "loss_edge": loss_edge,         # === 新增：记录到 details 以便监控 ===
             "total_loss": final_loss
         })
 
