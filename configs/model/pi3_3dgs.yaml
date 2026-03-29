@@ -9,7 +9,7 @@ model:
     # use_global_points: false
     train_conf: false
     num_dec_blk_not_to_checkpoint: 999
-    ckpt: "outputs/pi3_lowres_free/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
+    ckpt: "ckpts/pi3/model_pi3x.safetensors" # <path-to-your-pretrain-checkpoint>
 
 loss:
     train_loss:
@@ -58,27 +58,22 @@ train:
     # Optimizer config
     optimizer:
         type: AdamW
-        lr: 4e-5
+        lr: 5e-5
         weight_decay: 5e-2
         betas: [0.9, 0.95]
         verbose: true
         filter_bias_and_bn: true
-        fused: True  # 核心加速参数
+
         encoder_lr: 5e-6
 
-    # lr_scheduler:
-    #     type: OneCycleLR
-    #     max_lr: ${train.optimizer.lr}
-    #     pct_start: 0.0
-    #     anneal_strategy: cos
-    #     div_factor: 1000.0
-    #     final_div_factor: 100.0
-    #     total_steps: -1
-    # 彻底抛弃坑人的 OneCycleLR
     lr_scheduler:
-        type: CosineAnnealingLR
-        total_steps: -1    # 12个epoch * 10000步。这里直接写死，最安全！
-        eta_min: 1e-7
+        type: OneCycleLR
+        max_lr: ${train.optimizer.lr}
+        pct_start: 0.0
+        anneal_strategy: cos
+        div_factor: 1000.0
+        final_div_factor: 100.0
+        total_steps: -1
 
 test:
     num_workers: 16              # 16

@@ -6,16 +6,16 @@
 dataset_switches:
     tartanair: false
     scannet: false
-    co3dv2: false
-    wildrgbd: false
-    matrixcity: false
+    co3dv2: true
+    wildrgbd: true
+    matrixcity: true
     mapfree: false
-    midair: false
+    midair: true
     ntu: true
 # =========================================================
 
 train_dataset:
-    length: 1500000         # dummy
+    length: 1200000         # dummy
 
     # 这里的权重都会保留，但在代码中可以通过读取 enabled 状态来决定是否使用该权重
     weights: 
@@ -23,6 +23,7 @@ train_dataset:
         wildrgbd: 10000
         matrixcity: 10000
         midair: 10000
+        # mapfree: 10000
         ntu: 10000
 
     TarTanAir:

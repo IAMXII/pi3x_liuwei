@@ -394,7 +394,7 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=0.3, 
+            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=1, 
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
             train_conf=False, num_sky_anchors=8196 
     ):
@@ -563,7 +563,10 @@ class Pi3LossGS(nn.Module):
         gt_local_pts_sub = gt_local_pts[:, sub_idx]
 
         gauss_raw = pred['gaussians']
-        pred_c2w = pred['camera_poses'] 
+        pred_c2w = pred['camera_poses']
+        intrinsics_pred = pred['intrinsics'] 
+        # print("Ground Truth Intrinsics:", gt_ks[0, 0])  # 打印第一个视角的 GT 内参以供调试
+        # print("Predicted Intrinsics:", intrinsics_pred[0, 0])  # 打印第一个视角的预测内参以供调试
         
         pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
 
@@ -579,7 +582,7 @@ class Pi3LossGS(nn.Module):
 
         render_w2c = se3_inverse(render_c2w)
         
-        render_out, _, _ = self._render_gs(gauss_render, render_w2c, gt_ks, H, W, render_mode='RGB+ED')
+        render_out, _, _ = self._render_gs(gauss_render, render_w2c, intrinsics_pred, H, W, render_mode='RGB+ED')
         
         rgb_full = render_out[..., :3].reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
         depth_map = render_out[..., 3:4].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
@@ -633,10 +636,10 @@ class Pi3LossGS(nn.Module):
             
         final_loss = (
             self.lambda_rgb * loss_rgb + 
-            self.lambda_ssim * loss_ssim +
-            self.lambda_depth * loss_depth +
+            self.lambda_ssim * loss_ssim
+            # self.lambda_depth * loss_depth
             # self.lambda_lpips * loss_lpips +
-            self.lambda_edge * loss_edge 
+            # self.lambda_edge * loss_edge 
         )
 
         if final_loss == 0.0:
