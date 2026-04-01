@@ -8,7 +8,7 @@ log:
   # output_dir: '${work_dir}/outputs/${name}-${now:%Y-%m-%d_%H-%M-%S}'
   output_dir: '${work_dir}/outputs/${name}'
   use_tensorboard: false
-  use_wandb: true
+  use_wandb: false
   project_name: "My_3DGS_Project" # WandB 上的项目名
   exp_name: "run_v1_large_decoder" # 本次实验的名称 (Run Name)
   wandb_entity: null # (可选) WandB 用户名或团队名

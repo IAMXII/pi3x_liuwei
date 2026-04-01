@@ -394,7 +394,7 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=1, 
+            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=1.5, 
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
             train_conf=False, num_sky_anchors=8196 
     ):
@@ -412,7 +412,14 @@ class Pi3LossGS(nn.Module):
         
         self.train_conf = train_conf 
         self.num_sky_anchors = num_sky_anchors
-        self.lpips_loss_fn = lpips.LPIPS(net='alex').to('cuda')
+        # self.lpips_loss_fn = lpips.LPIPS(net='alex')
+        self.lpips_loss_fn = lpips.LPIPS(net='alex').eval()
+        # 冻结 LPIPS 参数，避免无谓的梯度计算
+        for param in self.lpips_loss_fn.parameters():
+            param.requires_grad = False
+
+        self.register_buffer('cached_grid_x', None)
+        self.register_buffer('cached_grid_y', None)
         
 
     def prepare_gt(self, gt):
@@ -424,16 +431,20 @@ class Pi3LossGS(nn.Module):
 
         B, N, H, W = gt_depths.shape
         device = gt_depths.device
-
         masks = (gt_depths > 1e-4).unsqueeze(-1) 
+        H, W = gt_depths.shape[-2:]
 
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(H, device=device), 
-            torch.arange(W, device=device), 
-            indexing='ij'
-        )
-        grid_x = grid_x.expand(B, N, -1, -1).float()
-        grid_y = grid_y.expand(B, N, -1, -1).float()
+        if self.cached_grid_x is None or self.cached_grid_x.shape != (H, W):
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(H, device=device), 
+                torch.arange(W, device=device), 
+                indexing='ij'
+            )
+            self.cached_grid_x = grid_x.float()
+            self.cached_grid_y = grid_y.float()
+
+        grid_x = self.cached_grid_x.expand(B, N, -1, -1)
+        grid_y = self.cached_grid_y.expand(B, N, -1, -1)
 
         fx = gt_ks[..., 0, 0].view(B, N, 1, 1)
         fy = gt_ks[..., 1, 1].view(B, N, 1, 1)
@@ -445,43 +456,63 @@ class Pi3LossGS(nn.Module):
         local_z = gt_depths
         gt_local_pts_raw = torch.stack([local_x, local_y, local_z], dim=-1) 
 
-        gt_local_pts_h = homogenize_points(gt_local_pts_raw).view(B, N, -1, 4).transpose(2, 3) 
-        gt_pts = torch.matmul(poses, gt_local_pts_h).transpose(2, 3).reshape(B, N, H, W, 4)[..., :3] 
+        # gt_local_pts_h = homogenize_points(gt_local_pts_raw).view(B, N, -1, 4).transpose(2, 3) 
+        # gt_pts = torch.matmul(poses, gt_local_pts_h).transpose(2, 3).reshape(B, N, H, W, 4)[..., :3] 
+        R = poses[..., :3, :3]       # [B, N, 3, 3]
+        t = poses[..., :3, 3:4]      # [B, N, 3, 1]
+        # [B, N, 3, H*W]
+        pts_flat = gt_local_pts_raw.reshape(B, N, -1, 3).transpose(-1, -2) 
+        # R @ pts + t，然后变回原形状
+        gt_pts = (torch.matmul(R, pts_flat) + t).transpose(-1, -2).reshape(B, N, H, W, 3)
 
+        # w2c_target = se3_inverse(poses[:, 0])
+        # gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
+        # poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
         w2c_target = se3_inverse(poses[:, 0])
-        gt_pts = torch.einsum('bij, bnhwj -> bnhwi', w2c_target, homogenize_points(gt_pts))[..., :3]
+        R_w2c = w2c_target[..., :3, :3]    # [B, 3, 3]
+        t_w2c = w2c_target[..., :3, 3:4]   # [B, 3, 1]
+        # 将 gt_pts 从 [B, N, H, W, 3] 展平为 [B, 3, N*H*W]
+        # gt_pts_flat = gt_pts.view(B, -1, 3).transpose(-1, -2)
+        gt_pts_flat = gt_pts.reshape(B, -1, 3).transpose(-1, -2)
+        # 用 bmm (Batch Matrix Multiply) 加速运算
+        gt_pts = (torch.bmm(R_w2c, gt_pts_flat) + t_w2c).transpose(-1, -2).reshape(B, N, H, W, 3)
+        
         poses = torch.einsum('bij, bnjk -> bnik', w2c_target, poses)
 
         valid_batch = masks.view(B, -1).sum(dim=-1) > 0 
         
-        if valid_batch.sum() > 0:
-            B_ = valid_batch.sum()
-            all_pts = gt_pts[valid_batch].clone() 
+        # if valid_batch.sum() > 0:
+        #     B_ = valid_batch.sum()
+        #     all_pts = gt_pts[valid_batch].clone() 
             
-            mask_bool = masks[valid_batch].squeeze(-1) 
-            all_pts[~mask_bool] = 0
+        #     mask_bool = masks[valid_batch].squeeze(-1) 
+        #     all_pts[~mask_bool] = 0
             
-            all_pts = all_pts.reshape(B_, -1, 3) 
-            all_dis = all_pts.norm(dim=-1)       
+        #     all_pts = all_pts.reshape(B_, -1, 3) 
+        #     all_dis = all_pts.norm(dim=-1)       
             
-            num_valid_pts = mask_bool.view(B_, -1).float().sum(dim=-1) 
+        #     num_valid_pts = mask_bool.view(B_, -1).float().sum(dim=-1) 
             
-            norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) 
-            norm_factor = norm_factor.clamp_min(1e-4)
+        #     norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) 
+        #     norm_factor = norm_factor.clamp_min(1e-4)
 
-            gt_pts[valid_batch] = gt_pts[valid_batch] / norm_factor[..., None, None, None, None]
-            poses[valid_batch, ..., :3, 3] /= norm_factor[..., None, None]
-            gt_depths[valid_batch] /= norm_factor[..., None, None, None]
+        #     gt_pts[valid_batch] = gt_pts[valid_batch] / norm_factor[..., None, None, None, None]
+        #     poses[valid_batch, ..., :3, 3] /= norm_factor[..., None, None]
+        #     gt_depths[valid_batch] /= norm_factor[..., None, None, None]
 
-        extrinsics = se3_inverse(poses)
-        gt_local_pts = torch.einsum('bnij, bnhwj -> bnhwi', extrinsics, homogenize_points(gt_pts))[..., :3]
-
+        # extrinsics = se3_inverse(poses)
+        # gt_local_pts = torch.einsum('bnij, bnhwj -> bnhwi', extrinsics, homogenize_points(gt_pts))[..., :3]
+        # extrinsics = se3_inverse(poses)
+        # R_ext = extrinsics[..., :3, :3]    # [B, N, 3, 3]
+        # t_ext = extrinsics[..., :3, 3:4]   # [B, N, 3, 1]
+        # gt_pts_flat2 = gt_pts.view(B, N, -1, 3).transpose(-1, -2) # [B, N, 3, H*W]
+        # gt_local_pts = (torch.matmul(R_ext, gt_pts_flat2) + t_ext).transpose(-1, -2).reshape(B, N, H, W, 3)
         return dict(
             imgs = imgs,
             gt_ks = gt_ks,
             gt_depths = gt_depths,
-            global_points = gt_pts,
-            gt_local_pts = gt_local_pts, 
+            # global_points = gt_pts,
+            # gt_local_pts = gt_local_pts, 
             masks = masks,
             gt_c2w = poses
         )
@@ -526,19 +557,19 @@ class Pi3LossGS(nn.Module):
         # ... (保持不变) ...
         opacities = gaussians["opacity"].clone()
         
-        if self.train_stage == 3 or not self.training:
-            means = gaussians["xyz"].detach().contiguous()
-            quats = gaussians["rotation"].detach().contiguous()
-            scales = gaussians["scale"].detach().contiguous()
-            colors = gaussians["color"].detach().contiguous()
-            conf_prob = torch.sigmoid(gaussians["conf"])
-            opacities = (opacities.detach() * conf_prob).squeeze(-1).contiguous()
-        else:
-            means = gaussians["xyz"].contiguous()
-            quats = gaussians["rotation"].contiguous()
-            scales = gaussians["scale"].contiguous()
-            colors = gaussians["color"].contiguous()
-            opacities = opacities.squeeze(-1).contiguous()
+        # if self.train_stage == 3 or not self.training:
+        #     means = gaussians["xyz"].detach().contiguous()
+        #     quats = gaussians["rotation"].detach().contiguous()
+        #     scales = gaussians["scale"].detach().contiguous()
+        #     colors = gaussians["color"].detach().contiguous()
+        #     conf_prob = torch.sigmoid(gaussians["conf"])
+        #     opacities = (opacities.detach() * conf_prob).squeeze(-1).contiguous()
+        # else:
+        means = gaussians["xyz"].contiguous()
+        quats = gaussians["rotation"].contiguous()
+        scales = gaussians["scale"].contiguous()
+        colors = gaussians["color"].contiguous()
+        opacities = opacities.squeeze(-1).contiguous()
 
         return rasterization(
             means=means, quats=quats, scales=scales,
@@ -551,23 +582,43 @@ class Pi3LossGS(nn.Module):
         
         B, N_total, C, H, W = gt['imgs'].shape
         sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
+        self.lpips_loss_fn = self.lpips_loss_fn.to(gt['imgs'].device)  # 确保 LPIPS 损失函数在正确的设备上
         N_sub = len(sub_idx)
 
-        gt_sub_mask = {'masks': gt['masks'][:, sub_idx]}
+        gt_sub_mask = {'masks': gt['masks']}
         pred = self.normalize_pred(pred, gt_sub_mask) 
         
         gt_ks, gt_c2w, gt_imgs, gt_depths, valid_masks = gt['gt_ks'], gt['gt_c2w'], gt['imgs'], gt['gt_depths'], gt['masks']
-        gt_local_pts = gt['gt_local_pts']
+        # gt_local_pts = gt['gt_local_pts']
         
         valid_masks_sub = valid_masks[:, sub_idx].squeeze(-1)
-        gt_local_pts_sub = gt_local_pts[:, sub_idx]
+        # gt_local_pts_sub = gt_local_pts[:, sub_idx]
 
         gauss_raw = pred['gaussians']
         pred_c2w = pred['camera_poses']
         intrinsics_pred = pred['intrinsics'] 
         # print("Ground Truth Intrinsics:", gt_ks[0, 0])  # 打印第一个视角的 GT 内参以供调试
         # print("Predicted Intrinsics:", intrinsics_pred[0, 0])  # 打印第一个视角的预测内参以供调试
-        
+        warmup_steps = 7500.0 # 前 60% 步数用于预热光度损失
+        progress = min(batch_idx / warmup_steps, 1.0)
+
+        # 光度损失 (RGB/SSIM) 从 10% 平滑增加到 100%
+        start_ratio = 0.1
+        photo_ratio = start_ratio + (1.0 - start_ratio) * progress
+        cur_lambda_rgb = self.lambda_rgb * photo_ratio
+        cur_lambda_ssim = self.lambda_ssim * photo_ratio
+        lpips_start_step = 2500.0
+        lpips_total_steps = 22500.0  # 100000 - 50000
+        if batch_idx > lpips_start_step:
+            lpips_progress = min((batch_idx - lpips_start_step) / lpips_total_steps, 1.0)
+        else:
+            lpips_progress = 0.0
+            
+        cur_lambda_lpips = self.lambda_lpips * lpips_progress
+        # cur_lambda_lpips = self.lambda_lpips * max(photo_ratio, 1.0)
+        # 几何损失 (Depth) 从 1.0 平滑衰减到 0.5，前期强行主导几何框架
+        depth_ratio = 1.0 - 0.5 * progress 
+        cur_lambda_depth = self.lambda_depth * depth_ratio
         pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
 
         loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
@@ -588,58 +639,46 @@ class Pi3LossGS(nn.Module):
         depth_map = render_out[..., 3:4].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
         
         gt_imgs_reshaped = gt_imgs.reshape(B * N_total, 3, H, W)
-        gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
+        # gt_depth_reshaped = gt_depths.reshape(B * N_total, 1, H, W)
             
-        with torch.no_grad():
-            batch_idx = 0
-            num_viz = min(4, B * N_total)
-            rgb_viz = torch.cat([gt_imgs_reshaped[:num_viz], rgb_full[:num_viz]], dim=2) 
+        # with torch.no_grad():
+        #     batch_idx = 0
+        #     num_viz = min(4, B * N_total)
+        #     rgb_viz = torch.cat([gt_imgs_reshaped[:num_viz], rgb_full[:num_viz]], dim=2) 
             
-            # 直接使用 depth_map 进行可视化
-            d_pred_viz = depth_map[:num_viz] / (depth_map[:num_viz].max() + 1e-5)
-            d_gt_viz = gt_depth_reshaped[:num_viz] / (gt_depth_reshaped[:num_viz].max() + 1e-5)
-            d_pred_viz = d_pred_viz.repeat(1, 3, 1, 1)
-            d_gt_viz = d_gt_viz.repeat(1, 3, 1, 1)
-            depth_viz = torch.cat([d_gt_viz, d_pred_viz], dim=2)
+        #     # 直接使用 depth_map 进行可视化
+        #     d_pred_viz = depth_map[:num_viz] / (depth_map[:num_viz].max() + 1e-5)
+        #     d_gt_viz = gt_depth_reshaped[:num_viz] / (gt_depth_reshaped[:num_viz].max() + 1e-5)
+        #     d_pred_viz = d_pred_viz.repeat(1, 3, 1, 1)
+        #     d_gt_viz = d_gt_viz.repeat(1, 3, 1, 1)
+        #     depth_viz = torch.cat([d_gt_viz, d_pred_viz], dim=2)
             
-            final_viz = torch.cat([rgb_viz, depth_viz], dim=3)
-            torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}.png")
+        #     final_viz = torch.cat([rgb_viz, depth_viz], dim=3)
+        #     torchvision.utils.save_image(final_viz, f"debug_output/step_{batch_idx}_stage_{self.train_stage}.png")
 
-        if self.train_stage in [1, 2]:
+        if self.train_stage in [1, 2, 3]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
-            loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped,data_range=1.0)
+            loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
             loss_lpips = self.lpips_loss_fn(rgb_full, gt_imgs_reshaped).mean()
+            # 使用 pred_local_pts 提取深度作为伪标签约束
+            # conf_mask = torch.sigmoid(pred['conf'][..., 0]) > 0.1 
+            # non_edge_mask = ~depth_edge(pred['local_points'][..., 2], rtol=0.03) 
             
-            loss_edge = sobel_edge_loss(rgb_full, gt_imgs_reshaped)
-            
-            # === 直接使用原始预测点的 Z 轴作为 GT 深度约束 ===
-            conf_mask = torch.sigmoid(pred['conf'][..., 0]) > 0.1 
-            non_edge_mask = ~depth_edge(pred['local_points'][..., 2], rtol=0.03) 
-            
-            pseudo_mask = torch.logical_and(conf_mask, non_edge_mask)
-            pseudo_mask = pseudo_mask.reshape(B * N_total, 1, H, W)
-            
-            # 直接从 pred_local_pts 提取深度作为伪标签
+            # pseudo_mask = torch.logical_and(conf_mask, non_edge_mask)
+            # pseudo_mask = pseudo_mask.reshape(B * N_total, 1, H, W)
             pseudo_gt_depth = pred_local_pts[..., 2:3].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
             
-            if self.lambda_depth > 0 and pseudo_mask.sum() > 10:
-                # 直接比较 depth_map 和 pseudo_gt_depth
-                loss_depth = F.l1_loss(depth_map[pseudo_mask], pseudo_gt_depth[pseudo_mask].detach())
+            if self.lambda_depth > 0:# and pseudo_mask.sum() > 10:
+                loss_depth = F.l1_loss(depth_map, pseudo_gt_depth.detach())
 
-        elif self.train_stage == 3:
-            rgb_sub = rgb_full.view(B, N_total, 3, H, W)[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            gt_imgs_sub = gt_imgs[:, sub_idx].reshape(B * N_sub, 3, H, W)
-            pixel_error = torch.abs(rgb_sub - gt_imgs_sub).mean(dim=1, keepdim=True).detach()
-            valid_target = (pixel_error < 0.1).float() 
-            dense_conf_logits = pred['conf'].reshape(B * N_sub, 1, H, W)
-            loss_conf = F.binary_cross_entropy_with_logits(dense_conf_logits, valid_target)
-            
+        # ==========================================================
+        # 【修改】：应用动态权重
+        # ==========================================================
         final_loss = (
-            self.lambda_rgb * loss_rgb + 
-            self.lambda_ssim * loss_ssim
-            # self.lambda_depth * loss_depth
-            # self.lambda_lpips * loss_lpips +
-            # self.lambda_edge * loss_edge 
+            cur_lambda_rgb * loss_rgb + 
+            cur_lambda_ssim * loss_ssim +
+            cur_lambda_depth * loss_depth +
+            cur_lambda_lpips * loss_lpips
         )
 
         if final_loss == 0.0:
@@ -649,8 +688,10 @@ class Pi3LossGS(nn.Module):
             "loss_rgb": loss_rgb,
             "loss_ssim": loss_ssim,
             "loss_depth": loss_depth, 
-            "loss_lpips": loss_lpips, 
-            "loss_edge": loss_edge,         
+            "loss_lpips": loss_lpips,
+
+            "cur_weight_rgb": torch.tensor(cur_lambda_rgb, device=pred_c2w.device),   # 添加监控
+            "cur_weight_depth": torch.tensor(cur_lambda_depth, device=pred_c2w.device), # 添加监控
             "total_loss": final_loss
         })
 

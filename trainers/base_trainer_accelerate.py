@@ -189,7 +189,8 @@ class BaseTrainer:
 
         # Auto resume the checkpoint
         latest_epoch = self.auto_resume()
-        self.initial_global_step = self.iters_per_epoch * latest_epoch
+        # self.initial_global_step = self.iters_per_epoch * latest_epoch
+        self.initial_global_step = (self.iters_per_epoch * latest_epoch) // self.cfg.train.gradient_accumulation_steps
         self.first_epoch = latest_epoch
 
         os.makedirs(self.cfg.log.ckpt_dir, exist_ok=True)
@@ -200,6 +201,52 @@ class BaseTrainer:
         # model.encoder = torch.compile(model.encoder)
         # model.decoder = torch.compile(model.decoder)
         return model
+
+    # def prepare_model(self):
+    #     model = hydra.utils.instantiate(self.cfg.model)
+    #     count_parameters(model)
+        
+    #     # 使用 try-except 包装，避免低版本 PyTorch 报错
+    #     try:
+    #         import torch._dynamo
+    #         torch._dynamo.config.suppress_errors = True 
+            
+    #         self.log_info("Applying torch.compile to pure PyTorch sub-modules...")
+            
+    #         # 推荐使用 "default" 模式。
+    #         # "max-autotune" 编译时间极长，且在显存边缘游走时容易触发 OOM。
+    #         compile_mode = "default" 
+            
+    #         # 1. 编译特征提取器
+    #         if hasattr(model, 'encoder'):
+    #             model.encoder = torch.compile(model.encoder, mode=compile_mode, dynamic=True)
+    #         # if hasattr(model, 'decoder'):
+    #         #     model.decoder = torch.compile(model.decoder, mode=compile_mode, dynamic=True)
+    #         # 2. 编译并行的 Decoder Heads
+    #         # 将纯 Transformer 结构的头部进行编译，可以大幅加速 Attention 和 MLP 计算
+    #         if hasattr(model, 'point_decoder'):
+    #             model.point_decoder = torch.compile(model.point_decoder, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'gs_decoder'):
+    #             model.gs_decoder = torch.compile(model.gs_decoder, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'camera_decoder'):
+    #             model.camera_decoder = torch.compile(model.camera_decoder, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'conf_decoder'):
+    #             model.conf_decoder = torch.compile(model.conf_decoder, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'gs_head'):
+    #             model.gs_head = torch.compile(model.gs_head, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'point_head'):
+    #             model.point_head = torch.compile(model.point_head, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'camera_head'):
+    #             model.camera_head = torch.compile(model.camera_head, mode=compile_mode, dynamic=True)
+    #         if hasattr(model, 'conf_head'):
+    #             model.conf_head = torch.compile(model.conf_head, mode=compile_mode, dynamic=True)
+    #         # (注：刻意跳过了光栅化头和共享的 model.decoder(ModuleList)，
+    #         # 因为 ModuleList 逐块编译容易产生碎片化的 Graph，得不偿失)
+            
+    #     except Exception as e:
+    #         self.log_info(f"torch.compile failed or skipped. Error: {e}")
+
+    #     return model
     # def prepare_model(self):
     #     model = hydra.utils.instantiate(self.cfg.model)
     #     count_parameters(model)
@@ -272,7 +319,7 @@ class BaseTrainer:
                 epoch + 1
             ) % self.cfg.log.ckpt_interval == 0 or epoch + 1 == self.cfg.train.num_epoch:
                 if self.accelerator.sync_gradients:
-                    self.global_step = self.iters_per_epoch * (epoch + 1)
+                    self.global_step = (self.iters_per_epoch * (epoch + 1)) // self.cfg.train.gradient_accumulation_steps
                     save_path = os.path.join(
                         self.cfg.log.ckpt_dir,
                         f"checkpoint_{epoch}",
@@ -378,7 +425,8 @@ class BaseTrainer:
         # )
         header = "Epoch: [{}]".format(epoch)
         loss_details_dict = {}
-        start_steps = epoch * self.iters_per_epoch
+        # start_steps = epoch * self.iters_per_epoch
+        start_steps = (epoch * self.iters_per_epoch) // self.cfg.train.gradient_accumulation_steps
         self.global_step = start_steps
 
         self.log_info(
@@ -397,7 +445,7 @@ class BaseTrainer:
                 # Perform the forward using the accerlate
                 batch = move_to_device(batch, device=self.accelerator.device)
                 with self.accelerator.autocast():
-                    forward_output = self.forward_batch(batch, mode='train')
+                    forward_output = self.forward_batch(batch, mode='train',global_step=self.global_step)
                 
                 # [修改点 2] 传递 current_epoch 和 total_epochs 到 calculate_loss
                 batch_output = self.calculate_loss(

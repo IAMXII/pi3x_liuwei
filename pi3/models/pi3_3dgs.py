@@ -6,6 +6,7 @@ from functools import partial
 from copy import deepcopy
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
+import math
 import sys
 import math
 import torch.nn.functional as F
@@ -201,97 +202,6 @@ def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None
     uv = torch.stack([u, v], dim=-1)
     return uv
 
-def solve_optimal_shift(uv: np.ndarray, xyz: np.ndarray, focal: float):
-    "Solve `min |focal * xy / (z + shift) - uv|` with respect to shift"
-    from scipy.optimize import least_squares
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[: , None]
-        err = (focal * xy_proj - uv).ravel()
-        return err
-
-    solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    return optim_shift
-
-def recover_focal_shift(points: torch.Tensor, mask: torch.Tensor = None, focal: torch.Tensor = None, downsample_size: tuple[int, int] = (64, 64)):
-    """
-    Recover the depth map and FoV from a point map with unknown z shift and focal.
-
-    Note that it assumes:
-    - the optical center is at the center of the map
-    - the map is undistorted
-    - the map is isometric in the x and y directions
-
-    ### Parameters:
-    - `points: torch.Tensor` of shape (..., H, W, 3)
-    - `downsample_size: Tuple[int, int]` in (height, width), the size of the downsampled map. Downsampling produces approximate solution and is efficient for large maps.
-
-    ### Returns:
-    - `focal`: torch.Tensor of shape (...) the estimated focal length, relative to the half diagonal of the map
-    - `shift`: torch.Tensor of shape (...) Z-axis shift to translate the point map to camera space
-    """
-    shape = points.shape
-    height, width = points.shape[-3], points.shape[-2]
-    diagonal = (height ** 2 + width ** 2) ** 0.5
-
-    points = points.reshape(-1, *shape[-3:])
-    mask = None if mask is None else mask.reshape(-1, *shape[-3:-1])
-    focal = focal.reshape(-1) if focal is not None else None
-    uv = normalized_view_plane_uv(width, height, dtype=points.dtype, device=points.device)  # (H, W, 2)
-
-    points_lr = F.interpolate(points.permute(0, 3, 1, 2), downsample_size, mode='nearest').permute(0, 2, 3, 1)
-    uv_lr = F.interpolate(uv.unsqueeze(0).permute(0, 3, 1, 2), downsample_size, mode='nearest').squeeze(0).permute(1, 2, 0)
-    mask_lr = None if mask is None else F.interpolate(mask.to(torch.float32).unsqueeze(1), downsample_size, mode='nearest').squeeze(1) > 0
-    
-    uv_lr_np = uv_lr.cpu().numpy()
-    points_lr_np = points_lr.detach().cpu().numpy()
-    focal_np = focal.cpu().numpy() if focal is not None else None
-    mask_lr_np = None if mask is None else mask_lr.cpu().numpy()
-    optim_shift, optim_focal = [], []
-    for i in range(points.shape[0]):
-        points_lr_i_np = points_lr_np[i] if mask is None else points_lr_np[i][mask_lr_np[i]]
-        uv_lr_i_np = uv_lr_np if mask is None else uv_lr_np[mask_lr_np[i]]
-        if uv_lr_i_np.shape[0] < 2:
-            optim_focal.append(1)
-            optim_shift.append(0)
-            continue
-        if focal is None:
-            optim_shift_i, optim_focal_i = solve_optimal_focal_shift(uv_lr_i_np, points_lr_i_np)
-            optim_focal.append(float(optim_focal_i))
-        else:
-            optim_shift_i = solve_optimal_shift(uv_lr_i_np, points_lr_i_np, focal_np[i])
-        optim_shift.append(float(optim_shift_i))
-    optim_shift = torch.tensor(optim_shift, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-
-    if focal is None:
-        optim_focal = torch.tensor(optim_focal, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-    else:
-        optim_focal = focal.reshape(shape[:-3])
-
-    return optim_focal, optim_shift
-
-def solve_optimal_focal_shift(uv: np.ndarray, xyz: np.ndarray):
-    "Solve `min |focal * xy / (z + shift) - uv|` with respect to shift and focal"
-    from scipy.optimize import least_squares
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[: , None]
-        f = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-        err = (f * xy_proj - uv).ravel()
-        return err
-
-    solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    xy_proj = xy / (z + optim_shift)[: , None]
-    optim_focal = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-
-    return optim_shift, optim_focal
-
 class Pi3_3DGS(nn.Module):
     def __init__(
             self, 
@@ -306,7 +216,7 @@ class Pi3_3DGS(nn.Module):
             ckpt="ckpts/pi3/model_pi3x.safetensors", 
             anchors_per_view=100000, 
             num_sky_anchors=8196, 
-            K=8,                    
+            K_input = 1000000,                    
             debug_mem=False,
             train_stage=1,
             max_dense_gaussians=1000000
@@ -315,7 +225,7 @@ class Pi3_3DGS(nn.Module):
         self.debug_mem = debug_mem
         self.patch_size = 14
         self.num_dec_blk_not_to_checkpoint = num_dec_blk_not_to_checkpoint
-        
+        self.K_input = K_input
         self.train_stage = train_stage
         self.max_dense_gaussians = max_dense_gaussians
         self.anchors_per_view = anchors_per_view
@@ -546,7 +456,7 @@ class Pi3_3DGS(nn.Module):
         if mem_debug: mem_debug.step("Shared Decoder")
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
-    def forward(self, imgs, intrinsics=None, chunk_size=30000):
+    def forward(self, imgs, intrinsics=None, chunk_size=30000,global_step=None):
         mem = MemDebug(active=self.debug_mem)
         B, N_total, C, H, W = imgs.shape
         
@@ -582,9 +492,10 @@ class Pi3_3DGS(nn.Module):
         hidden_sub = hidden.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
         pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
 
-        point_h = self.point_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
+        point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
         # local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
         local_xyz_raw = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)
+        # local_xyz_raw = local_xyz_raw[:, ::2]
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
         gs_attrs = self.gs_head([gs_h], (H, W)).reshape(B, N_sub, H, W, 11)
@@ -595,9 +506,10 @@ class Pi3_3DGS(nn.Module):
         # else:
         #     # 随便给个不占显存的 dummy tensor，防止后续取值报错
         #     conf_logits = torch.zeros((B, N_sub, H, W, 1), device=hidden.device)
-        ret_conf = self.conf_decoder(hidden, xpos=pos)
-        conf = self.conf_head(ret_conf[:, self.patch_start_idx:].float(), patch_h=patch_h, patch_w=patch_w)[0]
-        conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_sub, H, W, -1)
+        # ret_conf = self.conf_decoder(hidden, xpos=pos)
+        # conf = self.conf_head(ret_conf[:, self.patch_start_idx:].float(), patch_h=patch_h, patch_w=patch_w)[0]
+        # conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
+        # conf_logits = conf_logits[:, ::2]
         mem.step("Geometry & Attributes")
 
         # ==========================================================
@@ -608,8 +520,8 @@ class Pi3_3DGS(nn.Module):
         # 将 Local Point 提升至 Global
         # xy, z = local_xyz_raw[0].reshape(B, N_sub, H, W, -1), torch.exp(local_xyz_raw[1].reshape(B, N_sub, H, W, -1))
         # 修复后的代码：先 permute 再 reshape
-        xy = local_xyz_raw[0].permute(0, 2, 3, 1).reshape(B, N_sub, H, W, -1)
-        z = torch.exp(local_xyz_raw[1].permute(0, 2, 3, 1).reshape(B, N_sub, H, W, -1))
+        xy = local_xyz_raw[0].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
+        z = torch.exp(local_xyz_raw[1].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1))
         local_pts = torch.cat([xy * z, z], dim=-1)
         dx = (xy[..., -1, 0] - xy[..., 0, 0]).mean(dim=-1) / (W - 1)
         
@@ -633,7 +545,7 @@ class Pi3_3DGS(nn.Module):
         cy = v_mean - y_mean * fy
 
         # 3. 组装内参矩阵 K，目标 shape 为 (B, N_sub, 3, 3)
-        K = torch.zeros((B, N_sub, 3, 3), device=xy.device, dtype=xy.dtype)
+        K = torch.zeros((B, N_total, 3, 3), device=xy.device, dtype=xy.dtype)
 
         # 将计算好的参数填入对应的矩阵位置
         K[:, :, 0, 0] = fx
@@ -641,9 +553,16 @@ class Pi3_3DGS(nn.Module):
         K[:, :, 0, 2] = cx
         K[:, :, 1, 2] = cy
         K[:, :, 2, 2] = 1.0
+        # K = K.repeat_interleave(2, dim=1)
         # K = K[:, 0, :, :]
-        local_pts_h = homogenize_points(local_pts).view(B, N_sub, -1, 4).transpose(2, 3)
-        global_pts = torch.matmul(camera_poses_sub, local_pts_h).transpose(2, 3).reshape(B, N_sub, H, W, 4)[..., :3]
+        # local_pts_h = homogenize_points(local_pts).view(B, N_total, -1, 4).transpose(2, 3)
+        # global_pts = torch.matmul(camera_poses, local_pts_h).transpose(2, 3).reshape(B, N_total, H, W, 4)[..., :3]
+        R_cam = camera_poses[..., :3, :3]       # [B, N_total, 3, 3]
+        t_cam = camera_poses[..., :3, 3:4]      # [B, N_total, 3, 1]
+        # 展平空间维度，形状变为 [B, N_total, 3, H*W]
+        local_pts_flat = local_pts.view(B, N_total, -1, 3).transpose(-1, -2) 
+        # R * x + t，再还原回原形状
+        global_pts = (torch.matmul(R_cam, local_pts_flat) + t_cam).transpose(-1, -2).reshape(B, N_total, H, W, 3)
 
         # 解析 Dense 高斯属性
         local_rot = F.normalize(gs_attrs[..., 0:4], dim=-1)
@@ -655,43 +574,146 @@ class Pi3_3DGS(nn.Module):
         cam_quats_sub = matrix_to_quaternion(camera_poses_sub[..., :3, :3]).view(B, N_sub, 1, 1, 4).expand(-1, -1, H, W, -1)
         global_rot = F.normalize(quat_mult(cam_quats_sub, local_rot), dim=-1)
 
-        d_xyz = global_pts.reshape(B, -1, 3)
+        d_xyz = global_pts[:, sub_idx].reshape(B, -1, 3)
         d_rot = global_rot.reshape(B, -1, 4)
         d_scale = scale.reshape(B, -1, 3)
         d_opacity = opacity.reshape(B, -1, 1)
         d_color = color.reshape(B, -1, 3)
-        d_conf = conf_logits.reshape(B, -1, 1)
+        # d_conf = conf_logits.reshape(B, -1, 1)
+        # conf_noise = conf_logits[:, sub_idx].reshape(B, -1, 1)
 
-        # 根号 N 上限 + 置信度阈值动态概率筛选
         num_dense = d_xyz.shape[1]
-        limit_gaussians = int(self.anchors_per_view * math.sqrt(N_sub))  # 这里改用 N_sub 的开方
+        
+        # --- 1. 计算理论下限 K_lower ---
+        K_lower = int(0.8 * H * W * math.sqrt(N_sub))
         if self.max_dense_gaussians is not None:
-            limit_gaussians = min(limit_gaussians, self.max_dense_gaussians)
+            K_lower = min(K_lower, self.max_dense_gaussians)
+        K_lower = min(num_dense, K_lower)
 
-        K_target = min(num_dense, limit_gaussians)
+        # --- 2. 动态 K 策略 ---
+        # if self.training and self.train_stage in [1, 2]:
+        #     # K_target = torch.randint(K_lower, num_dense + 1, (1,)).item()
 
+        #     log_lower = math.log(K_lower)
+        #     log_upper = math.log(num_dense + 1)
+
+        #     # 在对数空间均匀采样
+        #     log_k = torch.empty(1).uniform_(log_lower, log_upper)
+
+        #     # 转换回线性空间并转为整数
+        #     K_target = int(torch.exp(log_k).item())
+
+        #     # 确保不越界
+        #     K_target = max(K_lower, min(num_dense, K_target))
+        # else:
+        #     K_target = self.K_input
+        K_target = K_lower
+        # with torch.no_grad():
+        #     imgs_sub = imgs[:, sub_idx] 
+        #     imgs_gray = imgs_sub.mean(dim=2, keepdim=True) 
+        #     dx = torch.abs(imgs_gray[..., :, 1:] - imgs_gray[..., :, :-1])
+        #     dy = torch.abs(imgs_gray[..., 1:, :] - imgs_gray[..., :-1, :])
+        #     dx = F.pad(dx, (0, 1, 0, 0))
+        #     dy = F.pad(dy, (0, 0, 0, 1))
+        #     edge_map = (dx + dy).reshape(B, -1) 
+        #     edge_map = edge_map / (edge_map.max(dim=1, keepdim=True)[0] + 1e-5)
         if K_target < num_dense or self.train_stage == 3:
             if self.train_stage == 3:
-                conf_prob = torch.sigmoid(d_conf.squeeze(-1))
-                conf_threshold = 0.5 
-                
-                max_valid_in_batch = (conf_prob > conf_threshold).sum(dim=1).max().item()
-                K_target = max(min(max_valid_in_batch, limit_gaussians), 1) 
-                _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
+                # conf_prob = torch.sigmoid(d_conf.squeeze(-1))
+                # conf_threshold = 0.1 
+                # max_valid_in_batch = (conf_prob > conf_threshold).sum(dim=1).max().item()
+                # K_target = max(min(max_valid_in_batch, K_target), 1) 
+                # _, topk_indices = torch.topk(conf_prob, k=K_target, dim=1)
+                pass
             else:
-                # 【修改这里】：在 Stage 1, 2 加入 Gumbel 随机探索，打破死神经元
                 if self.training:
-                    # 获取 Sigmoid 前的 Logits (gs_attrs[..., 7:8] 即为 Opacity Logits)
                     opacity_logits = gs_attrs[..., 7:8].reshape(B, -1)
-                    # 生成 Gumbel 噪声
+                    # alpha = 3.0
+                    # 基于 conf 的自适应温度与截断 Gumbel 噪声
+                    # conf_prob = torch.sigmoid(conf_noise.squeeze(-1)) 
+                    # uncertainty = 1.0 - conf_prob 
+                    # densification_score = conf_prob + alpha * edge_map
+                    
+                    # tau_base = 0.2  
+                    # gamma = 1.2     
+                    # tau_i = tau_base + gamma * uncertainty
+                    tau_max = 2.0      
+                    tau_min = 0.01      
+                    decay_steps = 7500.0 
+                    progress = min(global_step / decay_steps, 1.0)
+                    tau = tau_max * ((tau_min / tau_max) ** progress)
+                    
                     noise = torch.rand_like(opacity_logits)
                     gumbel_noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
-                    # 打分 = 原始 Logits + 适度噪声 (Temperature设为1.0左右)
-                    scores = opacity_logits + gumbel_noise * 1.0 
+                    # gumbel_noise = torch.clamp(gumbel_noise, min=-2.0, max=3.0)
+                    
+                    scores = opacity_logits + gumbel_noise * tau 
+                    
+                    # ==========================================
+                    # 核心修复：Epsilon-Greedy 保底策略
+                    # ==========================================
+                    # eps = 0.1 # 扣出 15% 的名额无视分数，强行全图随机播撒
+                    # K_top = int(K_target * (1.0 - eps))
+                    # K_rand = K_target - K_top
+                    
+                    # 1. 主力部队：选出得分最高的 K_top 个点（主攻有深度监督的前景）
                     _, topk_indices = torch.topk(scores, k=K_target, dim=1)
+                    
+                    # # 2. 星火部队：在剩下的点中，完全随机抽取 K_rand 个点（强行给天空留种）
+                    # # 构造纯随机打分，并将已经选中的主力点分数设为极小值（防止重复选中）
+                    # rand_scores = torch.rand_like(scores)
+                    # rand_scores.scatter_(1, topk_indices_main, -1e9)
+                    # _, topk_indices_rand = torch.topk(rand_scores, k=K_rand, dim=1)
+                    
+                    # # 3. 会师：合并主力与星火的索引
+                    # topk_indices = torch.cat([topk_indices_main, topk_indices_rand], dim=1)
+                    # ==========================================
                 else:
-                    # 推理时保持确定性硬截断
                     _, topk_indices = torch.topk(d_opacity.squeeze(-1), k=K_target, dim=1)
+        
+
+        # ==========================================================
+        # 【核心整合】：复合打分 + Gumbel退火 + 10%纯随机保底
+        # ==========================================================
+        # if K_target < num_dense:
+        #     # 复合致密化得分: 基础置信度 + 边缘引导 (alpha=3.0)
+        #     alpha = 3.0
+        #     densification_score = d_conf + alpha * edge_map
+            
+        #     if self.training:
+        #         # 1. 指数退火参数设定 (基于 100,000 步)
+        #         tau_max = 2.0      
+        #         tau_min = 0.01      
+        #         decay_steps = 20000.0 
+        #         progress = min(global_step / decay_steps, 1.0)
+        #         tau = tau_max * ((tau_min / tau_max) ** progress)
+                
+        #         # 2. 注入 Gumbel 噪声
+        #         noise = torch.rand_like(densification_score)
+        #         gumbel_noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
+        #         noisy_logits = (densification_score + gumbel_noise) / tau
+        #         noisy_logits_squeeze = noisy_logits.squeeze(-1)
+                
+        #         # 3. 混合调度策略：90% Gumbel 主力 + 10% 纯随机保底
+        #         # eps = 0.0 
+        #         # K_top = int(K_target * (1.0 - eps))
+        #         # K_rand = K_target - K_top
+                
+        #         #   3.1 主力部队：选出得分最高的前 90%
+        #         _, topk_indices = torch.topk(noisy_logits_squeeze, k=K_target, dim=1)
+                
+        #         # #   3.2 星火侦察兵：剩余点中完全随机抽 10%
+        #         # rand_scores = torch.rand_like(noisy_logits_squeeze)
+        #         # # 将已选中的主力点得分设为极小值，避免重复抽取
+        #         # rand_scores.scatter_(1, topk_indices_main, -1e9)
+        #         # _, topk_indices_rand = torch.topk(rand_scores, k=K_rand, dim=1)
+                
+        #         #   3.3 会师合并
+        #         # topk_indices = torch.cat([topk_indices_main, topk_indices_rand], dim=1)
+                
+        #     else:
+        #         # 推理阶段：不加噪声，也不加纯随机，100% 凭绝对得分截断
+        #         _, topk_indices = torch.topk(densification_score.squeeze(-1), k=K_target, dim=1)
             # else:
             #     if self.training:
             #         # ==========================================================
@@ -747,15 +769,15 @@ class Pi3_3DGS(nn.Module):
             d_opacity = filter_topk(d_opacity)
             d_color = filter_topk(d_color)
 
-            d_conf_filtered = filter_topk(d_conf)
+            # d_conf_filtered = filter_topk(d_conf)
             # d_scale = torch.ones_like(d_scale)  # 这里改成全1，交给后续的置信度来控制显隐
             # d_opacity = torch.ones_like(d_opacity)  # 这里改成全1，交给后续的置信度来控制显隐
-            if self.train_stage == 3:
-                survived_prob = torch.sigmoid(d_conf_filtered.squeeze(-1))
-                invalid_mask = (survived_prob <= conf_threshold).unsqueeze(-1)
-                d_opacity = torch.where(invalid_mask, torch.zeros_like(d_opacity), d_opacity)
+            # if self.train_stage == 3:
+            #     survived_prob = torch.sigmoid(d_conf_filtered.squeeze(-1))
+            #     invalid_mask = (survived_prob <= conf_threshold).unsqueeze(-1)
+            #     d_opacity = torch.where(invalid_mask, torch.zeros_like(d_opacity), d_opacity)
 
-            d_conf = d_conf_filtered
+            # d_conf = d_conf_filtered
             mem.step("Dynamic Probability & Top-K Filtering")
 
         # 提取全量场景特征并传入 Sky Head (使用 N_total)
@@ -768,7 +790,7 @@ class Pi3_3DGS(nn.Module):
             "scale": d_scale,
             "opacity": d_opacity,
             "color": d_color,
-            "conf": d_conf,
+            # "conf": d_conf,
             "num_sky": 0 
         }
         mem.step("GS Concat")
@@ -821,5 +843,5 @@ class Pi3_3DGS(nn.Module):
             camera_poses=camera_poses, 
             local_points=local_pts,
             intrinsics=K, 
-            conf=conf_logits
+            # conf=conf_logits
         )

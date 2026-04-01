@@ -8,10 +8,10 @@ train:
 
   # dynamic resolution and 
   random_reslution: true
-  aspect_ratio_range: [1, 1]
-  pixel_count_range: [255000, 255000] 
+  aspect_ratio_range: [0.5, 2]
+  pixel_count_range: [100000, 255000] 
   patch_size: 14
   num_resolution: -1
 
 model:
-  ckpt: "outputs/pi3_highres_0324/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
+  ckpt: "outputs/pi3_lowres_0327/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
