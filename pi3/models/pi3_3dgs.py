@@ -637,9 +637,9 @@ class Pi3_3DGS(nn.Module):
                     # tau_base = 0.2  
                     # gamma = 1.2     
                     # tau_i = tau_base + gamma * uncertainty
-                    tau_max = 2.0      
+                    tau_max = 1.0      
                     tau_min = 0.01      
-                    decay_steps = 7500.0 
+                    decay_steps = 10000.0 
                     progress = min(global_step / decay_steps, 1.0)
                     tau = tau_max * ((tau_min / tau_max) ** progress)
                     

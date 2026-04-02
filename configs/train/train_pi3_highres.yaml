@@ -14,4 +14,4 @@ train:
   num_resolution: -1
 
 model:
-  ckpt: "outputs/pi3_lowres_0327/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
+  ckpt: "outputs/pi3_highres_0327/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>

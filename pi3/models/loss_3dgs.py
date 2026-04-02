@@ -608,7 +608,7 @@ class Pi3LossGS(nn.Module):
         cur_lambda_rgb = self.lambda_rgb * photo_ratio
         cur_lambda_ssim = self.lambda_ssim * photo_ratio
         lpips_start_step = 2500.0
-        lpips_total_steps = 22500.0  # 100000 - 50000
+        lpips_total_steps = 12500.0  # 100000 - 50000
         if batch_idx > lpips_start_step:
             lpips_progress = min((batch_idx - lpips_start_step) / lpips_total_steps, 1.0)
         else:
@@ -677,7 +677,7 @@ class Pi3LossGS(nn.Module):
         final_loss = (
             cur_lambda_rgb * loss_rgb + 
             cur_lambda_ssim * loss_ssim +
-            cur_lambda_depth * loss_depth +
+            self.lambda_depth * loss_depth +
             cur_lambda_lpips * loss_lpips
         )
 
