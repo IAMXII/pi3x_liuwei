@@ -105,10 +105,12 @@ def create_dataloader(cfg, mode):
         max_img_per_gpu=max_img_per_gpu,
         rank=rank
     )
-
+    print(batch_sampler,flush=True)
     return data_loader(
         dataset=dataset,
         batch_sampler=batch_sampler,
+        # sampler=sampler,        # <--- 修改: 直接使用底层的 DistributedSampler
+        # batch_size=1,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,

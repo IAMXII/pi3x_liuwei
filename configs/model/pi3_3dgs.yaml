@@ -37,7 +37,7 @@ train:
     # Training config
     gradient_accumulation_steps: 4
     clip_grad: 1.0
-    clip_loss: 10
+    clip_loss: 100
 
     seed: 42
     resume: null

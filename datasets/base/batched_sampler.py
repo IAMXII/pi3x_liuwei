@@ -176,7 +176,7 @@ class DynamicBatchSampler(Sampler):
                 batch_size = self.max_img_per_gpu / random_image_num
                 batch_size = np.floor(batch_size).astype(int)
                 batch_size = max(1, batch_size)  # Ensure batch size is at least 1
-
+                batch_size = 1
                 # Collect samples for the current batch
                 current_batch = []
                 for _ in range(batch_size):

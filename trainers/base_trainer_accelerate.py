@@ -397,10 +397,16 @@ class BaseTrainer:
                 total_samples += len(batch)
 
                 # self.log_all(outputs, self.global_step, prefix='val')
+                # scalar_metrics = {
+                #         k: v for k, v in outputs.items() 
+                #         if not (isinstance(v, torch.Tensor) and v.numel() > 1)
+                #     }
+                # metric_logger.update(**scalar_metrics)
                 scalar_metrics = {
-                        k: v for k, v in outputs.items() 
-                        if not (isinstance(v, torch.Tensor) and v.numel() > 1)
-                    }
+                    k: v.item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v 
+                    for k, v in outputs.items() 
+                    if not (isinstance(v, torch.Tensor) and v.numel() > 1)
+                }
                 metric_logger.update(**scalar_metrics)
                 # metric_logger.update(**outputs)
 
@@ -564,6 +570,7 @@ class BaseTrainer:
                     self.accelerator.log({"grad_norm": grad_norm}, step=start_steps)
 
                     self.global_step = start_steps
+                    del forward_output, batch_output, loss, batch
 
         # # gather the stats from all processes
         # metric_logger.synchronize_between_processes()
@@ -693,6 +700,7 @@ class BaseTrainer:
             )
 
             fsdp_plugin = hydra.utils.instantiate(self.cfg.fsdp_plugin)(**fsdp_plugin_kwargs)
+            # fsdp_plugin = hydra.utils.instantiate(self.cfg.fsdp_plugin, **fsdp_plugin_kwargs)
             accelerate_config["fsdp_plugin"] = fsdp_plugin
         else:
             ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=self.cfg.train.find_unused_parameters)

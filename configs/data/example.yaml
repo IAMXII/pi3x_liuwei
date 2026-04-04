@@ -10,7 +10,7 @@ dataset_switches:
     wildrgbd: true
     matrixcity: true
     mapfree: false
-    midair: true
+    midair: false
     ntu: true
 # =========================================================
 

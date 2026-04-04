@@ -66,7 +66,7 @@ class ConvPts3dHead(nn.Module):
         tokens = decout[-1] if isinstance(decout, list) else decout
         
         # ConvHead 需要 float 类型的输入
-        out = self.conv_head(tokens.float(), patch_h=patch_h, patch_w=patch_w)
+        out = self.conv_head(tokens, patch_h=patch_h, patch_w=patch_w)
         
         # 如果返回的是列表 (如 xy和z分离预测)，则在通道维度拼接
         if isinstance(out, list):
@@ -108,7 +108,7 @@ class ConvDenseGaussianHead(nn.Module):
         tokens = decout[-1] if isinstance(decout, list) else decout
         
         # ConvHead 预测多种属性
-        out = self.conv_head(tokens.float(), patch_h=patch_h, patch_w=patch_w)
+        out = self.conv_head(tokens, patch_h=patch_h, patch_w=patch_w)
         
         # 将 [rot, scale, opacity, color] 按通道顺序拼接
         feat = torch.cat(out, dim=1)

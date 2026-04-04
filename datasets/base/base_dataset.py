@@ -600,8 +600,8 @@ class BaseDataset(EasyDataset):
 
                 # check data-types
                 for v, view in enumerate(views):
-                    assert 'pts3d' not in view, f"pts3d should not be there, they will be computed afterwards based on intrinsics+depthmap for view {view_name(view)}"
-                    view['idx'] = (idx, ar_idx, v)
+                    # assert 'pts3d' not in view, f"pts3d should not be there, they will be computed afterwards based on intrinsics+depthmap for view {view_name(view)}"
+                    # view['idx'] = (idx, ar_idx, v)
                     # view['idx'] = (idx, v)
 
                     # encode the image
@@ -613,18 +613,18 @@ class BaseDataset(EasyDataset):
                         view['camera_pose'] = np.full((4, 4), np.nan, dtype=np.float32)
                     else:
                         assert np.isfinite(view['camera_pose']).all(), f'NaN in camera pose for view {view_name(view)}'
-                    assert 'pts3d' not in view
-                    assert 'valid_mask' not in view
-                    assert np.isfinite(view['depthmap']).all(), f'NaN in depthmap for view {view_name(view)}'
-                    view['z_far'] = self.z_far
-                    pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
+                    # assert 'pts3d' not in view
+                    # assert 'valid_mask' not in view
+                    # assert np.isfinite(view['depthmap']).all(), f'NaN in depthmap for view {view_name(view)}'
+                    # view['z_far'] = self.z_far
+                    # pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
-                    view['pts3d'] = pts3d
-                    view['valid_mask'] = valid_mask & np.isfinite(pts3d).all(axis=-1)
+                    # view['pts3d'] = pts3d
+                    # view['valid_mask'] = valid_mask & np.isfinite(pts3d).all(axis=-1)
 
-                    view['depthmap'][~view['valid_mask']] = 0.0
+                    # view['depthmap'][~view['valid_mask']] = 0.0
 
-                    assert view['valid_mask'].sum() > 0
+                    # assert view['valid_mask'].sum() > 0
 
                     if 'normal' not in view:
                         view['normal'] = None

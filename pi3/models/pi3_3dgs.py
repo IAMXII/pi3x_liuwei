@@ -494,7 +494,7 @@ class Pi3_3DGS(nn.Module):
 
         point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
         # local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
-        local_xyz_raw = self.point_head(point_h.float(), patch_h=patch_h, patch_w=patch_w)
+        local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)
         # local_xyz_raw = local_xyz_raw[:, ::2]
 
         gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
@@ -506,10 +506,19 @@ class Pi3_3DGS(nn.Module):
         # else:
         #     # 随便给个不占显存的 dummy tensor，防止后续取值报错
         #     conf_logits = torch.zeros((B, N_sub, H, W, 1), device=hidden.device)
-        # ret_conf = self.conf_decoder(hidden, xpos=pos)
-        # conf = self.conf_head(ret_conf[:, self.patch_start_idx:].float(), patch_h=patch_h, patch_w=patch_w)[0]
-        # conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
-        # conf_logits = conf_logits[:, ::2]
+        if self.train_stage in [1, 2]:
+            with torch.no_grad():
+                ret_conf = self.conf_decoder(hidden, xpos=pos)
+                conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
+        else:
+            ret_conf = self.conf_decoder(hidden, xpos=pos)
+            conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
+            
+        conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
+        
+        # 极其重要：及时释放厚重的隐层特征，防止驻留显存
+        del ret_conf, conf 
+        
         mem.step("Geometry & Attributes")
 
         # ==========================================================
@@ -518,10 +527,26 @@ class Pi3_3DGS(nn.Module):
         camera_poses_sub = camera_poses[:, sub_idx]
 
         # 将 Local Point 提升至 Global
-        # xy, z = local_xyz_raw[0].reshape(B, N_sub, H, W, -1), torch.exp(local_xyz_raw[1].reshape(B, N_sub, H, W, -1))
-        # 修复后的代码：先 permute 再 reshape
+        # xy = local_xyz_raw[0].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
+        # z = torch.exp(local_xyz_raw[1].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1))
+        
+        # # ==========================================================
+        # # 【修改 2/2】：根据 conf_mask，将低于 0.1 的点深度向远推 100 倍
+        # # 此操作正好发生在组装 local_pts 和赋给高斯属性之前
+        # # ==========================================================
+        # with torch.no_grad(): 
+        #     # 仅仅是推远深度的判别条件，不需要反向传播到 conf_logits
+        #     mask_push = torch.sigmoid(conf_logits) < 0.1
+        # # print(z.mean(), z.max(), z.min())
+        # z = torch.where(mask_push, 1000.0 * z, z)
+        # del mask_push  # 释放 mask 占用的显存
+        
+        # local_pts = torch.cat([xy * z, z], dim=-1)
+        # 将 Local Point 提升至 Global (相机坐标系下)
         xy = local_xyz_raw[0].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
         z = torch.exp(local_xyz_raw[1].permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1))
+        
+        # 1. 先按常规计算所有 local_pts
         local_pts = torch.cat([xy * z, z], dim=-1)
         dx = (xy[..., -1, 0] - xy[..., 0, 0]).mean(dim=-1) / (W - 1)
         
@@ -553,6 +578,51 @@ class Pi3_3DGS(nn.Module):
         K[:, :, 0, 2] = cx
         K[:, :, 1, 2] = cy
         K[:, :, 2, 2] = 1.0
+        # ==========================================================
+        # 动态计算 scene_size (基于相机原点的最大距离)
+        # ==========================================================
+        with torch.no_grad():
+            # 计算所有点到相机原点 (0,0,0) 的距离: sqrt(x^2 + y^2 + z^2)
+            distances = torch.norm(local_pts, dim=-1) 
+            
+            # 方法 A (严格最大值): 直接取最远的点作为场景大小
+            # scene_size = distances.max() 
+            
+            # 方法 B (推荐：鲁棒最大值): 取 99% 分位数，过滤掉可能飞到极远处的异常噪点
+            scene_size = torch.quantile(distances.float(), 0.8)
+            # print(f"Dynamic scene size: {scene_size.item():.2f}")
+            # scene_size_f = scene_size / 10.0 
+            # local_pts = local_pts / scene_size_f[..., None, None, None]  # 将点云缩放到更合理的范围，防止数值不稳定
+            # 目标半径设定为场景大小的 10 倍
+            target_radius = 20.0 * scene_size
+
+        # ==========================================================
+        # 【修改 2/2】：将 conf < 0.1 的点放置到 10 倍 scene_size 的球面上
+        # ==========================================================
+        with torch.no_grad(): 
+            mask_push = torch.sigmoid(conf_logits) < 0.1
+            mask_push_expand = mask_push.expand_as(local_pts)
+            
+            xy_detached = xy.detach()
+            
+            # 射线方向 d = (x, y, 1)，模长 |d|
+            dir_norm = torch.sqrt(xy_detached[..., 0:1]**2 + xy_detached[..., 1:2]**2 + 1.0)
+            
+            # 要使最终点距离相机为 target_radius，新的 z = target_radius / |d|
+            z_sphere = target_radius / dir_norm
+            
+            # 组装球面上的点坐标
+            sphere_pts = torch.cat([xy_detached * z_sphere, z_sphere], dim=-1)
+
+        # 替换被 push 的点，切断这部分的梯度
+        local_pts = torch.where(mask_push_expand, sphere_pts, local_pts)
+        
+        # 释放内存
+        del distances, mask_push, mask_push_expand, xy_detached, dir_norm, z_sphere, sphere_pts
+        
+        # (B, N, 3) 维度展平
+        local_pts = local_pts.reshape(B, N_total, H, W, 3)
+        
         # K = K.repeat_interleave(2, dim=1)
         # K = K[:, 0, :, :]
         # local_pts_h = homogenize_points(local_pts).view(B, N_total, -1, 4).transpose(2, 3)
@@ -567,6 +637,16 @@ class Pi3_3DGS(nn.Module):
         # 解析 Dense 高斯属性
         local_rot = F.normalize(gs_attrs[..., 0:4], dim=-1)
         scale = torch.exp(torch.clamp(gs_attrs[..., 4:7], min=-10.0, max=5.0)) * 0.01
+        with torch.no_grad():
+            # 提取与 gs_attrs 对齐的 conf 子集，防止未来 sub_idx 发生变化
+            conf_logits_sub = conf_logits[:, sub_idx]
+            mask_push_scale = torch.sigmoid(conf_logits_sub) < 0.1
+            # 将 mask_push_scale 的最后一个维度从 1 扩展到 3，以匹配 scale 的维度
+            mask_push_scale = mask_push_scale.expand_as(scale)
+            
+        # 根据掩码放大 scale 100 倍
+        scale = torch.where(mask_push_scale, scale * 50.0, scale)
+        del conf_logits_sub, mask_push_scale # 释放显存
         opacity = torch.sigmoid(gs_attrs[..., 7:8])
         color = torch.sigmoid(gs_attrs[..., 8:11])
 
@@ -579,13 +659,13 @@ class Pi3_3DGS(nn.Module):
         d_scale = scale.reshape(B, -1, 3)
         d_opacity = opacity.reshape(B, -1, 1)
         d_color = color.reshape(B, -1, 3)
-        # d_conf = conf_logits.reshape(B, -1, 1)
+        d_conf = conf_logits.reshape(B, -1, 1)
         # conf_noise = conf_logits[:, sub_idx].reshape(B, -1, 1)
 
         num_dense = d_xyz.shape[1]
         
         # --- 1. 计算理论下限 K_lower ---
-        K_lower = int(0.8 * H * W * math.sqrt(N_sub))
+        K_lower = int((0.64 * H * W) * math.sqrt(N_sub))
         if self.max_dense_gaussians is not None:
             K_lower = min(K_lower, self.max_dense_gaussians)
         K_lower = min(num_dense, K_lower)
@@ -768,6 +848,7 @@ class Pi3_3DGS(nn.Module):
             d_scale = filter_topk(d_scale)
             d_opacity = filter_topk(d_opacity)
             d_color = filter_topk(d_color)
+            d_conf = filter_topk(d_conf)
 
             # d_conf_filtered = filter_topk(d_conf)
             # d_scale = torch.ones_like(d_scale)  # 这里改成全1，交给后续的置信度来控制显隐
@@ -790,7 +871,7 @@ class Pi3_3DGS(nn.Module):
             "scale": d_scale,
             "opacity": d_opacity,
             "color": d_color,
-            # "conf": d_conf,
+            "conf": d_conf,
             "num_sky": 0 
         }
         mem.step("GS Concat")
@@ -843,5 +924,5 @@ class Pi3_3DGS(nn.Module):
             camera_poses=camera_poses, 
             local_points=local_pts,
             intrinsics=K, 
-            # conf=conf_logits
+            conf=conf_logits
         )
