@@ -155,7 +155,7 @@ class BaseTrainer:
             self.optimizer, self.lr_scheduler
         )
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and len(self.accelerator.trackers) == 0:
             self.accelerator.init_trackers(os.path.basename(self.cfg.log.output_dir))
 
         # Report the training info
@@ -523,7 +523,7 @@ class BaseTrainer:
 
                 if self.accelerator.state.deepspeed_plugin is None:
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                 self.lr_scheduler.step()
 
                 if self.accelerator.sync_gradients:
@@ -771,7 +771,7 @@ class BaseTrainer:
                 # For "best_model", strictly speaking we should probably not resume training 
                 # loop logic from it unless we know the epoch, but defaulting to 0 is risky
                 # if the scheduler is loaded. For now, keep as 0 or consider handling best_model differently.
-                start_epoch = 0
+                start_epoch = 2
 
         return start_epoch
 

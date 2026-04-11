@@ -1,30 +1,33 @@
 # @package _global_
 
 model:
-    _target_: pi3.models.pi3_3dgs.Pi3_3DGS
+    _target_: pi3.models.pi3_3dgs_1.Pi3_3DGS
     pos_type: rope100
     decoder_size: large
     load_vggt: false
     freeze_encoder: true
     # use_global_points: false
-    train_conf: false
+    # train_conf: false
     num_dec_blk_not_to_checkpoint: 999
     ckpt: "ckpts/pi3/model_pi3x.safetensors" # <path-to-your-pretrain-checkpoint>
+    max_dense_gaussians: 1000000
 
 loss:
     train_loss:
-        _target_: pi3.models.loss_3dgs.Pi3LossGS
+        _target_: pi3.models.loss_3dgs_1.Pi3LossGS
+        # lambda_consistency: 0.05
         # train_conf: false
 
     test_loss:
-        _target_: pi3.models.loss_3dgs.Pi3LossGS
+        _target_: pi3.models.loss_3dgs_1.Pi3LossGS
+        # lambda_consistency: 0.05
         # train_conf: false
 
 train:
     num_workers: 16
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 10 #80
-    iters_per_epoch: 10000 # 800
+    num_epoch: 25 #80
+    iters_per_epoch: 5000 # 800
 
     print_freq: 40
     base_seed: 666
@@ -48,7 +51,7 @@ train:
     rank: -1
     gpu: -1
     dist_on_itp: false
-    find_unused_parameters: true
+    find_unused_parameters: false
 
     # for distributed training
     distributed: false
@@ -79,4 +82,4 @@ test:
     num_workers: 16              # 16
     batch_size: 1              # not use, dynamic batch size
     print_freq: 10
-    iters_per_test: -1
+    iters_per_test: 1000

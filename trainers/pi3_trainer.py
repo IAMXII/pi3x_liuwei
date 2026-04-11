@@ -1,6 +1,7 @@
 from trainers.base_trainer_accelerate import BaseTrainer
 from easydict import EasyDict
 import torch
+import inspect
 from datasets.base.base_dataset import sample_resolutions
 import hydra
 
@@ -161,7 +162,17 @@ class Pi3Trainer(BaseTrainer):
         imgs_paired = torch.stack([view['img_paired'] for view in batch], dim=1) if ('img_paired' in batch[0] and isinstance(batch[0]['img_paired'], torch.Tensor)) else None
         intrinsics = torch.stack([view['camera_intrinsics'] for view in batch], dim=1)
         current_step = global_step if global_step is not None else 0
-        pred = self.model(imgs, imgs_paired, intrinsics, global_step=current_step)
+
+        forward_params = inspect.signature(self.model.forward).parameters
+        model_kwargs = {}
+        if 'imgs_paired' in forward_params:
+            model_kwargs['imgs_paired'] = imgs_paired
+        if 'intrinsics' in forward_params:
+            model_kwargs['intrinsics'] = intrinsics
+        if 'global_step' in forward_params:
+            model_kwargs['global_step'] = current_step
+
+        pred = self.model(imgs, **model_kwargs)
 
         return [pred, batch]
     

@@ -6,6 +6,7 @@ from functools import partial
 from copy import deepcopy
 from torch.utils.checkpoint import checkpoint
 from safetensors.torch import load_file
+from contextlib import nullcontext
 import math
 import sys
 import math
@@ -212,7 +213,7 @@ class Pi3_3DGS(nn.Module):
             train_conf=False, 
             train_cam=False, 
             train_geo=False, 
-            num_dec_blk_not_to_checkpoint=4,
+            num_dec_blk_not_to_checkpoint=0,
             ckpt="ckpts/pi3/model_pi3x.safetensors", 
             anchors_per_view=100000, 
             num_sky_anchors=8196, 
@@ -224,7 +225,7 @@ class Pi3_3DGS(nn.Module):
             pre_topk_per_view=4096,
             keep_ratio_sqrt=0.4,
             keep_ratio_linear=0.1,
-            overlap_voxel_size_ratio=0.02,
+            overlap_voxel_size_ratio=0.002,
             overlap_penalty=0.25,
             dir_penalty=0.08,
             dir_bins_azimuth=16,
@@ -240,8 +241,10 @@ class Pi3_3DGS(nn.Module):
             sparse_scale_boost_max=1.8,
             sparse_scale_density_tau=4.0,
             sparse_scale_conf_threshold=0.1,
-            scale_min_ratio=5e-4,
-            scale_max_ratio=0.08,
+            scale_min_ratio=5e-5,
+            scale_max_ratio=0.8,
+            gs_view_stride=1,
+            gs_decoder_view_chunk_size=10,
     ):
         super().__init__()
         self.debug_mem = debug_mem
@@ -273,6 +276,8 @@ class Pi3_3DGS(nn.Module):
         self.sparse_scale_conf_threshold = min(max(float(sparse_scale_conf_threshold), 0.0), 1.0)
         self.scale_min_ratio = float(scale_min_ratio)
         self.scale_max_ratio = max(float(scale_max_ratio), float(scale_min_ratio) * 1.1)
+        self.gs_view_stride = max(1, int(gs_view_stride))
+        self.gs_decoder_view_chunk_size = max(1, int(gs_decoder_view_chunk_size))
 
         # ----------------------
         #        Encoder
@@ -489,7 +494,7 @@ class Pi3_3DGS(nn.Module):
                 pos_curr = pos.reshape(B, N * hw, -1)
                 hidden = hidden.reshape(B, N * hw, -1)
                 
-            if i >= self.num_dec_blk_not_to_checkpoint and self.training:
+            if self.training:
                 hidden = checkpoint(blk, hidden, xpos=pos_curr, use_reentrant=False)
             else:
                 hidden = blk(hidden, xpos=pos_curr)
@@ -500,292 +505,6 @@ class Pi3_3DGS(nn.Module):
         if mem_debug: mem_debug.step("Shared Decoder")
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
 
-    def _compute_view_novelty(self, camera_poses):
-        B, N = camera_poses.shape[:2]
-        if N <= 1:
-            return torch.ones(B, N, device=camera_poses.device, dtype=camera_poses.dtype)
-
-        with torch.no_grad():
-            t = camera_poses[..., :3, 3].float()
-            dt = torch.cdist(t, t)
-
-            R = camera_poses[..., :3, :3].float()
-            R_rel = torch.matmul(R[:, :, None], R[:, None].transpose(-1, -2))
-            tr = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]
-            cos_theta = ((tr - 1.0) * 0.5).clamp(-1.0 + 1e-4, 1.0 - 1e-4)
-            rot_dist = torch.acos(cos_theta)
-
-            trans_scale = dt.mean(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
-            pose_dist = dt / trans_scale + self.view_angle_weight * rot_dist
-
-            kernel = torch.exp(-pose_dist / max(self.view_novelty_tau, 1e-6))
-            eye = torch.eye(N, device=kernel.device, dtype=kernel.dtype).unsqueeze(0)
-            redundancy = (kernel * (1.0 - eye)).sum(dim=-1)
-            novelty = 1.0 / (1.0 + redundancy)
-            novelty = novelty / novelty.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-        return novelty.to(dtype=camera_poses.dtype)
-
-    def _normalize_scene_size(self, scene_size, B, device, dtype):
-        if not isinstance(scene_size, torch.Tensor):
-            scene_size_per_batch = torch.full((B,), float(scene_size), device=device, dtype=dtype)
-        else:
-            if scene_size.ndim == 0:
-                scene_size_per_batch = scene_size.view(1).expand(B)
-            else:
-                scene_size_per_batch = scene_size.reshape(-1)
-                if scene_size_per_batch.numel() == 1:
-                    scene_size_per_batch = scene_size_per_batch.expand(B)
-                elif scene_size_per_batch.numel() != B:
-                    scene_size_per_batch = scene_size_per_batch.mean().view(1).expand(B)
-
-            scene_size_per_batch = scene_size_per_batch.to(device=device, dtype=dtype)
-
-        return scene_size_per_batch.clamp_min(1e-6)
-
-    def _compute_overlap_penalty(self, xyz_flat, scene_size):
-        B, M, _ = xyz_flat.shape
-        penalties = xyz_flat.new_zeros(B, M)
-        dir_bins = self.dir_bins_azimuth * self.dir_bins_elevation
-
-        scene_size_per_batch = self._normalize_scene_size(
-            scene_size,
-            B,
-            xyz_flat.device,
-            xyz_flat.dtype,
-        )
-
-        for b in range(B):
-            pts = xyz_flat[b]
-            voxel_size = max(float(scene_size_per_batch[b].item()) * self.overlap_voxel_size_ratio, 1e-3)
-
-            vox = torch.floor(pts / voxel_size).to(torch.int64)
-            hashes = vox[:, 0] * 73856093 + vox[:, 1] * 19349663 + vox[:, 2] * 83492791
-            _, inv = torch.unique(hashes, return_inverse=True)
-            voxel_cnt = torch.bincount(inv, minlength=int(inv.max().item()) + 1).float()
-            voxel_pen = torch.log1p(voxel_cnt[inv]).to(dtype=pts.dtype)
-
-            dirs = F.normalize(pts, dim=-1, eps=1e-6)
-            az = torch.atan2(dirs[:, 1], dirs[:, 0])
-            el = torch.atan2(dirs[:, 2], torch.sqrt(dirs[:, 0] ** 2 + dirs[:, 1] ** 2 + 1e-12))
-
-            az_bin = torch.clamp(
-                ((az + math.pi) / (2.0 * math.pi) * self.dir_bins_azimuth).long(),
-                0,
-                self.dir_bins_azimuth - 1,
-            )
-            el_bin = torch.clamp(
-                ((el + 0.5 * math.pi) / math.pi * self.dir_bins_elevation).long(),
-                0,
-                self.dir_bins_elevation - 1,
-            )
-            dir_id = az_bin * self.dir_bins_elevation + el_bin
-            dir_cnt = torch.bincount(dir_id, minlength=dir_bins).float()
-            dir_pen = torch.log1p(dir_cnt[dir_id]).to(dtype=pts.dtype)
-
-            penalties[b] = self.overlap_penalty * voxel_pen + self.dir_penalty * dir_pen
-
-        return penalties
-
-    def _apply_sparse_scale_boost(self, xyz_selected, scale_selected, conf_selected, scene_size):
-        if self.sparse_scale_boost_max <= 1.0:
-            return scale_selected
-
-        B, K, _ = xyz_selected.shape
-        if K <= 0:
-            return scale_selected
-
-        scene_size_per_batch = self._normalize_scene_size(
-            scene_size,
-            B,
-            xyz_selected.device,
-            xyz_selected.dtype,
-        )
-
-        with torch.no_grad():
-            boost = torch.ones((B, K, 1), device=xyz_selected.device, dtype=xyz_selected.dtype)
-
-            for b in range(B):
-                pts = xyz_selected[b]
-                voxel_size = max(float(scene_size_per_batch[b].item()) * self.sparse_scale_voxel_size_ratio, 1e-3)
-
-                vox = torch.floor(pts / voxel_size).to(torch.int64)
-                hashes = vox[:, 0] * 73856093 + vox[:, 1] * 19349663 + vox[:, 2] * 83492791
-                _, inv = torch.unique(hashes, return_inverse=True)
-                voxel_cnt = torch.bincount(inv, minlength=int(inv.max().item()) + 1).float()
-                local_density = voxel_cnt[inv].to(dtype=pts.dtype)
-
-                sparse_strength = torch.exp(-(local_density - 1.0) / self.sparse_scale_density_tau)
-                sparse_strength = sparse_strength.clamp(0.0, 1.0)
-
-                boost[b, :, 0] = 1.0 + (self.sparse_scale_boost_max - 1.0) * sparse_strength
-
-            if conf_selected is not None:
-                conf_prob = torch.sigmoid(conf_selected.detach())
-                conf_mask = (conf_prob >= self.sparse_scale_conf_threshold).to(dtype=boost.dtype)
-                boost = 1.0 + (boost - 1.0) * conf_mask
-
-        boosted_scale = scale_selected * boost
-
-        scale_min = self.scale_min_ratio * scene_size_per_batch.view(B, 1, 1)
-        scale_max = self.scale_max_ratio * scene_size_per_batch.view(B, 1, 1)
-        boosted_scale = torch.clamp(boosted_scale, min=scale_min, max=scale_max)
-
-        return boosted_scale
-
-    def _select_gaussians(
-        self,
-        xyz_view,
-        rot_view,
-        scale_view,
-        opacity_view,
-        color_view,
-        conf_view,
-        score_view,
-        scene_size,
-        camera_poses_sub,
-        global_step,
-    ):
-        B, N_sub, M_view, _ = xyz_view.shape
-        pre_k = min(self.pre_topk_per_view, M_view)
-
-        n_views = max(N_sub, 1)
-        K_adaptive = int(
-            M_view * (
-                self.keep_ratio_sqrt * math.sqrt(n_views)
-                + self.keep_ratio_linear * n_views
-            )
-        )
-        K_floor = int(self.min_gaussians_per_view * N_sub)
-        K_target = max(K_adaptive, K_floor)
-
-        if self.max_dense_gaussians is not None:
-            K_target = min(K_target, int(self.max_dense_gaussians))
-        if self.K_input is not None and self.K_input > 0:
-            K_target = min(K_target, int(self.K_input))
-
-        K_target = min(K_target, N_sub * pre_k)
-        K_target = max(1, K_target)
-
-        if pre_k < M_view:
-            pre_idx = torch.topk(score_view, k=pre_k, dim=2).indices
-        else:
-            pre_idx = torch.arange(M_view, device=score_view.device).view(1, 1, M_view).expand(B, N_sub, M_view)
-            pre_k = M_view
-
-        def gather_pre(tensor):
-            C = tensor.shape[-1]
-            expanded = pre_idx.unsqueeze(-1).expand(-1, -1, -1, C)
-            return torch.gather(tensor, 2, expanded)
-
-        xyz_pre = gather_pre(xyz_view)
-        rot_pre = gather_pre(rot_view)
-        scale_pre = gather_pre(scale_view)
-        opacity_pre = gather_pre(opacity_view)
-        color_pre = gather_pre(color_view)
-        conf_pre = gather_pre(conf_view)
-        xyz_flat = xyz_pre.reshape(B, -1, 3)
-        rot_flat = rot_pre.reshape(B, -1, 4)
-        scale_flat = scale_pre.reshape(B, -1, 3)
-        opacity_flat = opacity_pre.reshape(B, -1, 1)
-        color_flat = color_pre.reshape(B, -1, 3)
-        conf_flat = conf_pre.reshape(B, -1, 1)
-        score_pre = torch.gather(score_view, 2, pre_idx)
-
-        novelty = self._compute_view_novelty(camera_poses_sub)
-        score_pre = score_pre + self.novelty_bonus * torch.log(novelty.unsqueeze(-1).clamp_min(1e-6))
-        score_flat = score_pre.reshape(B, -1)
-
-        overlap_penalty = self._compute_overlap_penalty(xyz_flat, scene_size)
-        score_flat = score_flat - overlap_penalty
-
-        if self.training and self.train_stage in [1, 2]:
-            tau_max = 1
-            tau_min = 0.01
-            decay_steps = 12500.0
-            step_value = 0.0 if global_step is None else float(global_step)
-            progress = min(step_value / decay_steps, 1.0)
-            tau = tau_max * ((tau_min / tau_max) ** progress)
-            noise = torch.rand_like(score_flat)
-            gumbel_noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
-            score_flat = score_flat + gumbel_noise * tau
-
-        base_quota = min(pre_k, self.min_gaussians_per_view)
-        if base_quota * N_sub > K_target:
-            base_quota = K_target // max(N_sub, 1)
-        extra_k = K_target - base_quota * N_sub
-
-        selected_idx_batch = []
-        for b in range(B):
-            scores_b = score_flat[b]
-            selected_mask = torch.zeros(N_sub * pre_k, dtype=torch.bool, device=scores_b.device)
-            selected_parts = []
-
-            if base_quota > 0:
-                base_idx_local = torch.topk(score_pre[b], k=base_quota, dim=1).indices
-                view_offsets = (torch.arange(N_sub, device=scores_b.device) * pre_k).unsqueeze(-1)
-                base_idx_global = (base_idx_local + view_offsets).reshape(-1)
-                selected_mask[base_idx_global] = True
-                selected_parts.append(base_idx_global)
-
-            if extra_k > 0:
-                remaining_scores = scores_b.masked_fill(selected_mask, -1e9)
-                can_pick = int((~selected_mask).sum().item())
-                pick_k = min(extra_k, can_pick)
-                if pick_k > 0:
-                    extra_idx = torch.topk(remaining_scores, k=pick_k, dim=0).indices
-                    selected_parts.append(extra_idx)
-
-            if len(selected_parts) == 0:
-                selected = torch.topk(scores_b, k=min(K_target, scores_b.numel()), dim=0).indices
-            else:
-                selected = torch.cat(selected_parts, dim=0)
-                if selected.numel() < K_target:
-                    fill_scores = scores_b.clone()
-                    fill_scores[selected] = -1e9
-                    fill_k = K_target - selected.numel()
-                    fill_idx = torch.topk(fill_scores, k=fill_k, dim=0).indices
-                    selected = torch.cat([selected, fill_idx], dim=0)
-                elif selected.numel() > K_target:
-                    keep = torch.topk(scores_b[selected], k=K_target, dim=0).indices
-                    selected = selected[keep]
-
-            selected_scores = scores_b[selected]
-            order = torch.argsort(selected_scores, descending=True)
-            selected_idx_batch.append(selected[order])
-
-        selected_idx = torch.stack(selected_idx_batch, dim=0)
-
-        def gather_final(tensor_flat):
-            C = tensor_flat.shape[-1]
-            idx = selected_idx.unsqueeze(-1).expand(-1, -1, C)
-            return torch.gather(tensor_flat, 1, idx)
-
-        xyz_selected = gather_final(xyz_flat)
-        rot_selected = gather_final(rot_flat)
-        scale_selected = gather_final(scale_flat)
-        opacity_selected = gather_final(opacity_flat)
-        color_selected = gather_final(color_flat)
-        conf_selected = gather_final(conf_flat)
-
-        # For sparse regions that survive selection, enlarge scale to preserve coverage
-        # when the per-view budget gets tighter as view count grows.
-        scale_selected = self._apply_sparse_scale_boost(
-            xyz_selected,
-            scale_selected,
-            conf_selected,
-            scene_size,
-        )
-
-        return (
-            xyz_selected,
-            rot_selected,
-            scale_selected,
-            opacity_selected,
-            color_selected,
-            conf_selected,
-            K_target,
-        )
 
     def forward(self, imgs, intrinsics=None, chunk_size=30000,global_step=None):
         mem = MemDebug(active=self.debug_mem)
@@ -808,48 +527,39 @@ class Pi3_3DGS(nn.Module):
         # Branches: Camera Pose 对全量数据生效
         # -----------------------------
         patch_h, patch_w = H // 14, W // 14
-        cam_h = self.camera_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
-        camera_poses = self.camera_head(cam_h, patch_h, patch_w).reshape(B, N_total, 4, 4)
+        cam_ctx = torch.no_grad() if self.train_stage in [1, 2] else nullcontext()
+        with cam_ctx:
+            cam_h = self.camera_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
+            camera_poses = self.camera_head(cam_h, patch_h, patch_w).reshape(B, N_total, 4, 4)
         mem.step("Camera Decoder")
 
         # ==========================================================
-        # [修改点 2] 提取 1/3 等间隔特征用于生成 Gaussian 与 Conf
+        # [修改点 2] 提取等间隔特征用于生成 Gaussian 与 Conf
         # ==========================================================
-        sub_idx = torch.arange(0, N_total, 1, device=imgs.device)
+        sub_idx = torch.arange(0, N_total, self.gs_view_stride, device=imgs.device)
+        if sub_idx[-1].item() != (N_total - 1):
+            sub_idx = torch.unique(torch.cat([sub_idx, sub_idx.new_tensor([N_total - 1])]), sorted=True)
         N_sub = len(sub_idx)
         hw = hidden.shape[1]
 
-        # 重塑并提取子集特征
-        hidden_sub = hidden.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
-        pos_sub = pos.view(B, N_total, hw, -1)[:, sub_idx].reshape(B * N_sub, hw, -1)
+        hidden_views = hidden.view(B, N_total, hw, -1)[:, sub_idx].contiguous()
+        pos_views = pos.view(B, N_total, hw, -1)[:, sub_idx].contiguous()
 
-        point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
-        # local_xyz_raw = self.point_head([point_h], (H, W)).reshape(B, N_sub, H, W, 3)
-        local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)
-        # local_xyz_raw = local_xyz_raw[:, ::2]
+        point_ctx = torch.no_grad() if self.train_stage == 1 else nullcontext()
+        with point_ctx:
+            point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
+            local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)
 
-        gs_h = self.gs_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-        gs_attrs = self.gs_head([gs_h], (H, W)).reshape(B, N_sub, H, W, 11)
-
-        # if self.train_stage == 3:
-        #     conf_h = self.conf_decoder(hidden_sub, xpos=pos_sub)[:, self.patch_start_idx:]
-        #     conf_logits = self.conf_head([conf_h], (H, W)).reshape(B, N_sub, H, W, 1)
-        # else:
-        #     # 随便给个不占显存的 dummy tensor，防止后续取值报错
-        #     conf_logits = torch.zeros((B, N_sub, H, W, 1), device=hidden.device)
-        if self.train_stage in [1, 2]:
-            with torch.no_grad():
-                ret_conf = self.conf_decoder(hidden, xpos=pos)
-                conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
-        else:
+        conf_ctx = torch.no_grad() if self.train_stage in [1, 2] else nullcontext()
+        with conf_ctx:
             ret_conf = self.conf_decoder(hidden, xpos=pos)
             conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
-            
+
         conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
-        
+
         # 极其重要：及时释放厚重的隐层特征，防止驻留显存
-        del ret_conf, conf
-        
+        del ret_conf, conf, point_h, hidden, pos, cam_h
+
         mem.step("Geometry & Attributes")
 
         # ==========================================================
@@ -953,159 +663,335 @@ class Pi3_3DGS(nn.Module):
         
         # (B, N, 3) 维度展平
         local_pts = local_pts.reshape(B, N_total, H, W, 3)
-        
-        # K = K.repeat_interleave(2, dim=1)
-        # K = K[:, 0, :, :]
-        # local_pts_h = homogenize_points(local_pts).view(B, N_total, -1, 4).transpose(2, 3)
-        # global_pts = torch.matmul(camera_poses, local_pts_h).transpose(2, 3).reshape(B, N_total, H, W, 4)[..., :3]
-        R_cam = camera_poses[..., :3, :3]       # [B, N_total, 3, 3]
-        t_cam = camera_poses[..., :3, 3:4]      # [B, N_total, 3, 1]
-        # 展平空间维度，形状变为 [B, N_total, 3, H*W]
-        local_pts_flat = local_pts.view(B, N_total, -1, 3).transpose(-1, -2) 
-        # R * x + t，再还原回原形状
-        global_pts = (torch.matmul(R_cam, local_pts_flat) + t_cam).transpose(-1, -2).reshape(B, N_total, H, W, 3)
 
         # 解析 Dense 高斯属性
-        local_rot = F.normalize(gs_attrs[..., 0:4], dim=-1)
-        scale = torch.exp(torch.clamp(gs_attrs[..., 4:7], min=-10.0, max=5.0)) * 0.1
+        # ==========================================================
+        # 1. 解析 Dense 高斯属性 & 天空推远/膨胀逻辑 (完全保留你的逻辑)
+        # ==========================================================
+        # ==========================================================
+        # 1. 解析 Dense 高斯属性 & 天空推远/膨胀逻辑 (完全保留你的逻辑)
+        # ==========================================================
         with torch.no_grad():
-            # 提取与 gs_attrs 对齐的 conf 子集，防止未来 sub_idx 发生变化
+            # 提取与 gs_attrs 对齐的 conf 子集
             conf_logits_sub = conf_logits[:, sub_idx]
-            mask_push_scale = torch.sigmoid(conf_logits_sub) < 0.1
-            # 将 mask_push_scale 的最后一个维度从 1 扩展到 3，以匹配 scale 的维度
-            mask_push_scale = mask_push_scale.expand_as(scale)
+            conf_prob = torch.sigmoid(conf_logits_sub)
             
-        # 根据掩码放大 scale 100 倍
-        scale = torch.where(mask_push_scale, scale * self.low_conf_scale_boost, scale)
-        del conf_logits_sub, mask_push_scale # 释放显存
+            mask_push_scale = conf_prob < 0.1
+            
 
-        # 将 scale 限制到和场景尺度一致的区间，避免大视角数时出现极端尺度污染。
-        scale_min = self.scale_min_ratio * scene_size.view(B, 1, 1, 1, 1)
-        scale_max = self.scale_max_ratio * scene_size.view(B, 1, 1, 1, 1)
-        scale = torch.clamp(scale, min=scale_min, max=scale_max)
+        # ==========================================================
+        # 2. 动态多级四叉树 (Quadtree-Pro 激进版：最大 32，无 Scale 截断)
+        # ==========================================================
+        with torch.no_grad():
+            z_raw = z.permute(0, 1, 4, 2, 3)
+            depth_flat = z_raw[:, sub_idx].reshape(B * N_sub, 1, H, W)
+            imgs_sub = imgs[:, sub_idx].reshape(B * N_sub, 3, H, W)
 
-        opacity = torch.sigmoid(gs_attrs[..., 7:8])
-        color = torch.sigmoid(gs_attrs[..., 8:11])
+            # --- A. 提取底层特征联合 Score Map ---
+            local_mean = F.avg_pool2d(imgs_sub, 7, stride=1, padding=3)
+            color_diff = torch.abs(imgs_sub - local_mean).mean(dim=1, keepdim=True)
+            color_score = color_diff / (color_diff.amax(dim=(-2, -1), keepdim=True) + 1e-5)
 
-        # 本地旋转转全局旋转
-        cam_quats_sub = matrix_to_quaternion(camera_poses_sub[..., :3, :3]).view(B, N_sub, 1, 1, 4).expand(-1, -1, H, W, -1)
-        global_rot = F.normalize(quat_mult(cam_quats_sub, local_rot), dim=-1)
+            sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=imgs.device).view(1, 1, 3, 3)
+            sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=imgs.device).view(1, 1, 3, 3)
+            dx = F.conv2d(depth_flat, sobel_x, padding=1)
+            dy = F.conv2d(depth_flat, sobel_y, padding=1)
+            depth_edge = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
+            
+            depth_edge = torch.clamp(depth_edge, max=torch.quantile(depth_edge.float().view(-1), 0.98))
+            depth_score = 0.5 * depth_edge / (depth_edge.amax(dim=(-2, -1), keepdim=True) + 1e-5)
 
-        d_xyz = global_pts[:, sub_idx].reshape(B, -1, 3)
-        d_rot = global_rot.reshape(B, -1, 4)
-        d_scale = scale.reshape(B, -1, 3)
-        d_opacity = opacity.reshape(B, -1, 1)
-        d_color = color.reshape(B, -1, 3)
-        d_conf = conf_logits[:, sub_idx].reshape(B, -1, 1)
+            score_map = torch.max(color_score, depth_score)
 
-        # 组装为 [B, N_sub, HW, C]，便于按视角预筛 + 全局抗重叠融合。
-        M_view = H * W
-        d_xyz_view = global_pts[:, sub_idx].reshape(B, N_sub, M_view, 3)
-        d_rot_view = global_rot.reshape(B, N_sub, M_view, 4)
-        d_scale_view = scale.reshape(B, N_sub, M_view, 3)
-        d_opacity_view = opacity.reshape(B, N_sub, M_view, 1)
-        d_color_view = color.reshape(B, N_sub, M_view, 3)
-        d_conf_view = conf_logits[:, sub_idx].reshape(B, N_sub, M_view, 1)
+            # --- B. 计算多级 Scale Map (带自动 Padding) ---
+            # 【修改 1】：重新放开到 32 级大格子
+            patch_sizes = [32, 16, 8, 4, 2, 1] 
+            base_threshold = 0.055  
+            relax_factor = 0.3
+            
+            # 对齐到 32 的倍数
+            pad_h = (32 - H % 32) % 32
+            pad_w = (32 - W % 32) % 32
+            score_map_padded = F.pad(score_map, (0, pad_w, 0, pad_h), mode='replicate')
+            H_pad, W_pad = H + pad_h, W + pad_w
 
-        # conf_prob = torch.sigmoid(d_conf_view)
-        # scale_proxy = torch.log1p(d_scale_view.mean(dim=-1, keepdim=False).clamp_min(1e-6))
-        # opacity_proxy = d_opacity_view.squeeze(-1)
+            covered_mask = torch.zeros((B * N_sub, 1, H_pad, W_pad), dtype=torch.bool, device=imgs.device)
+            scale_map_padded = torch.ones((B * N_sub, 1, H_pad, W_pad), dtype=torch.float32, device=imgs.device)
 
-        # score_view = opacity_proxy + self.score_conf_weight * conf_prob.squeeze(-1) + self.score_scale_weight * scale_proxy
-        conf_prob = torch.sigmoid(d_conf_view)
-        scale_proxy = torch.log1p(d_scale_view.mean(dim=-1, keepdim=False).clamp_min(1e-6))
-        opacity_proxy = d_opacity_view.squeeze(-1)
+            for i, size in enumerate(patch_sizes):
+                if i == len(patch_sizes) - 1:
+                    is_flat_expanded = torch.ones((B * N_sub, 1, H_pad, W_pad), dtype=torch.bool, device=imgs.device)
+                else:
+                    current_threshold = base_threshold * (1.0 + relax_factor * math.log2(size))
+                    pooled_score = F.max_pool2d(score_map_padded, kernel_size=size, stride=size)
+                    is_flat_expanded = pooled_score.repeat_interleave(size, dim=2).repeat_interleave(size, dim=3) < current_threshold
 
-        # 【修改点】：只对置信度合格的前景高斯给予 Scale 加分，防止放大后的天空高斯骗取高分
-        valid_scale_mask = (conf_prob.squeeze(-1) >= 0.1).float()
-        valid_scale_proxy = scale_proxy * valid_scale_mask
+                active_region = is_flat_expanded & (~covered_mask)
+                scale_map_padded = torch.where(active_region, torch.full_like(scale_map_padded, size), scale_map_padded)
+                covered_mask = covered_mask | active_region
 
-        score_view = opacity_proxy + self.score_conf_weight * conf_prob.squeeze(-1) + self.score_scale_weight * valid_scale_proxy
-        (
-            d_xyz,
-            d_rot,
-            d_scale,
-            d_opacity,
-            d_color,
-            d_conf,
-            selected_gaussians,
-        ) = self._select_gaussians(
-            d_xyz_view,
-            d_rot_view,
-            d_scale_view,
-            d_opacity_view,
-            d_color_view,
-            d_conf_view,
-            score_view,
-            scene_size=scene_size,
-            camera_poses_sub=camera_poses_sub,
-            global_step=global_step,
-        )
-        mem.step("Overlap-aware Two-stage Selection")
+            scale_map = scale_map_padded[:, :, :H, :W].reshape(B, N_sub, H, W, 1)
 
-        # 提取全量场景特征并传入 Sky Head (使用 N_total)
-        # global_scene_feat = hidden.view(B, N_total, hw, -1).mean(dim=(1, 2))
-        # s_xyz, s_rot, s_scale, s_opacity, s_color, s_conf_sky = self.sky_head(global_scene_feat)
-        
+            # --- C. 选点逻辑：锚点掩码 (居中对齐) ---
+            u_coords = torch.arange(W, device=imgs.device).view(1, 1, 1, W, 1).expand(B, N_sub, H, W, 1)
+            v_coords = torch.arange(H, device=imgs.device).view(1, 1, H, 1, 1).expand(B, N_sub, H, W, 1)
+            
+            offset = (scale_map.long() // 2)
+            quad_keep_mask = ((u_coords - offset) % scale_map.long() == 0) & ((v_coords - offset) % scale_map.long() == 0)
+            
+            quad_keep_mask = quad_keep_mask & (~mask_push_scale)
+
+        # --- D. 提取并应用属性 (极速瘦身：先筛点，再分块解码 GS 属性) ---
+        keep_mask = (quad_keep_mask | mask_push_scale).squeeze(-1) # 形状: (B, N_sub, H, W)
+        local_pts_sub = local_pts[:, sub_idx]
+        del z, xy, local_xyz_raw, z_raw, depth_flat, imgs_sub, score_map, score_map_padded
+        del covered_mask, scale_map_padded, u_coords, v_coords, offset, conf_prob
+        voxel_size_val = (scene_size.mean() * 0.002).clamp_min(1e-4).item()
+        fused_gaussians = []
+
+        # ==========================================================
+        # 3. 仅对有效保留点解析属性并执行 3D Soft Voxel Attention Fusion
+        #    先筛，再按视角 chunk 解码 GS，避免整块 gs_attrs 常驻显存
+        # ==========================================================
+        for b in range(B):
+            mask_b = keep_mask[b] # [N_sub, H, W]
+
+            # 兜底：防止该批次全图被过滤导致后续报错，强行保留一个点
+            if not mask_b.any():
+                mask_b[0, 0, 0] = True
+
+        #####
+
+        #     gs_attrs_parts = []
+        #     local_pts_parts = []
+        #     scale_map_parts = []
+        #     conf_parts = []
+        #     quad_center_parts = []
+        #     low_conf_parts = []
+        #     view_idx_parts = []
+
+        #     for start in range(0, N_sub, self.gs_decoder_view_chunk_size):
+        #         end = min(start + self.gs_decoder_view_chunk_size, N_sub)
+        #         mask_chunk = mask_b[start:end]
+        #         if not mask_chunk.any():
+        #             continue
+
+        #         hidden_chunk = hidden_views[b, start:end].reshape(end - start, hw, -1)
+        #         pos_chunk = pos_views[b, start:end].reshape(end - start, hw, -1)
+        #         gs_h_chunk = self.gs_decoder(hidden_chunk, xpos=pos_chunk)[:, self.patch_start_idx:]
+        #         gs_attrs_chunk = self.gs_head([gs_h_chunk], (H, W)).reshape(end - start, H, W, 11)
+
+        #         gs_attrs_parts.append(gs_attrs_chunk[mask_chunk])
+        #         local_pts_parts.append(local_pts_sub[b, start:end][mask_chunk])
+        #         scale_map_parts.append(scale_map[b, start:end][mask_chunk])
+        #         conf_parts.append(conf_logits_sub[b, start:end][mask_chunk])
+        #         quad_center_parts.append(quad_keep_mask[b, start:end][mask_chunk])
+        #         low_conf_parts.append(mask_push_scale[b, start:end][mask_chunk])
+        #         view_idx_parts.append(mask_chunk.nonzero(as_tuple=True)[0] + start)
+
+        #         del hidden_chunk, pos_chunk, gs_h_chunk, gs_attrs_chunk, mask_chunk
+
+        #     gs_attrs_v = torch.cat(gs_attrs_parts, dim=0)
+        #     local_pts_v = torch.cat(local_pts_parts, dim=0)
+        #     scale_map_v = torch.cat(scale_map_parts, dim=0)
+        #     conf_v = torch.cat(conf_parts, dim=0)
+        #     is_quad_center_v = torch.cat(quad_center_parts, dim=0)
+        #     low_conf_v = torch.cat(low_conf_parts, dim=0)
+        #     view_idx = torch.cat(view_idx_parts, dim=0)
+
+        #     del gs_attrs_parts, local_pts_parts, scale_map_parts, conf_parts, quad_center_parts, low_conf_parts, view_idx_parts
+
+        #     # ----------------------------------------------------
+        #     # 2. 仅对有效点解析基本属性 (不计算无用点的 Sigmoid)
+        #     # ----------------------------------------------------
+        #     local_rot_v = F.normalize(gs_attrs_v[:, 0:4], dim=-1)
+        #     scale_v = torch.exp(torch.clamp(gs_attrs_v[:, 4:7], min=-10.0, max=5.0)) * 0.1
+        #     opacity_v = torch.sigmoid(gs_attrs_v[:, 7:8])
+        #     color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
+        #     scale_v = torch.where(low_conf_v, scale_v * self.low_conf_scale_boost, scale_v)
+
+        #     # 仅对四叉树选中的大格子中心点应用 scale_map 倍率放大
+        #     scale_v = torch.where(is_quad_center_v, scale_v * scale_map_v, scale_v)
+
+        #     # ----------------------------------------------------
+        #     # 3. 仅对保留的点执行相机位姿到世界坐标系的旋转转换
+        #     # 极大地节省了全尺寸张量的 Quat Mult 乘法计算
+        #     # ----------------------------------------------------
+        #     cam_poses_v = camera_poses_sub[b, view_idx]     # [K, 4, 4]
+        #     cam_rot_v = cam_poses_v[:, :3, :3]
+        #     cam_trans_v = cam_poses_v[:, :3, 3]
+        #     xyz_v = torch.bmm(cam_rot_v, local_pts_v.unsqueeze(-1)).squeeze(-1) + cam_trans_v
+        #     cam_quats_v = matrix_to_quaternion(cam_rot_v) # [K, 4]
+        #     rot_v = F.normalize(quat_mult(cam_quats_v, local_rot_v), dim=-1)
+
+        #     # ----------------------------------------------------
+        #     # 4. 再次剔除掉模型主动预测为透明的废点 (如果存在)
+        #     # ----------------------------------------------------
+        #     valid_opacity_mask = opacity_v[:, 0] > 0.05
+        #     if not valid_opacity_mask.any():
+        #         valid_opacity_mask[0] = True
+
+        #     xyz_v = xyz_v[valid_opacity_mask]
+        #     # print("xyz_v",xyz_v.shape)
+        #     rot_v = rot_v[valid_opacity_mask]
+        #     scale_v = scale_v[valid_opacity_mask]
+        #     opacity_v = opacity_v[valid_opacity_mask]
+        #     color_v = color_v[valid_opacity_mask]
+        #     conf_v = conf_v[valid_opacity_mask]
+
+        #     # # ----------------------------------------------------
+        #     # # 5. 空间哈希体素软融合 (Voxel Attention Fusion)
+        #     # # ----------------------------------------------------
+        #     # vox_coords = torch.floor(xyz_v / voxel_size_val).int()
+        #     # hash_idx = (vox_coords[:, 0] * 73856093 ^ vox_coords[:, 1] * 19349663 ^ vox_coords[:, 2] * 83492791)
+        #     # unique_hashes, inverse_indices = torch.unique(hash_idx, return_inverse=True)
+        #     # num_voxels = unique_hashes.size(0)
+
+        #     # safe_conf = torch.clamp(conf_v, max=20.0)
+        #     # exp_conf = torch.exp(safe_conf)
+        #     # sum_exp = torch.zeros(num_voxels, 1, device=xyz_v.device).index_add_(0, inverse_indices, exp_conf)
+        #     # weights = exp_conf / (sum_exp[inverse_indices] + 1e-8)
+
+        #     # # 原地无损聚合
+        #     # f_xyz = torch.zeros(num_voxels, 3, device=xyz_v.device).index_add_(0, inverse_indices, xyz_v * weights)
+        #     # # print("f_xyz:",num_voxels)
+        #     # f_rot = torch.zeros(num_voxels, 4, device=xyz_v.device).index_add_(0, inverse_indices, rot_v * weights)
+        #     # f_rot = F.normalize(f_rot, dim=-1)
+        #     # f_scale = torch.zeros(num_voxels, 3, device=xyz_v.device).index_add_(0, inverse_indices, scale_v * weights)
+        #     # f_opacity = torch.zeros(num_voxels, 1, device=xyz_v.device).index_add_(0, inverse_indices, opacity_v * weights)
+        #     # f_color = torch.zeros(num_voxels, 3, device=xyz_v.device).index_add_(0, inverse_indices, color_v * weights)
+
+        #     fused_gaussians.append({
+        #         "xyz": xyz_v, "rotation": rot_v, "scale": scale_v,
+        #         "opacity": opacity_v, "color": color_v
+        #     })
+        #     # fused_gaussians.append({
+        #     #     "xyz": f_xyz, "rotation": f_rot, "scale": f_scale,
+        #     #     "opacity": f_opacity, "color": f_color
+        #     # })
+
+        #     del gs_attrs_v, local_pts_v, scale_map_v, conf_v, is_quad_center_v, low_conf_v, view_idx
+        #     del local_rot_v, scale_v, opacity_v, color_v, cam_poses_v, cam_rot_v, cam_trans_v, xyz_v, cam_quats_v, rot_v
+        #     # del valid_opacity_mask, vox_coords, hash_idx, unique_hashes, inverse_indices, safe_conf, exp_conf, sum_exp, weights
+        #     # del f_xyz, f_rot, f_scale, f_opacity, f_color
+
+        # del hidden_views, pos_views, local_pts_sub, conf_logits_sub, mask_push_scale, scale_map, quad_keep_mask, keep_mask
+
+        # mem.step("Voxel Attention Fusion")
+        #####
+            # --- 优化后的高斯解析逻辑 ---
+            b_xyz, b_rot, b_scale, b_opacity, b_color = [], [], [], [], []
+
+            for start in range(0, N_sub, self.gs_decoder_view_chunk_size):
+                end = min(start + self.gs_decoder_view_chunk_size, N_sub)
+                mask_chunk = mask_b[start:end]
+                if not mask_chunk.any():
+                    continue
+
+                hidden_chunk = hidden_views[b, start:end].reshape(end - start, hw, -1)
+                pos_chunk = pos_views[b, start:end].reshape(end - start, hw, -1)
+                gs_h_chunk = self.gs_decoder(hidden_chunk, xpos=pos_chunk)[:, self.patch_start_idx:]
+                gs_attrs_chunk = self.gs_head([gs_h_chunk], (H, W)).reshape(end - start, H, W, 11)
+
+                # 1. 提取当前 chunk 内有效四叉树点
+                gs_attrs_v = gs_attrs_chunk[mask_chunk]
+                local_pts_v = local_pts_sub[b, start:end][mask_chunk]
+                scale_map_v = scale_map[b, start:end][mask_chunk]
+                is_quad_center_v = quad_keep_mask[b, start:end][mask_chunk]
+                low_conf_v = mask_push_scale[b, start:end][mask_chunk]
+                view_idx_v = mask_chunk.nonzero(as_tuple=True)[0] + start
+
+                # 及时释放 chunk 级无用显存
+                del hidden_chunk, pos_chunk, gs_h_chunk, gs_attrs_chunk, mask_chunk
+
+                # 2. 提前计算 Opacity，执行第一波残酷过滤 (极大幅度降低后续计算量)
+                opacity_v = torch.sigmoid(gs_attrs_v[:, 7:8])
+                valid_mask = opacity_v[:, 0] > 0.05
+                if not valid_mask.any():
+                    continue
+                
+                # 应用过滤
+                gs_attrs_v = gs_attrs_v[valid_mask]
+                local_pts_v = local_pts_v[valid_mask]
+                scale_map_v = scale_map_v[valid_mask]
+                is_quad_center_v = is_quad_center_v[valid_mask]
+                low_conf_v = low_conf_v[valid_mask]
+                view_idx_v = view_idx_v[valid_mask]
+                opacity_v = opacity_v[valid_mask]
+
+                # 3. 仅对存活的点解析其余属性并变换
+                local_rot_v = F.normalize(gs_attrs_v[:, 0:4], dim=-1)
+                scale_v = torch.exp(torch.clamp(gs_attrs_v[:, 4:7], min=-10.0, max=5.0)) * 0.1
+                color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
+
+                # 【修复 OOM 广播灾难】：强制转为 (N, 1) 的形状，避免 N x N 维度爆炸
+                mask_low = low_conf_v.view(-1, 1)
+                mask_quad = is_quad_center_v.view(-1, 1)
+                map_scale = scale_map_v.view(-1, 1)
+
+                scale_v = torch.where(mask_low, scale_v * self.low_conf_scale_boost, scale_v)
+                scale_v = torch.where(mask_quad, scale_v * map_scale, scale_v)
+
+                cam_poses_v = camera_poses_sub[b, view_idx_v]
+                cam_rot_v = cam_poses_v[:, :3, :3]
+                cam_trans_v = cam_poses_v[:, :3, 3]
+
+                # 坐标与旋转变换 (此时数据量已锐减)
+                xyz_v = torch.bmm(cam_rot_v, local_pts_v.unsqueeze(-1)).squeeze(-1) + cam_trans_v
+                cam_quats_v = matrix_to_quaternion(cam_rot_v)
+                rot_v = F.normalize(quat_mult(cam_quats_v, local_rot_v), dim=-1)
+
+                # 将存活的点追加到列表
+                b_xyz.append(xyz_v)
+                b_rot.append(rot_v)
+                b_scale.append(scale_v)
+                b_opacity.append(opacity_v)
+                b_color.append(color_v)
+
+                del gs_attrs_v, local_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
+
+            # 当前 Batch 视角处理完毕，合并结果兜底
+            if len(b_xyz) > 0:
+                fused_gaussians.append({
+                    "xyz": torch.cat(b_xyz, dim=0),
+                    "rotation": torch.cat(b_rot, dim=0),
+                    "scale": torch.cat(b_scale, dim=0),
+                    "opacity": torch.cat(b_opacity, dim=0),
+                    "color": torch.cat(b_color, dim=0)
+                })
+            else:
+                # 极端兜底，防止全被过滤导致维度错误
+                fused_gaussians.append({
+                    "xyz": torch.zeros((1, 3), device=imgs.device),
+                    "rotation": torch.tensor([[1., 0., 0., 0.]], device=imgs.device),
+                    "scale": torch.full((1, 3), 1e-5, device=imgs.device),
+                    "opacity": torch.zeros((1, 1), device=imgs.device),
+                    "color": torch.zeros((1, 3), device=imgs.device)
+                })
+        # 对齐 Batch 内高斯数量
+        max_k = max(g["xyz"].size(0) for g in fused_gaussians)
+        d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out = [], [], [], [], []
+        for g in fused_gaussians:
+            pad_len = max_k - g["xyz"].size(0)
+            d_xyz_out.append(F.pad(g["xyz"], (0,0, 0,pad_len), value=0.0))
+            d_rot_out.append(F.pad(g["rotation"], (0,0, 0,pad_len), value=1.0))
+            d_scale_out.append(F.pad(g["scale"], (0,0, 0,pad_len), value=1e-5))
+            d_opacity_out.append(F.pad(g["opacity"], (0,0, 0,pad_len), value=0.0))
+            d_color_out.append(F.pad(g["color"], (0,0, 0,pad_len), value=0.0))
+
         gaussians = {
-            "xyz": d_xyz,
-            "rotation": d_rot,
-            "scale": d_scale,
-            "opacity": d_opacity,
-            "color": d_color,
-            "conf": d_conf,
+            "xyz": torch.stack(d_xyz_out, dim=0),
+            "rotation": torch.stack(d_rot_out, dim=0),
+            "scale": torch.stack(d_scale_out, dim=0),
+            "opacity": torch.stack(d_opacity_out, dim=0),
+            "color": torch.stack(d_color_out, dim=0),
             "num_sky": 0 
         }
-        mem.step("GS Concat")
-
-        # points = local_pts
-        # masks = torch.sigmoid(conf_logits[..., 0]) > 0.1
-        # original_height, original_width = points.shape[-3:-1]
-        # aspect_ratio = original_width / original_height
-        # # use recover_focal_shift function from MoGe
-        # focal, shift = recover_focal_shift(points, masks)
-        # fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
-
-        # intrinsics_ = intrinsics_from_focal_center(fx, fy, H, W)
-        # print(intrinsics_[0])
-
-        # import numpy as np
-        # from PIL import Image
-
-        # with torch.no_grad(): # 避免梯度追踪增加显存开销
-        #     # 1. 提取第一个 batch, 第一个 view 的点云和内参
-        #     # local_pts 形状: (B, N_sub, H, W, 3), K 形状: (B, N_sub, 3, 3)
-        #     # 1. 提取第一个 batch, 第一个 view 的点云和内参，并强制转换为 float32
-        #     K1 = K[0, 0].float()  # 内参矩阵，形状为 (3, 3)
-        #     depth_image = point_cloud_to_depth_map(local_pts[0,0].reshape(-1, 3), K1)
-        #     plt.figure(figsize=(6, 6))
-        #     plt.imshow(depth_image.cpu().numpy(), cmap='plasma')
-        #     plt.colorbar(label='Depth (Z)')
-        #     plt.title(f'Projected Depth Map')
-        #     plt.axis('off')
-        #     plt.savefig('projected_depth.png')
-        #     print("深度图已生成，大小:", depth_image.shape)
-        #         # print(f"Saved projected depth map to {save_path}")
-        # depth = local_pts[0, 0,..., 2].detach().cpu().numpy()
-        # depth_vis = np.zeros_like(depth)
-        # valid_depths = depth
-        # d_min, d_max = valid_depths.min(), valid_depths.max()
-
-        # # 归一化整个深度图
-        # normalized_depth = (depth - d_min) / (d_max - d_min + 1e-8)
-
-        # # 将归一化后的有效区域赋值给可视化图像，背景保留为0
-        # depth_vis = normalized_depth
-
-        # # 保存图片
-        # save_file = os.path.join(f'depth_0.png')
-        # plt.imsave(save_file, depth_vis, cmap='plasma')
 
         return dict(
             gaussians=gaussians,
             camera_poses=camera_poses, 
             local_points=local_pts,
             intrinsics=K, 
-            conf=conf_logits,
-            selected_gaussians=torch.tensor(selected_gaussians, device=imgs.device)
+            conf=conf_logits
         )

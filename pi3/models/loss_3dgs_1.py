@@ -437,9 +437,9 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.5, lambda_depth=5, 
+            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=1, 
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
-        train_conf=False, num_sky_anchors=8196
+        train_conf=False, num_sky_anchors=8196, lpips_downsample=0.5
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -455,6 +455,7 @@ class Pi3LossGS(nn.Module):
         
         self.train_conf = train_conf 
         self.num_sky_anchors = num_sky_anchors
+        # self.lpips_downsample = min(max(float(lpips_downsample), 0.1), 1.0)
         self.lpips_loss_fn = lpips.LPIPS(net='alex').eval()
         for param in self.lpips_loss_fn.parameters():
             param.requires_grad = False
@@ -471,39 +472,6 @@ class Pi3LossGS(nn.Module):
             gt_ks = gt_ks,
         )
 
-    # def normalize_pred(self, pred, gt):
-    #     local_points = pred['local_points']
-    #     camera_poses = pred['camera_poses']
-    #     B, N, H, W, _ = local_points.shape
-    #     masks = gt['masks'] 
-        
-    #     mask_bool = masks.squeeze(-1) 
-
-    #     all_pts = local_points.clone()
-    #     all_pts[~mask_bool] = 0 
-        
-    #     all_pts = all_pts.reshape(B, -1, 3) 
-    #     all_dis = all_pts.norm(dim=-1)      
-        
-    #     num_valid_pts = mask_bool.view(B, -1).float().sum(dim=-1) 
-        
-    #     norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) 
-    #     norm_factor = norm_factor.clamp_min(1e-4) 
-        
-    #     local_points = local_points / norm_factor[..., None, None, None, None]
-        
-    #     camera_poses_normalized = camera_poses.clone()
-    #     camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
-
-    #     pred['local_points'] = local_points
-    #     pred['camera_poses'] = camera_poses_normalized
-
-    #     if 'gaussians' in pred:
-    #         pred['gaussians']['xyz'] = pred['gaussians']['xyz'] / norm_factor.view(B, 1, 1)
-    #         pred['gaussians']['scale'] = pred['gaussians']['scale'] / norm_factor.view(B, 1, 1)
-
-    #     return pred
-
     def normalize_pred(self, pred, gt):
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
@@ -518,23 +486,12 @@ class Pi3LossGS(nn.Module):
         all_pts = all_pts.reshape(B, -1, 3) 
         all_dis = all_pts.norm(dim=-1)      
         
-        norm_factor = torch.ones(B, device=all_dis.device, dtype=all_dis.dtype)
-        for b in range(B):
-            valid_dis = all_dis[b][mask_bool.view(B, -1)[b]]
-            if valid_dis.numel() > 0:
-                # 【核心修复 1】：使用中位数 (Median) 
-                # 中位数对极端的“飞点”完全免疫，能永远把场景最核心的主体稳定锚定在距离 1.0 的安全区
-                norm_factor[b] = torch.median(valid_dis)
-                
-        # 兜底保护
+        num_valid_pts = mask_bool.view(B, -1).float().sum(dim=-1) 
+        
+        norm_factor = all_dis.sum(dim=-1) / (num_valid_pts + 1e-8) 
         norm_factor = norm_factor.clamp_min(1e-4) 
         
-        # 将场景主体统一缩放归一化
         local_points = local_points / norm_factor[..., None, None, None, None]
-        
-        # 【核心修复 2】：硬性物理截断
-        # 满足你的需求：归一化后，绝对不允许任何点飞出 1000 的范围，直接切平
-        local_points = torch.clamp(local_points, min=-1000.0, max=1000.0)
         
         camera_poses_normalized = camera_poses.clone()
         camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
@@ -543,14 +500,55 @@ class Pi3LossGS(nn.Module):
         pred['camera_poses'] = camera_poses_normalized
 
         if 'gaussians' in pred:
-            # 同步缩放高斯属性
             pred['gaussians']['xyz'] = pred['gaussians']['xyz'] / norm_factor.view(B, 1, 1)
-            # 同样对高斯坐标施加 100 的硬截断
-            pred['gaussians']['xyz'] = torch.clamp(pred['gaussians']['xyz'], min=-1000.0, max=1000.0)
-            
             pred['gaussians']['scale'] = pred['gaussians']['scale'] / norm_factor.view(B, 1, 1)
 
         return pred
+
+    # def normalize_pred(self, pred, gt):
+    #     local_points = pred['local_points']
+    #     camera_poses = pred['camera_poses']
+    #     B, N, H, W, _ = local_points.shape
+    #     masks = gt['masks'] 
+        
+    #     mask_bool = masks.squeeze(-1) 
+
+    #     all_dis = local_points.norm(dim=-1).reshape(B, -1)
+    #     mask_flat = mask_bool.reshape(B, -1)
+        
+    #     norm_factor = torch.ones(B, device=all_dis.device, dtype=all_dis.dtype)
+    #     for b in range(B):
+    #         valid_dis = all_dis[b][mask_flat[b]]
+    #         if valid_dis.numel() > 0:
+    #             # 【核心修复 1】：使用中位数 (Median) 
+    #             # 中位数对极端的“飞点”完全免疫，能永远把场景最核心的主体稳定锚定在距离 1.0 的安全区
+    #             norm_factor[b] = torch.median(valid_dis)
+                
+    #     # 兜底保护
+    #     norm_factor = norm_factor.clamp_min(1e-4) 
+        
+    #     # 将场景主体统一缩放归一化
+    #     local_points = local_points / norm_factor[..., None, None, None, None]
+        
+    #     # 【核心修复 2】：硬性物理截断
+    #     # 满足你的需求：归一化后，绝对不允许任何点飞出 1000 的范围，直接切平
+    #     local_points = torch.clamp(local_points, min=-1000.0, max=1000.0)
+        
+    #     camera_poses_normalized = camera_poses.clone()
+    #     camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
+
+    #     pred['local_points'] = local_points
+    #     pred['camera_poses'] = camera_poses_normalized
+
+    #     if 'gaussians' in pred:
+    #         # 同步缩放高斯属性
+    #         pred['gaussians']['xyz'] = pred['gaussians']['xyz'] / norm_factor.view(B, 1, 1)
+    #         # 同样对高斯坐标施加 100 的硬截断
+    #         pred['gaussians']['xyz'] = torch.clamp(pred['gaussians']['xyz'], min=-1000.0, max=1000.0)
+            
+    #         pred['gaussians']['scale'] = pred['gaussians']['scale'] / norm_factor.view(B, 1, 1)
+
+    #     return pred
 
 
     def _render_gs(self, gaussians, w2c, ks, H, W, render_mode='RGB'):
@@ -572,16 +570,16 @@ class Pi3LossGS(nn.Module):
         gt = self.prepare_gt(gt_raw)
         
         B, N_total, C, H, W = gt['imgs'].shape
-        sub_idx = torch.arange(0, N_total, 1, device=gt['imgs'].device)
-        self.lpips_loss_fn = self.lpips_loss_fn.to(gt['imgs'].device)
-        N_sub = len(sub_idx)
+        if next(self.lpips_loss_fn.parameters()).device != gt['imgs'].device:
+            self.lpips_loss_fn = self.lpips_loss_fn.to(gt['imgs'].device)
 
         # ==========================================
         # === 修改处 1: 提前计算 pseudo_mask 代替 gt_mask ===
         # ==========================================
-        conf_mask = torch.sigmoid(pred['conf'][..., 0]) > 0.1 
-        non_edge_mask = ~depth_edge(pred['local_points'][..., 2], rtol=0.03) 
-        pseudo_mask_2d = torch.logical_and(conf_mask, non_edge_mask) # 形状: [B, N, H, W]
+        with torch.no_grad():
+            conf_mask = torch.sigmoid(pred['conf'][..., 0]) > 0.1 
+            non_edge_mask = ~depth_edge(pred['local_points'][..., 2], rtol=0.03) 
+            pseudo_mask_2d = torch.logical_and(conf_mask, non_edge_mask) # 形状: [B, N, H, W]
         
         # 增加最后通道维度以适配 normalize_pred 所需的 [B, N, H, W, 1] 形状
         pseudo_mask_dict = {'masks': pseudo_mask_2d.unsqueeze(-1)}
@@ -615,91 +613,119 @@ class Pi3LossGS(nn.Module):
         
         depth_ratio = 1.0 - 0.5 * progress 
         cur_lambda_depth = self.lambda_depth * depth_ratio
-        pred_local_pts = torch.clamp(pred['local_points'], min=-1e4, max=1e4)
+        pred_local_depth = pred['local_points'][..., 2:3].clamp(min=-1e4, max=1e4)
 
-        loss_rgb = loss_ssim = loss_depth = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
+        loss_rgb = loss_ssim = loss_depth = loss_sobel = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
+        loss_lpips = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
-        gauss_render = {k: v for k, v in gauss_raw.items()} 
         render_c2w = pred_c2w.clone()
 
         render_w2c = se3_inverse(render_c2w)
         
         # 1. 渲染完整的 RGB
-        render_out_rgb, _, _ = self._render_gs(gauss_render, render_w2c, intrinsics_pred, H, W, render_mode='RGB')
+        render_out_rgb, _, _ = self._render_gs(gauss_raw, render_w2c, intrinsics_pred, H, W, render_mode='RGB')
         rgb_full = render_out_rgb[..., :3].reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
-        
-        # 2. 构造专用于渲染 Depth 的高斯字典
-        gauss_render_depth = {k: v for k, v in gauss_render.items()}
-        if "conf" in gauss_render:
-            conf_prob = torch.sigmoid(gauss_render["conf"])
-            gauss_render_depth["opacity"] = torch.where(
-                conf_prob < 0.1, 
-                torch.zeros_like(gauss_render["opacity"]), 
-                gauss_render["opacity"]
-            )
-            
-        render_out_depth, _, _ = self._render_gs(gauss_render_depth, render_w2c, intrinsics_pred, H, W, render_mode='ED')
-        
-        depth_map = render_out_depth[..., 0:1].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-        
+        del render_out_rgb
+
         gt_imgs_reshaped = gt_imgs.reshape(B * N_total, 3, H, W)
 
         if self.train_stage in [1, 2, 3]:
             loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
             loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
-            loss_lpips = self.lpips_loss_fn(rgb_full, gt_imgs_reshaped).mean()
-            
-            # ==========================================
-            # === 修改处 2: 复用之前算好的 pseudo_mask ===
-            # ==========================================
-            # 直接使用我们在 forward 开头计算出来的 pseudo_mask_2d，只需进行 reshape 即可
+            # loss_sobel = sobel_edge_loss(rgb_full, gt_imgs_reshaped)
+
+            # if cur_lambda_lpips > 0:
+            #     if self.lpips_downsample < 1.0:
+            #         lp_rgb = F.interpolate(rgb_full, scale_factor=self.lpips_downsample, mode='bilinear', align_corners=False, antialias=True)
+            #         lp_gt = F.interpolate(gt_imgs_reshaped, scale_factor=self.lpips_downsample, mode='bilinear', align_corners=False, antialias=True)
+            #     else:
+            #         lp_rgb = rgb_full
+            #         lp_gt = gt_imgs_reshaped
+            #     loss_lpips = self.lpips_loss_fn(lp_rgb, lp_gt).mean()
+            #     if self.lpips_downsample < 1.0:
+            #         del lp_rgb, lp_gt
+            if cur_lambda_lpips > 0:
+                loss_lpips = self.lpips_loss_fn(
+                    rgb_full,
+                    gt_imgs_reshaped,
+                    normalize=True
+                ).mean()
+
+        del rgb_full, gt_imgs_reshaped
+
+        need_depth_loss = (self.train_stage in [1, 2, 3]) and (self.lambda_depth > 0) and bool(pseudo_mask_2d.any().item())
+        if need_depth_loss:
+            # 2. 构造专用于渲染 Depth 的高斯字典
+            if "conf" in gauss_raw:
+                conf_prob = torch.sigmoid(gauss_raw["conf"])
+                gauss_render_depth = {
+                    "xyz": gauss_raw["xyz"],
+                    "rotation": gauss_raw["rotation"],
+                    "scale": gauss_raw["scale"],
+                    "color": gauss_raw["color"],
+                    "opacity": torch.where(
+                        conf_prob < 0.1,
+                        torch.zeros_like(gauss_raw["opacity"]),
+                        gauss_raw["opacity"]
+                    ),
+                }
+                del conf_prob
+            else:
+                gauss_render_depth = gauss_raw
+
+            render_out_depth, _, _ = self._render_gs(gauss_render_depth, render_w2c, intrinsics_pred, H, W, render_mode='ED')
+            depth_map = render_out_depth[..., 0:1].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
+            del render_out_depth
+
             pseudo_mask = pseudo_mask_2d.reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-            pseudo_gt_depth = pred_local_pts[..., 2:3].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-            
-            if self.lambda_depth > 0 and pseudo_mask.sum() > 10:
+            pseudo_gt_depth = pred_local_depth.reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
+            if pseudo_mask.sum() > 10:
                 loss_depth = F.l1_loss(depth_map[pseudo_mask], pseudo_gt_depth[pseudo_mask].detach())
-            # ==========================================
-            # 【新增：渲染层面的稀疏惩罚与体积克制】
+            del depth_map, pseudo_mask, pseudo_gt_depth
+        # ==========================================
+        # 【新增：渲染层面的稀疏惩罚与体积克制】
         loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
         loss_volume = torch.tensor(0.0, device=pred_c2w.device)
         
         valid_render_mask = gauss_raw['opacity'].squeeze(-1) > 0.05
         if valid_render_mask.sum() > 0:
             active_opacities = gauss_raw['opacity'][valid_render_mask]
-            active_scales = gauss_raw['scale'][valid_render_mask]
+            # active_scales = gauss_raw['scale'][valid_render_mask]
             
-            # 【修改】：使用二元熵 (Binary Entropy) 推动透明度彻底两极分化
-            # 加上极小值 eps 防止 log(0) 导致 NaN 梯度爆炸
+            # 【修复 3】：将 opacity 截断，防止极小的负浮点数导致 log 出现 nan
             eps = 1e-6
+            active_opacities_safe = active_opacities.clamp(eps, 1.0 - eps)
             loss_sparsity = -(
-                active_opacities * torch.log(active_opacities + eps) + 
-                (1.0 - active_opacities) * torch.log(1.0 - active_opacities + eps)
+                active_opacities_safe * torch.log(active_opacities_safe) + 
+                (1.0 - active_opacities_safe) * torch.log(1.0 - active_opacities_safe)
             ).mean()
             
-            # 限制极速膨胀
-            vol = active_scales[..., 0] * active_scales[..., 1] * active_scales[..., 2]
-            loss_volume = (vol * active_opacities.squeeze(-1)).mean()
-
+            # 【修复 1】：将 scale 强转为 fp32 计算体积，防止 fp16 溢出 (65504 上限)
+            # active_scales_fp32 = active_scales.float()
+            # vol = active_scales_fp32[..., 0] * active_scales_fp32[..., 1] * active_scales_fp32[..., 2]
+            # loss_volume = (vol * active_opacities.squeeze(-1).float()).mean()
         final_loss = (
             cur_lambda_rgb * loss_rgb + 
             cur_lambda_ssim * loss_ssim +
             cur_lambda_depth * loss_depth +
             cur_lambda_lpips * loss_lpips +
-            0.05 * loss_sparsity +   
-            0.01 * loss_volume
+            # 0.05 * loss_sobel +
+            0.03 * loss_sparsity 
+            # 0.0001 * loss_volume
         )
 
         if final_loss == 0.0:
-             final_loss = (pred_local_pts.sum() * 0.0)
+            final_loss = (pred['local_points'].sum() * 0.0)
 
         details.update({
             "loss_rgb": loss_rgb,
             "loss_ssim": loss_ssim,
-            "loss_depth": loss_depth, 
+            "loss_depth": loss_depth,
+            # "loss_sobel": loss_sobel,
             "loss_lpips": loss_lpips,
             "loss_sparsity": loss_sparsity,
-            "loss_volume": loss_volume,
+            # "loss_volume": loss_volume,
             "cur_weight_rgb": torch.tensor(cur_lambda_rgb, device=pred_c2w.device),   
             "cur_weight_depth": torch.tensor(cur_lambda_depth, device=pred_c2w.device), 
             "total_loss": final_loss
@@ -707,5 +733,10 @@ class Pi3LossGS(nn.Module):
 
         if "selected_gaussians" in pred:
             details["selected_gaussians"] = pred["selected_gaussians"].detach().float()
+        
+        del render_c2w, render_w2c
+        if need_depth_loss:
+            del gauss_render_depth
+        # torch.cuda.empty_cache() # 让 Pytorch 回收碎片显存留给 backward 用
 
         return final_loss, details

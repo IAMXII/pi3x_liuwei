@@ -15,7 +15,7 @@ dataset_switches:
 # =========================================================
 
 train_dataset:
-    length: 400000         # dummy
+    length: 360000         # dummy
 
     # 这里的权重都会保留，但在代码中可以通过读取 enabled 状态来决定是否使用该权重
     weights: 
