@@ -22,6 +22,7 @@ import math
 import sys
 from PIL import Image
 import shutil
+from safetensors.torch import load_file as load_safetensors
 from utils.basic import seed_anything, count_parameters
 
 from datasets import create_dataloader
@@ -759,21 +760,100 @@ class BaseTrainer:
             start_epoch = 0
         else:
             self.log_info(f"Resuming from checkpoint {path}")
-            self.accelerator.load_state(path)
-            
-            # Extract epoch number from checkpoint path
-            if "checkpoint_" in path:
-                # Extract epoch from "checkpoint_N" format
-                checkpoint_name = path.rstrip('/').split('/')[-1]
-                # FIX: Add +1 because checkpoint is saved AFTER the epoch finishes
-                start_epoch = int(checkpoint_name.split("checkpoint_")[-1]) + 1
+            start_epoch = self._get_resume_epoch(path)
+            checkpoint_group_sizes = self._get_checkpoint_optimizer_group_sizes(path)
+            current_group_sizes = self._get_optimizer_group_sizes()
+
+            if (
+                checkpoint_group_sizes is not None
+                and current_group_sizes is not None
+                and checkpoint_group_sizes != current_group_sizes
+            ):
+                self.log_info(
+                    "Optimizer state is incompatible with the current trainable parameter "
+                    f"groups. Checkpoint groups: {checkpoint_group_sizes}, current groups: "
+                    f"{current_group_sizes}. Loading model weights only and restarting the "
+                    "optimizer / LR scheduler from step 0."
+                )
+                self._load_model_only(path)
+                start_epoch = 0
             else:
-                # For "best_model", strictly speaking we should probably not resume training 
-                # loop logic from it unless we know the epoch, but defaulting to 0 is risky
-                # if the scheduler is loaded. For now, keep as 0 or consider handling best_model differently.
-                start_epoch = 2
+                try:
+                    self.accelerator.load_state(path)
+                except ValueError as exc:
+                    if not self._is_optimizer_state_mismatch(exc):
+                        raise
+
+                    self.log_info(
+                        "Optimizer state could not be restored after a parameter-group change "
+                        f"({exc}). Loading model weights only and restarting the optimizer / "
+                        "LR scheduler from step 0."
+                    )
+                    self._load_model_only(path)
+                    start_epoch = 0
 
         return start_epoch
+
+    def _get_resume_epoch(self, path):
+        if "checkpoint_" in path:
+            checkpoint_name = path.rstrip("/").split("/")[-1]
+            return int(checkpoint_name.split("checkpoint_")[-1]) + 1
+
+        # Best-model checkpoints do not encode the epoch in their directory name.
+        return 0
+
+    def _get_optimizer_group_sizes(self):
+        optimizer = getattr(self.optimizer, "optimizer", self.optimizer)
+        if not hasattr(optimizer, "param_groups"):
+            return None
+        return [len(group.get("params", [])) for group in optimizer.param_groups]
+
+    def _get_checkpoint_optimizer_group_sizes(self, path):
+        optimizer_path = os.path.join(path, "optimizer.bin")
+        if not os.path.exists(optimizer_path):
+            return None
+
+        optimizer_state = self._torch_load_cpu(optimizer_path)
+        if not isinstance(optimizer_state, dict):
+            return None
+
+        param_groups = optimizer_state.get("param_groups", [])
+        return [len(group.get("params", [])) for group in param_groups]
+
+    def _torch_load_cpu(self, path):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    def _load_model_only(self, path):
+        model_path = os.path.join(path, "model.safetensors")
+        if os.path.exists(model_path):
+            state_dict = load_safetensors(model_path, device="cpu")
+        else:
+            model_path = os.path.join(path, "pytorch_model.bin")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(
+                    f"Could not find model weights under checkpoint directory: {path}"
+                )
+            state_dict = self._torch_load_cpu(model_path)
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        result = unwrapped_model.load_state_dict(state_dict, strict=False)
+        self.log_info(
+            f"Model-only resume from {model_path}: "
+            f"{len(result.missing_keys)} missing keys, "
+            f"{len(result.unexpected_keys)} unexpected keys."
+        )
+        self.accelerator.wait_for_everyone()
+
+    def _is_optimizer_state_mismatch(self, exc):
+        message = str(exc)
+        mismatch_markers = (
+            "different number of parameter groups",
+            "doesn't match the size of optimizer's group",
+        )
+        return any(marker in message for marker in mismatch_markers)
 
     def log_info(self, info):
         if is_logging_process():

@@ -64,6 +64,46 @@ def freeze_all_params(modules):
         except AttributeError:
             module.requires_grad = False
 
+
+def modules_require_grad(modules):
+    for module in modules:
+        for param in module.parameters():
+            if param.requires_grad:
+                return True
+    return False
+
+
+def approx_quantile_lastdim(x, q, max_samples=262144):
+    """
+    Compute a quantile on the last dimension with bounded memory.
+    When the last dimension is too large, sample evenly spaced points first.
+    """
+    n = x.shape[-1]
+    if n <= max_samples:
+        return torch.quantile(x, q, dim=-1)
+
+    if max_samples <= 1:
+        index = torch.zeros(1, device=x.device, dtype=torch.long)
+    else:
+        base = torch.arange(max_samples, device=x.device, dtype=torch.long)
+        index = (base * (n - 1)) // (max_samples - 1)
+    sampled = x.index_select(-1, index)
+    return torch.quantile(sampled, q, dim=-1)
+
+
+def approx_quantile_flat(x, q, max_samples=262144):
+    flat = x.reshape(-1)
+    if flat.numel() <= max_samples:
+        return torch.quantile(flat, q)
+
+    if max_samples <= 1:
+        index = torch.zeros(1, device=flat.device, dtype=torch.long)
+    else:
+        base = torch.arange(max_samples, device=flat.device, dtype=torch.long)
+        index = (base * (flat.numel() - 1)) // (max_samples - 1)
+    sampled = flat.index_select(0, index)
+    return torch.quantile(sampled, q)
+
 # # 手动实现一个（很简单）
 # def intrinsics_from_focal_center(fx, fy, cx, cy):
 #     B = fx.shape[0]
@@ -244,7 +284,7 @@ class Pi3_3DGS(nn.Module):
             scale_min_ratio=5e-5,
             scale_max_ratio=0.8,
             gs_view_stride=1,
-            gs_decoder_view_chunk_size=10,
+            gs_decoder_view_chunk_size=24,
     ):
         super().__init__()
         self.debug_mem = debug_mem
@@ -527,7 +567,7 @@ class Pi3_3DGS(nn.Module):
         # Branches: Camera Pose 对全量数据生效
         # -----------------------------
         patch_h, patch_w = H // 14, W // 14
-        cam_ctx = torch.no_grad() if self.train_stage in [1, 2] else nullcontext()
+        cam_ctx = nullcontext() if modules_require_grad([self.camera_decoder, self.camera_head]) else torch.no_grad()
         with cam_ctx:
             cam_h = self.camera_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
             camera_poses = self.camera_head(cam_h, patch_h, patch_w).reshape(B, N_total, 4, 4)
@@ -545,12 +585,12 @@ class Pi3_3DGS(nn.Module):
         hidden_views = hidden.view(B, N_total, hw, -1)[:, sub_idx].contiguous()
         pos_views = pos.view(B, N_total, hw, -1)[:, sub_idx].contiguous()
 
-        point_ctx = torch.no_grad() if self.train_stage == 1 else nullcontext()
+        point_ctx = nullcontext() if modules_require_grad([self.point_decoder, self.point_head]) else torch.no_grad()
         with point_ctx:
             point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
             local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)
 
-        conf_ctx = torch.no_grad() if self.train_stage in [1, 2] else nullcontext()
+        conf_ctx = nullcontext() if modules_require_grad([self.conf_decoder, self.conf_head]) else torch.no_grad()
         with conf_ctx:
             ret_conf = self.conf_decoder(hidden, xpos=pos)
             conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
@@ -629,8 +669,9 @@ class Pi3_3DGS(nn.Module):
             # 方法 A (严格最大值): 直接取最远的点作为场景大小
             # scene_size = distances.max() 
             
-            # 方法 B (推荐：鲁棒最大值): 取 99% 分位数，过滤掉可能飞到极远处的异常噪点
-            scene_size = torch.quantile(distances.float().reshape(B, -1), 0.8, dim=1)
+            # 方法 B (推荐：鲁棒最大值): 取分位数，过滤掉可能飞到极远处的异常噪点。
+            # 对长序列推理，直接全量 quantile 会触发 tensor-too-large 错误，这里改成有上限采样。
+            scene_size = approx_quantile_lastdim(distances.float().reshape(B, -1), 0.8)
             # print(f"Dynamic scene size: {scene_size.item():.2f}")
             # scene_size_f = scene_size / 10.0 
             # local_pts = local_pts / scene_size_f[..., None, None, None]  # 将点云缩放到更合理的范围，防止数值不稳定
@@ -698,7 +739,7 @@ class Pi3_3DGS(nn.Module):
             dy = F.conv2d(depth_flat, sobel_y, padding=1)
             depth_edge = torch.sqrt(dx ** 2 + dy ** 2 + 1e-6)
             
-            depth_edge = torch.clamp(depth_edge, max=torch.quantile(depth_edge.float().view(-1), 0.98))
+            depth_edge = torch.clamp(depth_edge, max=approx_quantile_flat(depth_edge.float(), 0.98))
             depth_score = 0.5 * depth_edge / (depth_edge.amax(dim=(-2, -1), keepdim=True) + 1e-5)
 
             score_map = torch.max(color_score, depth_score)
@@ -880,7 +921,7 @@ class Pi3_3DGS(nn.Module):
         # mem.step("Voxel Attention Fusion")
         #####
             # --- 优化后的高斯解析逻辑 ---
-            b_xyz, b_rot, b_scale, b_opacity, b_color = [], [], [], [], []
+            b_xyz, b_rot, b_scale, b_opacity, b_color, b_conf = [], [], [], [], [], []
 
             for start in range(0, N_sub, self.gs_decoder_view_chunk_size):
                 end = min(start + self.gs_decoder_view_chunk_size, N_sub)
@@ -899,6 +940,7 @@ class Pi3_3DGS(nn.Module):
                 scale_map_v = scale_map[b, start:end][mask_chunk]
                 is_quad_center_v = quad_keep_mask[b, start:end][mask_chunk]
                 low_conf_v = mask_push_scale[b, start:end][mask_chunk]
+                conf_v = conf_logits_sub[b, start:end][mask_chunk]
                 view_idx_v = mask_chunk.nonzero(as_tuple=True)[0] + start
 
                 # 及时释放 chunk 级无用显存
@@ -916,6 +958,7 @@ class Pi3_3DGS(nn.Module):
                 scale_map_v = scale_map_v[valid_mask]
                 is_quad_center_v = is_quad_center_v[valid_mask]
                 low_conf_v = low_conf_v[valid_mask]
+                conf_v = conf_v[valid_mask]
                 view_idx_v = view_idx_v[valid_mask]
                 opacity_v = opacity_v[valid_mask]
 
@@ -947,6 +990,7 @@ class Pi3_3DGS(nn.Module):
                 b_scale.append(scale_v)
                 b_opacity.append(opacity_v)
                 b_color.append(color_v)
+                b_conf.append(conf_v)
 
                 del gs_attrs_v, local_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
 
@@ -957,7 +1001,8 @@ class Pi3_3DGS(nn.Module):
                     "rotation": torch.cat(b_rot, dim=0),
                     "scale": torch.cat(b_scale, dim=0),
                     "opacity": torch.cat(b_opacity, dim=0),
-                    "color": torch.cat(b_color, dim=0)
+                    "color": torch.cat(b_color, dim=0),
+                    "conf": torch.cat(b_conf, dim=0)
                 })
             else:
                 # 极端兜底，防止全被过滤导致维度错误
@@ -966,11 +1011,12 @@ class Pi3_3DGS(nn.Module):
                     "rotation": torch.tensor([[1., 0., 0., 0.]], device=imgs.device),
                     "scale": torch.full((1, 3), 1e-5, device=imgs.device),
                     "opacity": torch.zeros((1, 1), device=imgs.device),
-                    "color": torch.zeros((1, 3), device=imgs.device)
+                    "color": torch.zeros((1, 3), device=imgs.device),
+                    "conf": torch.full((1, 1), -20.0, device=imgs.device)
                 })
         # 对齐 Batch 内高斯数量
         max_k = max(g["xyz"].size(0) for g in fused_gaussians)
-        d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out = [], [], [], [], []
+        d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out, d_conf_out = [], [], [], [], [], []
         for g in fused_gaussians:
             pad_len = max_k - g["xyz"].size(0)
             d_xyz_out.append(F.pad(g["xyz"], (0,0, 0,pad_len), value=0.0))
@@ -978,6 +1024,7 @@ class Pi3_3DGS(nn.Module):
             d_scale_out.append(F.pad(g["scale"], (0,0, 0,pad_len), value=1e-5))
             d_opacity_out.append(F.pad(g["opacity"], (0,0, 0,pad_len), value=0.0))
             d_color_out.append(F.pad(g["color"], (0,0, 0,pad_len), value=0.0))
+            d_conf_out.append(F.pad(g["conf"], (0,0, 0,pad_len), value=-20.0))
 
         gaussians = {
             "xyz": torch.stack(d_xyz_out, dim=0),
@@ -985,7 +1032,8 @@ class Pi3_3DGS(nn.Module):
             "scale": torch.stack(d_scale_out, dim=0),
             "opacity": torch.stack(d_opacity_out, dim=0),
             "color": torch.stack(d_color_out, dim=0),
-            "num_sky": 0 
+            "num_sky": 0,
+            "conf": torch.stack(d_conf_out, dim=0)
         }
 
         return dict(

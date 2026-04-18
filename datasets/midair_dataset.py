@@ -201,20 +201,29 @@ import numpy as np
 from PIL import Image
 from datasets.base.base_dataset import BaseDataset
 
-def load_intrinsics_from_npz(npz_path):
-    """仅读取内参"""
+def load_camera_from_npz(npz_path):
+    """读取 MidAir 的位姿和内参。"""
     if not osp.exists(npz_path):
         raise FileNotFoundError(f"Metadata file not found: {npz_path}")
     try:
         data = np.load(npz_path)
+        if 'camera_pose' in data:
+            camera_pose = data['camera_pose']
+        elif 'pose' in data:
+            camera_pose = data['pose']
+        else:
+            raise KeyError(f"No pose found in {npz_path}")
+
         if 'camera_intrinsics' in data:
-            return data['camera_intrinsics']
+            camera_intrinsics = data['camera_intrinsics']
         elif 'intrinsics' in data:
-            return data['intrinsics']
+            camera_intrinsics = data['intrinsics']
         elif 'K' in data:
-            return data['K']
+            camera_intrinsics = data['K']
         else:
             raise KeyError(f"No intrinsics found in {npz_path}")
+
+        return camera_pose, camera_intrinsics
     except Exception as e:
         raise IOError(f"Error loading npz {npz_path}: {e}")
 
@@ -249,18 +258,20 @@ class MidAirDataset(BaseDataset):
             for cond in conditions:
                 cond_dir = osp.join(subset_dir, cond)
                 rgb_base = osp.join(cond_dir, 'color_left')
+                depth_base = osp.join(cond_dir, 'depth')
                 meta_base = osp.join(cond_dir, 'metadata')
 
-                if not (osp.exists(rgb_base) and osp.exists(meta_base)):
+                if not (osp.exists(rgb_base) and osp.exists(depth_base) and osp.exists(meta_base)):
                     continue
 
                 trajs = sorted([d for d in os.listdir(rgb_base) if osp.isdir(osp.join(rgb_base, d))])
                 
                 for traj in trajs:
                     traj_rgb_dir = osp.join(rgb_base, traj)
+                    traj_depth_dir = osp.join(depth_base, traj)
                     traj_meta_dir = osp.join(meta_base, traj)
 
-                    if not osp.exists(traj_meta_dir):
+                    if not (osp.exists(traj_depth_dir) and osp.exists(traj_meta_dir)):
                         continue
 
                     all_frames = sorted([f for f in os.listdir(traj_rgb_dir) if f.endswith('.JPEG')])
@@ -268,6 +279,7 @@ class MidAirDataset(BaseDataset):
                     if len(all_frames) >= getattr(self, 'frame_num', 1):
                         valid_scans.append({
                             'rgb_dir': traj_rgb_dir,
+                            'depth_dir': traj_depth_dir,
                             'meta_dir': traj_meta_dir,
                             'frames': all_frames,
                             'scan_id': f"{subset}/{cond}/{traj}"
@@ -284,6 +296,7 @@ class MidAirDataset(BaseDataset):
             raise RuntimeError(f"Index {idx} is invalid for MidAirDataset")
 
         rgb_dir = scan['rgb_dir']
+        depth_dir = scan['depth_dir']
         meta_dir = scan['meta_dir']
         frames = scan['frames']
 
@@ -310,23 +323,25 @@ class MidAirDataset(BaseDataset):
         for frame_file in selected_frames:
             frame_id = osp.splitext(frame_file)[0]
             rgb_path = osp.join(rgb_dir, frame_file)
+            depth_path = osp.join(depth_dir, f"{frame_id}.PNG")
             meta_path = osp.join(meta_dir, f"{frame_id}.npz")
 
-            if not (osp.exists(rgb_path) and osp.exists(meta_path)):
+            if not (osp.exists(rgb_path) and osp.exists(depth_path) and osp.exists(meta_path)):
                 raise FileNotFoundError(f"Missing component for frame {frame_id} in {scan['scan_id']}")
 
             try:
                 rgb_image = np.array(Image.open(rgb_path).convert('RGB'))
-                camera_intrinsics = load_intrinsics_from_npz(meta_path)
-                
-                fake_depthmap = np.zeros(rgb_image.shape[:2], dtype=np.float32)
+                depthmap = np.array(Image.open(depth_path)).astype(np.float32)
+                camera_pose, camera_intrinsics = load_camera_from_npz(meta_path)
 
-                rgb_image, _, intrinsics = self._crop_resize_if_necessary(
-                    rgb_image, fake_depthmap, camera_intrinsics.astype(np.float32), resolution, rng=rng, info=rgb_path
+                rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
+                    rgb_image, depthmap, camera_intrinsics.astype(np.float32), resolution, rng=rng, info=rgb_path
                 )
 
                 views.append(dict(
                     img=rgb_image,
+                    depthmap=depthmap.astype(np.float32),
+                    camera_pose=camera_pose.astype(np.float32),
                     camera_intrinsics=intrinsics,
                     dataset='MidAir',
                     label=scan['scan_id'],

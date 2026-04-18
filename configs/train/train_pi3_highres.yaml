@@ -3,8 +3,8 @@
 trainer: trainers.pi3_trainer.Pi3Trainer
 
 train:
-  image_num_range: [2, 8]    # hres - increased from [2,8] to [8,12] for incremental testing
-  max_img_per_gpu: 8           # hres - allows testing clustering effectiveness with varying image counts
+  image_num_range: [2, 12]    # hres - increased from [2,8] to [8,12] for incremental testing
+  max_img_per_gpu: 12           # hres - allows testing clustering effectiveness with varying image counts
 
   # dynamic resolution and
   random_reslution: true
@@ -14,6 +14,6 @@ train:
   num_resolution: -1
 
 model:
-  ckpt: "outputs/pi3_highres_0407/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
+  ckpt: "outputs/pi3_highres_0410/ckpts/best_model/model.safetensors" # <path-to-your-pretrain-checkpoint>
 
 # 在你的主要 hydra config yaml 中添加或修改：

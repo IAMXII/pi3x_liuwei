@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn.functional as F
 import argparse
@@ -9,17 +8,60 @@ from gsplat import rasterization
 import sys
 import gc
 
+# --- 【新增】：引入 torchmetrics 计算评测指标 ---
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, \
+    LearnedPerceptualImagePatchSimilarity
+
 # 假设你的项目结构如下
-from pi3.utils.basic import load_images_as_tensor,load_images_and_intrinsics
-from pi3.models.pi3_3dgs import Pi3_3DGS
+from pi3.utils.basic import load_images_as_tensor, load_images_and_intrinsics
+from pi3.models.pi3_3dgs_1 import Pi3_3DGS
 
 
 # ==========================================
 # Helper Functions
 # ==========================================
+def save_heatmap(tensor, path):
+    alpha_np = tensor.squeeze().detach().cpu().numpy()
+    alpha_np = np.clip(alpha_np, 0, 1)
+    alpha_uint8 = (alpha_np * 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(alpha_uint8, cv2.COLORMAP_JET)
+    cv2.imwrite(path, heatmap_color)
+
+
+def save_ply_binary(gaussians, path):
+    xyz = gaussians["xyz"].detach().cpu().float().numpy().squeeze()
+    rot = gaussians["rotation"].detach().cpu().float().numpy().squeeze()
+    scale = gaussians["scale"].detach().cpu().float().numpy().squeeze()
+    opacity = gaussians["opacity"].detach().cpu().float().numpy().squeeze()
+    color = gaussians["color"].detach().cpu().float().numpy().squeeze()
+
+    scale_ply = np.log(np.clip(scale, 1e-10, None))
+    opacity_clipped = np.clip(opacity, 1e-6, 1 - 1e-6)
+    opacity_ply = np.log(opacity_clipped / (1 - opacity_clipped))
+
+    SH_C0 = 0.28209479177387814
+    f_dc = (color - 0.5) / SH_C0
+    normals = np.zeros_like(xyz)
+
+    attributes = np.concatenate((
+        xyz, normals, f_dc, opacity_ply[..., np.newaxis], scale_ply, rot
+    ), axis=-1).astype(np.float32)
+
+    with open(path, 'wb') as f:
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(f"element vertex {xyz.shape[0]}\n".encode('utf-8'))
+        f.write(b"property float x\nproperty float y\nproperty float z\n")
+        f.write(b"property float nx\nproperty float ny\nproperty float nz\n")
+        f.write(b"property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n")
+        f.write(b"property float opacity\n")
+        f.write(b"property float scale_0\nproperty float scale_1\nproperty float scale_2\n")
+        f.write(b"property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n")
+        f.write(b"end_header\n")
+        f.write(attributes.tobytes())
+
 
 def se3_inverse(T):
-    """SE(3) Matrix Inverse: C2W -> W2C"""
     R = T[..., :3, :3]
     t = T[..., :3, 3:4]
     R_inv = R.transpose(-1, -2)
@@ -32,24 +74,15 @@ def se3_inverse(T):
 
 
 def save_image(tensor, path):
-    """保存 RGB [3, H, W]"""
-    # 纯净的维度转换，不需要任何反归一化，因为模型已经通过 sigmoid 输出了 [0, 1] 的值
     img_np = tensor.permute(1, 2, 0).detach().cpu().numpy()
-
-    # 限制在 [0, 1] 并转为 uint8
     img_np = np.clip(img_np, 0, 1) * 255
     img_np = img_np.astype(np.uint8)
-
-    # 转为 OpenCV 的 BGR 格式保存
     img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     cv2.imwrite(path, img_np)
 
 
 def save_depth(tensor, path):
-    """保存深度图 [1, H, W] (灰度图)"""
     depth_np = tensor.squeeze().detach().cpu().numpy()
-
-    # 鲁棒的归一化用于可视化
     valid_mask = depth_np > 1e-5
     if valid_mask.sum() > 0:
         d_min = np.percentile(depth_np[valid_mask], 2)
@@ -58,8 +91,6 @@ def save_depth(tensor, path):
         depth_norm = np.clip(depth_norm, 0, 1)
     else:
         depth_norm = depth_np
-
-    # 直接保存为灰度图，移除伪彩色 (ColorMap)
     depth_gray = (depth_norm * 255).astype(np.uint8)
     cv2.imwrite(path, depth_gray)
 
@@ -69,18 +100,13 @@ def save_depth(tensor, path):
 # ==========================================
 def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
     means = gaussians["xyz"]
-    # 规范化四元数是个好习惯，防止渲染出现黑斑
     quats = gaussians["rotation"]
     scales = gaussians["scale"]
     opacities = gaussians["opacity"]
-
-    # === 核心修复：应用 Sigmoid 激活颜色 ===
-    # 将模型输出的无界 logits 映射到完美的 [0, 1] 色彩空间
     colors = gaussians["color"]
 
     B = means.shape[0]
 
-    # Handle Ragged Batching (num_near)
     if num_gaussians is not None:
         if isinstance(num_gaussians, torch.Tensor):
             max_N = int(num_gaussians.max().item())
@@ -89,6 +115,9 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
             scales = scales[:, :max_N]
             opacities = opacities[:, :max_N].clone()
             colors = colors[:, :max_N]
+
+            if "conf" in gaussians:
+                gaussians["conf"] = gaussians["conf"][:, :max_N]
 
             range_seq = torch.arange(max_N, device=means.device).expand(B, max_N)
             valid_mask = range_seq < num_gaussians.unsqueeze(1)
@@ -100,9 +129,10 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
             scales = scales[:, :limit]
             opacities = opacities[:, :limit]
             colors = colors[:, :limit]
+            if "conf" in gaussians:
+                gaussians["conf"] = gaussians["conf"][:, :limit]
 
-    # Render RGB
-    rgb, _, _ = rasterization(
+    rgb, alpha, _ = rasterization(
         means=means.contiguous().float(),
         quats=quats.contiguous().float(),
         scales=scales.contiguous().float(),
@@ -115,21 +145,29 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
         packed=False
     )
 
-    # Render Depth
+    opacities_depth = opacities.clone()
+    if "conf" in gaussians:
+        conf_prob = torch.sigmoid(gaussians["conf"])
+        opacities_depth = torch.where(
+            conf_prob < 0.1,
+            torch.zeros_like(opacities_depth),
+            opacities_depth
+        )
+
     depth, _, _ = rasterization(
         means=means.contiguous().float(),
         quats=quats.contiguous().float(),
         scales=scales.contiguous().float(),
-        opacities=opacities.squeeze(-1).contiguous().float(),
+        opacities=opacities_depth.squeeze(-1).contiguous().float(),
         colors=colors.contiguous().float(),
         viewmats=w2c.float(),
         Ks=K.float(),
         width=W, height=H,
-        render_mode='ED',  # Expected Depth
+        render_mode='ED',
         packed=False
     )
 
-    return rgb, depth
+    return rgb, depth, alpha
 
 
 # ==========================================
@@ -137,14 +175,14 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
 # ==========================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Pi3_3DGS Inference with Custom Intrinsics")
+    parser = argparse.ArgumentParser(description="Pi3_3DGS Inference with Predicted Intrinsics")
 
     parser.add_argument("--data_path", type=str, default='examples/skating.mp4')
-    parser.add_argument("--output_dir", type=str, default='output_render')
+    parser.add_argument("--output_dir", type=str, default='output_render_cp')
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--interval", type=int, default=-1)
     parser.add_argument("--device", type=str, default='cuda')
-    parser.add_argument("--chunk_size", type=int, default=5, help="Number of frames to process at once to avoid OOM")
+    parser.add_argument("--chunk_size", type=int, default=100, help="Number of frames to process at once to avoid OOM")
 
     args = parser.parse_args()
 
@@ -171,23 +209,26 @@ if __name__ == '__main__':
     else:
         weight = torch.load(args.ckpt, map_location=device, weights_only=False)
         model.load_state_dict(weight, strict=False)
-    K_base = torch.tensor([
-        [332.232689, 0.000000, 333.058485],
-        [0.000000, 332.644823, 240.998586],
-        [0.000000, 0.000000, 1.000000]
-    ], device=device)
-    # 2. Load Data (Keep on CPU first!)
-    print(f"Loading data from {args.data_path}...")
-    imgs_cpu,K_base = load_images_and_intrinsics(args.data_path, K_base, interval=args.interval)
 
+    print(f"Loading data from {args.data_path}...")
+    imgs_cpu = load_images_as_tensor(args.data_path, interval=args.interval)
+    imgs_cpu = imgs_cpu[996:1496:10, ...]
     total_frames = imgs_cpu.shape[0]
     H, W = imgs_cpu.shape[2], imgs_cpu.shape[3]
 
     print(f"Total frames: {total_frames}, Resolution: {H}x{W}")
     print(f"Processing in chunks of {args.chunk_size}...")
 
-    # 3. Setup Intrinsics
+    # --- 【新增】：初始化计算指标 (使用 3DGS 标准的 VGG 网络测 LPIPS) ---
+    print("Initializing metrics (PSNR, SSIM, LPIPS)...")
+    metric_psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
+    metric_ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    # normalize=True 表示输入图像的数据范围在 [0, 1] 之间，库会在内部将其映射到 [-1, 1]
+    metric_lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).to(device)
 
+    # 记录每个图像的评测结果
+    all_metrics = {"psnr": [], "ssim": [], "lpips": []}
+    # -------------------------------------------------------------
 
     # 4. Inference & Render Loop
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -202,13 +243,12 @@ if __name__ == '__main__':
         # Prepare Batch on GPU
         imgs_batch = imgs_cpu[start_idx:end_idx].unsqueeze(0).to(device)
         N_chunk = imgs_batch.shape[1]
-        K_batch = K_base.unsqueeze(0).unsqueeze(0).expand(1, N_chunk, 3, 3).to(device)
 
         # Inference
         try:
             with torch.no_grad():
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    res = model(imgs_batch, K_batch)
+                    res = model(imgs_batch)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"ERROR: Out of Memory during inference on chunk {start_idx}-{end_idx}.")
@@ -218,55 +258,96 @@ if __name__ == '__main__':
                 raise e
 
         # Prepare Rendering Data
-        # 我们只保留渲染真正需要的变量
         gaussians = res['gaussians']
         pred_c2w = res['camera_poses']
+        pred_K = res['intrinsics']
 
-        # 【优化核心：立即丢弃推理阶段无用的中间张量和输入，释放大块显存】
         num_near = gaussians.get('num_near', None)
-        del res['points'], res['conf'], res['local_points'], res
-        del imgs_batch  # 渲染阶段不再需要输入图像
-        torch.cuda.empty_cache()  # 强制执行显存碎片整理
+        torch.cuda.empty_cache()
 
         pred_w2c = se3_inverse(pred_c2w)
+        Ks = pred_K
 
-        # Expand Intrinsics for this batch
-        Ks = K_base.unsqueeze(0).unsqueeze(0).expand(1, current_batch_size, -1, -1)
-
-        # Render Loop for current chunk
         b_idx = 0
         current_gaussians = {k: v[b_idx:b_idx + 1] for k, v in gaussians.items() if isinstance(v, torch.Tensor)}
         current_num_near = num_near[b_idx:b_idx + 1] if num_near is not None else None
 
+        ply_filename = os.path.join(args.output_dir, f"gaussians_chunk_{start_idx:04d}_to_{end_idx - 1:04d}.ply")
+        save_ply_binary(current_gaussians, ply_filename)
+        print(f"Saved PLY point cloud: {ply_filename}")
+
         for i in range(current_batch_size):
             global_frame_idx = start_idx + i
-
             view_w2c = pred_w2c[b_idx:b_idx + 1, i:i + 1]
             view_K = Ks[b_idx:b_idx + 1, i:i + 1]
 
-            rgb_tensor, depth_tensor = render_frame(
+            rgb_tensor, depth_tensor, alpha_tensor = render_frame(
                 current_gaussians,
                 view_w2c,
                 view_K,
                 H, W,
-                num_gaussians=current_num_near
+                num_gaussians=None
             )
 
             rgb_out = rgb_tensor[0, 0].permute(2, 0, 1)
             depth_out = depth_tensor[0, 0].permute(2, 0, 1)
+            alpha_out = alpha_tensor[0, 0].permute(2, 0, 1)
+
+            # --- 【新增】：计算当前帧的 PSNR, SSIM, LPIPS ---
+            # 提取 Ground Truth 并转为 [1, C, H, W] 的浮点数以匹配预测值的格式
+            gt_img = imgs_batch[0, i].to(device)
+
+            with torch.no_grad():
+                pred_for_metric = rgb_out.unsqueeze(0).float()
+                gt_for_metric = gt_img.unsqueeze(0).float()
+
+                # 对齐边界情况，保证范围卡在 [0, 1] 内计算更为准确
+                pred_for_metric = torch.clamp(pred_for_metric, 0.0, 1.0)
+
+                psnr_val = metric_psnr(pred_for_metric, gt_for_metric).item()
+                ssim_val = metric_ssim(pred_for_metric, gt_for_metric).item()
+                lpips_val = metric_lpips(pred_for_metric, gt_for_metric).item()
+
+                all_metrics["psnr"].append(psnr_val)
+                all_metrics["ssim"].append(ssim_val)
+                all_metrics["lpips"].append(lpips_val)
+            # --------------------------------------------------
 
             rgb_path = os.path.join(args.output_dir, f"rgb_{global_frame_idx:04d}.png")
             depth_path = os.path.join(args.output_dir, f"depth_{global_frame_idx:04d}.png")
+            opacity_path = os.path.join(args.output_dir, f"opacity_heatmap_{global_frame_idx:04d}.png")
 
             save_image(rgb_out, rgb_path)
             save_depth(depth_out, depth_path)
+            save_heatmap(alpha_out, opacity_path)
 
-            # 单帧渲染结束后及时清理
-            del rgb_tensor, depth_tensor, rgb_out, depth_out
+            del rgb_tensor, depth_tensor, alpha_tensor, rgb_out, depth_out, alpha_out
 
         print(f"Saved frames {start_idx} - {end_idx - 1}")
 
-        # 清理当前 chunk 显存
-        del gaussians, pred_c2w, pred_w2c, current_gaussians, K_batch
+        del gaussians, pred_c2w, pred_w2c, current_gaussians
         torch.cuda.empty_cache()
         gc.collect()
+
+    # --- 【新增】：运行结束后汇总并保存评测结果 ---
+    print("\n" + "=" * 40)
+    print("Final Render Evaluation Metrics")
+    print("=" * 40)
+
+    avg_psnr = np.mean(all_metrics["psnr"])
+    avg_ssim = np.mean(all_metrics["ssim"])
+    avg_lpips = np.mean(all_metrics["lpips"])
+
+    print(f"Average PSNR:  {avg_psnr:.4f} dB")
+    print(f"Average SSIM:  {avg_ssim:.4f}")
+    print(f"Average LPIPS: {avg_lpips:.4f}")
+    print("=" * 40)
+
+    # 将结果写入 output_dir 方便后续分析对比
+    metrics_file = os.path.join(args.output_dir, "metrics_report.txt")
+    with open(metrics_file, "w") as f:
+        f.write(f"Average PSNR:  {avg_psnr:.4f}\n")
+        f.write(f"Average SSIM:  {avg_ssim:.4f}\n")
+        f.write(f"Average LPIPS: {avg_lpips:.4f}\n")
+    print(f"Metrics saved to: {metrics_file}")
+    # --------------------------------------------------

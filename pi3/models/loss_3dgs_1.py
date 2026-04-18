@@ -437,7 +437,7 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=1, 
+            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=0.5, 
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
         train_conf=False, num_sky_anchors=8196, lpips_downsample=0.5
     ):
@@ -566,6 +566,36 @@ class Pi3LossGS(nn.Module):
             viewmats=w2c, Ks=ks, width=W, height=H, render_mode=render_mode, packed=True
         )
 
+    def _build_depth_render_gaussians(self, gaussians):
+        if "conf" not in gaussians:
+            return gaussians
+
+        conf = gaussians["conf"]
+        opacity = gaussians["opacity"]
+
+        if conf.ndim == 2:
+            conf = conf.unsqueeze(-1)
+
+        if conf.ndim != opacity.ndim or conf.shape[0] != opacity.shape[0] or conf.shape[1] != opacity.shape[1]:
+            raise RuntimeError(
+                "gaussians['conf'] must be Gaussian-aligned when rendering depth. "
+                f"Got conf shape {tuple(conf.shape)} and opacity shape {tuple(opacity.shape)}. "
+                "pred['conf'] should remain pixel-level, while pred['gaussians']['conf'] must be per-Gaussian."
+            )
+
+        conf_prob = torch.sigmoid(conf)
+        return {
+            "xyz": gaussians["xyz"],
+            "rotation": gaussians["rotation"],
+            "scale": gaussians["scale"],
+            "color": gaussians["color"],
+            "opacity": torch.where(
+                conf_prob < 0.1,
+                torch.zeros_like(opacity),
+                opacity
+            ),
+        }
+
     def forward(self, pred, gt_raw, batch_idx=0, current_epoch=None, total_epochs=None, **kwargs):
         gt = self.prepare_gt(gt_raw)
         
@@ -577,6 +607,7 @@ class Pi3LossGS(nn.Module):
         # === 修改处 1: 提前计算 pseudo_mask 代替 gt_mask ===
         # ==========================================
         with torch.no_grad():
+            # pred['conf'] is the dense per-pixel confidence map used to define pseudo depth supervision.
             conf_mask = torch.sigmoid(pred['conf'][..., 0]) > 0.1 
             non_edge_mask = ~depth_edge(pred['local_points'][..., 2], rtol=0.03) 
             pseudo_mask_2d = torch.logical_and(conf_mask, non_edge_mask) # 形状: [B, N, H, W]
@@ -645,7 +676,7 @@ class Pi3LossGS(nn.Module):
             #     loss_lpips = self.lpips_loss_fn(lp_rgb, lp_gt).mean()
             #     if self.lpips_downsample < 1.0:
             #         del lp_rgb, lp_gt
-            if cur_lambda_lpips > 0:
+            if self.lambda_lpips > 0:
                 loss_lpips = self.lpips_loss_fn(
                     rgb_full,
                     gt_imgs_reshaped,
@@ -656,23 +687,8 @@ class Pi3LossGS(nn.Module):
 
         need_depth_loss = (self.train_stage in [1, 2, 3]) and (self.lambda_depth > 0) and bool(pseudo_mask_2d.any().item())
         if need_depth_loss:
-            # 2. 构造专用于渲染 Depth 的高斯字典
-            if "conf" in gauss_raw:
-                conf_prob = torch.sigmoid(gauss_raw["conf"])
-                gauss_render_depth = {
-                    "xyz": gauss_raw["xyz"],
-                    "rotation": gauss_raw["rotation"],
-                    "scale": gauss_raw["scale"],
-                    "color": gauss_raw["color"],
-                    "opacity": torch.where(
-                        conf_prob < 0.1,
-                        torch.zeros_like(gauss_raw["opacity"]),
-                        gauss_raw["opacity"]
-                    ),
-                }
-                del conf_prob
-            else:
-                gauss_render_depth = gauss_raw
+            # gauss_raw['conf'] is Gaussian-level confidence and is used exactly like depth rendering in inference.
+            gauss_render_depth = self._build_depth_render_gaussians(gauss_raw)
 
             render_out_depth, _, _ = self._render_gs(gauss_render_depth, render_w2c, intrinsics_pred, H, W, render_mode='ED')
             depth_map = render_out_depth[..., 0:1].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
@@ -685,33 +701,33 @@ class Pi3LossGS(nn.Module):
             del depth_map, pseudo_mask, pseudo_gt_depth
         # ==========================================
         # 【新增：渲染层面的稀疏惩罚与体积克制】
-        loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
-        loss_volume = torch.tensor(0.0, device=pred_c2w.device)
+        # loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
+        # loss_volume = torch.tensor(0.0, device=pred_c2w.device)
         
-        valid_render_mask = gauss_raw['opacity'].squeeze(-1) > 0.05
-        if valid_render_mask.sum() > 0:
-            active_opacities = gauss_raw['opacity'][valid_render_mask]
-            # active_scales = gauss_raw['scale'][valid_render_mask]
+        # valid_render_mask = gauss_raw['opacity'].squeeze(-1) > 0.05
+        # if valid_render_mask.sum() > 0:
+        #     active_opacities = gauss_raw['opacity'][valid_render_mask]
+        #     # active_scales = gauss_raw['scale'][valid_render_mask]
             
-            # 【修复 3】：将 opacity 截断，防止极小的负浮点数导致 log 出现 nan
-            eps = 1e-6
-            active_opacities_safe = active_opacities.clamp(eps, 1.0 - eps)
-            loss_sparsity = -(
-                active_opacities_safe * torch.log(active_opacities_safe) + 
-                (1.0 - active_opacities_safe) * torch.log(1.0 - active_opacities_safe)
-            ).mean()
+        #     # 【修复 3】：将 opacity 截断，防止极小的负浮点数导致 log 出现 nan
+        #     eps = 1e-6
+        #     active_opacities_safe = active_opacities.clamp(eps, 1.0 - eps)
+        #     loss_sparsity = -(
+        #         active_opacities_safe * torch.log(active_opacities_safe) + 
+        #         (1.0 - active_opacities_safe) * torch.log(1.0 - active_opacities_safe)
+        #     ).mean()
             
             # 【修复 1】：将 scale 强转为 fp32 计算体积，防止 fp16 溢出 (65504 上限)
             # active_scales_fp32 = active_scales.float()
             # vol = active_scales_fp32[..., 0] * active_scales_fp32[..., 1] * active_scales_fp32[..., 2]
             # loss_volume = (vol * active_opacities.squeeze(-1).float()).mean()
         final_loss = (
-            cur_lambda_rgb * loss_rgb + 
-            cur_lambda_ssim * loss_ssim +
-            cur_lambda_depth * loss_depth +
-            cur_lambda_lpips * loss_lpips +
+            self.lambda_rgb * loss_rgb + 
+            self.lambda_ssim * loss_ssim +
+            # self.lambda_depth * loss_depth +
+            self.lambda_lpips * loss_lpips
             # 0.05 * loss_sobel +
-            0.03 * loss_sparsity 
+            # 0.02 * loss_sparsity 
             # 0.0001 * loss_volume
         )
 
@@ -721,22 +737,22 @@ class Pi3LossGS(nn.Module):
         details.update({
             "loss_rgb": loss_rgb,
             "loss_ssim": loss_ssim,
-            "loss_depth": loss_depth,
+            # "loss_depth": loss_depth,
             # "loss_sobel": loss_sobel,
             "loss_lpips": loss_lpips,
-            "loss_sparsity": loss_sparsity,
+            # "loss_sparsity": loss_sparsity,
             # "loss_volume": loss_volume,
-            "cur_weight_rgb": torch.tensor(cur_lambda_rgb, device=pred_c2w.device),   
-            "cur_weight_depth": torch.tensor(cur_lambda_depth, device=pred_c2w.device), 
+            # "cur_weight_rgb": torch.tensor(cur_lambda_rgb, device=pred_c2w.device),   
+            # "cur_weight_depth": torch.tensor(cur_lambda_depth, device=pred_c2w.device), 
             "total_loss": final_loss
         })
 
-        if "selected_gaussians" in pred:
-            details["selected_gaussians"] = pred["selected_gaussians"].detach().float()
+        # if "selected_gaussians" in pred:
+        #     details["selected_gaussians"] = pred["selected_gaussians"].detach().float()
         
         del render_c2w, render_w2c
         if need_depth_loss:
             del gauss_render_depth
-        # torch.cuda.empty_cache() # 让 Pytorch 回收碎片显存留给 backward 用
+        torch.cuda.empty_cache() # 让 Pytorch 回收碎片显存留给 backward 用
 
         return final_loss, details
