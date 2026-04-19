@@ -13,7 +13,7 @@ class Pi3Trainer(BaseTrainer):
         super().__init__(cfg)
 
         self.train_loss = hydra.utils.instantiate(cfg.loss.train_loss)
-        self.test_loss = hydra.utils.instantiate(cfg.loss.train_loss)
+        self.test_loss = hydra.utils.instantiate(cfg.loss.get("test_loss", cfg.loss.train_loss))
 
     # def build_optimizer(self, cfg_optimizer, model):
     #     def param_group_fn(model_):
@@ -55,8 +55,11 @@ class Pi3Trainer(BaseTrainer):
             # 1. 精细化参数分组容器
             encoder_params = []
             point_decoder_params = []
+            point_head_params = []
             gs_decoder_params = []
+            gs_head_params = []
             camera_decoder_params = []
+            appearance_params = []
             other_params = []
 
             # 2. 遍历并分类参数
@@ -68,18 +71,27 @@ class Pi3Trainer(BaseTrainer):
                     encoder_params.append((name, param))
                 elif 'point_decoder' in name:
                     point_decoder_params.append((name, param))
+                elif 'point_head' in name:
+                    point_head_params.append((name, param))
                 elif 'gs_decoder' in name:
                     gs_decoder_params.append((name, param))
+                elif 'gs_head' in name:
+                    gs_head_params.append((name, param))
                 elif 'camera_decoder' in name:
                     camera_decoder_params.append((name, param))
+                elif 'appearance_' in name or 'environment_' in name:
+                    appearance_params.append((name, param))
                 else:
                     other_params.append((name, param))
 
             # 打印各组可训练参数的数量，方便你 debug 检查
             print(f'Trainable encoder params:', sum(p.numel() for _, p in encoder_params))
             print(f'Trainable point_decoder params:', sum(p.numel() for _, p in point_decoder_params))
+            print(f'Trainable point_head params:', sum(p.numel() for _, p in point_head_params))
             print(f'Trainable gs_decoder params:', sum(p.numel() for _, p in gs_decoder_params))
+            print(f'Trainable gs_head params:', sum(p.numel() for _, p in gs_head_params))
             print(f'Trainable camera_decoder params:', sum(p.numel() for _, p in camera_decoder_params))
+            print(f'Trainable appearance params:', sum(p.numel() for _, p in appearance_params))
             print(f'Trainable other params:', sum(p.numel() for _, p in other_params))
 
             def handle_weight_decay(params, weight_decay, lr):
@@ -111,6 +123,10 @@ class Pi3Trainer(BaseTrainer):
             # Point Decoder (几何): 极低学习率 (5%)，实现“软冻结”，只允许微小形变
             if point_decoder_params:
                 res.extend(handle_weight_decay(point_decoder_params, cfg_optimizer.weight_decay, base_lr * 0.07))
+
+            # Point Head: 外观迁移时允许几何头轻微自适应，但仍低于主外观分支
+            if point_head_params:
+                res.extend(handle_weight_decay(point_head_params, cfg_optimizer.weight_decay, base_lr * 0.15))
             
             # # Camera Decoder (相机姿态): 收敛后期通常不需要大动 (1%)
             # if camera_decoder_params:
@@ -119,6 +135,14 @@ class Pi3Trainer(BaseTrainer):
             # GS Decoder (颜色/透明度等): 现阶段的优化主力，保持 100% 基础学习率
             if gs_decoder_params:
                 res.extend(handle_weight_decay(gs_decoder_params, cfg_optimizer.weight_decay, base_lr * 1.0))
+
+            # GS Head: 与外观调制一起作为主优化对象
+            if gs_head_params:
+                res.extend(handle_weight_decay(gs_head_params, cfg_optimizer.weight_decay, base_lr * 1.0))
+
+            # Appearance / Environment Head: 新外观调制头同样用基础学习率，避免学不动
+            if appearance_params:
+                res.extend(handle_weight_decay(appearance_params, cfg_optimizer.weight_decay, base_lr * 1.0))
             
             # 其他主干网络 (如 Transformer 主体): 压低学习率 (10%)，稳定已有的特征空间
             if other_params:
@@ -160,6 +184,7 @@ class Pi3Trainer(BaseTrainer):
         imgs = torch.stack([view['img'] for view in batch], dim=1)
         # imgs_paired = torch.stack([view['img_paired'] for view in batch], dim=1) if 'img_paired' in batch[0] else None
         imgs_paired = torch.stack([view['img_paired'] for view in batch], dim=1) if ('img_paired' in batch[0] and isinstance(batch[0]['img_paired'], torch.Tensor)) else None
+        style_imgs = torch.stack([view['img_style'] for view in batch], dim=1) if ('img_style' in batch[0] and isinstance(batch[0]['img_style'], torch.Tensor)) else None
         intrinsics = torch.stack([view['camera_intrinsics'] for view in batch], dim=1)
         current_step = global_step if global_step is not None else 0
 
@@ -167,6 +192,8 @@ class Pi3Trainer(BaseTrainer):
         model_kwargs = {}
         if 'imgs_paired' in forward_params:
             model_kwargs['imgs_paired'] = imgs_paired
+        if 'style_imgs' in forward_params:
+            model_kwargs['style_imgs'] = style_imgs
         if 'intrinsics' in forward_params:
             model_kwargs['intrinsics'] = intrinsics
         if 'global_step' in forward_params:

@@ -13,6 +13,17 @@ __INDOOR_DATASETS__ = ['Hypersim', 'ScanNet', 'Scannetpp', 'Taskonomy', 'ARKitSc
 def create_dataloader(cfg, mode):
     data_loader = DataLoader
 
+    def maybe_add_dataset(dataset_name, dataset_i, weight, datasets_all):
+        dataset_len = len(dataset_i)
+        if dataset_len <= 0:
+            print(
+                f"[create_dataloader] Skip empty dataset '{dataset_name}' in {mode} mode.",
+                flush=True,
+            )
+            return
+        dataset_i.convert_attributes()
+        datasets_all.append(weight @ dataset_i)
+
     # pytorch dataset
     if mode == 'train':
         cfg_dataset = cfg.train_dataset
@@ -53,8 +64,7 @@ def create_dataloader(cfg, mode):
                         continue
                 # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name], resolution=resolutions)
-                dataset_i.convert_attributes()
-                datasets_all.append(weight @ dataset_i)
+                maybe_add_dataset(dataset_name, dataset_i, weight, datasets_all)
         elif 'resolution' in cfg.train:
             resolutions = cfg.train.resolution
             print('Setting dataset resolution', resolutions)
@@ -65,8 +75,7 @@ def create_dataloader(cfg, mode):
                         continue
                 # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name], resolution=resolutions)
-                dataset_i.convert_attributes()
-                datasets_all.append(weight @ dataset_i)
+                maybe_add_dataset(dataset_name, dataset_i, weight, datasets_all)
         else:
             for dataset_name, weight in weights.items():
                 # 👇 [新增这一段] 根据全局开关拦截：如果开关设为 false，直接跳过不实例化
@@ -75,8 +84,9 @@ def create_dataloader(cfg, mode):
                         continue
                 # 👆 [新增结束]
                 dataset_i = hydra.utils.instantiate(cfg_dataset[dataset_name])
-                dataset_i.convert_attributes()
-                datasets_all.append(weight @ dataset_i)
+                maybe_add_dataset(dataset_name, dataset_i, weight, datasets_all)
+        if len(datasets_all) == 0:
+            raise RuntimeError(f'No non-empty datasets available for mode={mode}.')
         dataset = datasets_all[0]
         for dataset_ in datasets_all[1:]:
             dataset += dataset_

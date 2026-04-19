@@ -212,7 +212,7 @@ if __name__ == '__main__':
 
     print(f"Loading data from {args.data_path}...")
     imgs_cpu = load_images_as_tensor(args.data_path, interval=args.interval)
-    imgs_cpu = imgs_cpu[996:1496:10, ...]
+    imgs_cpu = imgs_cpu[0:150:3, ...]
     total_frames = imgs_cpu.shape[0]
     H, W = imgs_cpu.shape[2], imgs_cpu.shape[3]
 

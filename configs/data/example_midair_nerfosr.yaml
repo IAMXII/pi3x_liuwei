@@ -1,0 +1,70 @@
+# @package _global_
+
+train_dataset:
+    length: 4000000
+
+    weights:
+        midair: 7000
+        nerfosr: 3000
+
+    midair:
+        _target_: datasets.midair_ill_dataset.MidAirDataset
+        root_dir: /home/liuwei/mnt/MidAir
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: train
+
+    nerfosr:
+        _target_: datasets.nerfosr_ill_dataset.NeRFOSRDataset
+        root_dir: /home/liuwei/mnt/NeRF-OSR/Data
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.JitterJpegLossBlurring
+        aug_focal: 0.9
+        mode: train
+
+train_dataloader:
+    drop_last: True
+    shuffle: True
+
+test_dataset:
+    weights:
+        midair: 1000
+        nerfosr: 1000
+
+    midair:
+        _target_: datasets.midair_ill_dataset.MidAirDataset
+        root_dir: /home/liuwei/mnt/MidAir
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: test
+
+    nerfosr:
+        _target_: datasets.nerfosr_ill_dataset.NeRFOSRDataset
+        root_dir: /home/liuwei/mnt/NeRF-OSR/Data
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: test
+        eval_split: test
+
+test_dataloader:
+    drop_last: False
+    shuffle: False

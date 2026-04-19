@@ -1,9 +1,9 @@
 # @package _global_
 
 defaults:
-  - model: pi3_3dgs.yaml
+  - model: pi3_3dgs_appearance.yaml
   - train: train_pi3_highres
-  - data: example.yaml
+  - data: example_midair_nerfosr.yaml
   - general: default.yaml
   - extras: default.yaml
   - override hydra/job_logging: custom

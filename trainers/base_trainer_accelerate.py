@@ -378,6 +378,9 @@ class BaseTrainer:
             for it, batch in enumerate(metric_logger.log_every(
                 self.test_loader, self.cfg.train.print_freq, header
             )):
+                if it >= self.iters_per_test:
+                    break
+
                 batch = move_to_device(batch, self.accelerator.device)
 
                 # Forward pass
@@ -472,11 +475,27 @@ class BaseTrainer:
                 loss_value = loss.item()
                 if not math.isfinite(loss_value):
                     rank = get_rank()
+                    debug_scalars = {}
+                    for item in batch_output:
+                        val = batch_output[item]
+                        if isinstance(val, torch.Tensor) and val.numel() == 1:
+                            debug_scalars[item] = float(val.detach().float().cpu().item())
+                        elif isinstance(val, (int, float)):
+                            debug_scalars[item] = float(val)
+                    batch_meta = {
+                        "datasets": [str(view.get("dataset", "unknown")) for view in batch[: min(len(batch), 4)]],
+                        "labels": [str(view.get("label", "unknown")) for view in batch[: min(len(batch), 4)]],
+                        "instances": [str(view.get("instance", "unknown")) for view in batch[: min(len(batch), 4)]],
+                    }
                     print(
-                        f"Rank {rank}: Loss is {loss_value}, stopping training at iter {it} (epoch {epoch}, global step {self.global_step}).",
+                        f"Rank {rank}: Loss is {loss_value}, skipping batch at iter {it} (epoch {epoch}, global step {self.global_step}).",
                         force=True,
                     )
-                    sys.exit(1)
+                    print(f"Rank {rank}: Batch meta: {json.dumps(batch_meta, ensure_ascii=False)}", flush=True)
+                    print(f"Rank {rank}: Scalar debug: {json.dumps(debug_scalars, ensure_ascii=False, sort_keys=True)}", flush=True)
+                    if self.accelerator.state.deepspeed_plugin is None:
+                        self.optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 self.accelerator.backward(loss)
 
@@ -521,6 +540,29 @@ class BaseTrainer:
                         return norm
 
                     grad_norm = get_gradient_norm(self.model.parameters())
+                    if not math.isfinite(grad_norm):
+                        rank = get_rank()
+                        debug_scalars = {}
+                        for item in batch_output:
+                            val = batch_output[item]
+                            if isinstance(val, torch.Tensor) and val.numel() == 1:
+                                debug_scalars[item] = float(val.detach().float().cpu().item())
+                            elif isinstance(val, (int, float)):
+                                debug_scalars[item] = float(val)
+                        batch_meta = {
+                            "datasets": [str(view.get("dataset", "unknown")) for view in batch[: min(len(batch), 4)]],
+                            "labels": [str(view.get("label", "unknown")) for view in batch[: min(len(batch), 4)]],
+                            "instances": [str(view.get("instance", "unknown")) for view in batch[: min(len(batch), 4)]],
+                        }
+                        print(
+                            f"Rank {rank}: Gradient norm is {grad_norm}, skipping optimizer step at iter {it} (epoch {epoch}, global step {self.global_step}).",
+                            force=True,
+                        )
+                        print(f"Rank {rank}: Batch meta: {json.dumps(batch_meta, ensure_ascii=False)}", flush=True)
+                        print(f"Rank {rank}: Scalar debug: {json.dumps(debug_scalars, ensure_ascii=False, sort_keys=True)}", flush=True)
+                        if self.accelerator.state.deepspeed_plugin is None:
+                            self.optimizer.zero_grad(set_to_none=True)
+                        continue
 
                 if self.accelerator.state.deepspeed_plugin is None:
                     self.optimizer.step()
@@ -633,7 +675,7 @@ class BaseTrainer:
         elif self.cfg.log.use_tensorboard:
             log_with = 'tensorboard'
         else:
-            log_with = 'all'
+            log_with = None
 
         mixed_precision = 'no' if self.cfg.train.model_dtype not in ['fp8', 'fp16', 'bf16'] else self.cfg.train.model_dtype
 
@@ -718,7 +760,7 @@ class BaseTrainer:
         self.log_info(accelerator.state)
         # self.logger.rank_zero_only = True
         # ------------------- [修改开始] -------------------
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and (self.cfg.log.use_wandb or self.cfg.log.use_tensorboard):
             # 准备 WandB 的初始化参数
             init_kwargs = {}
             if self.cfg.log.use_wandb:

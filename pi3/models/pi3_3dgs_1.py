@@ -1014,6 +1014,7 @@ class Pi3_3DGS(nn.Module):
                     "color": torch.zeros((1, 3), device=imgs.device),
                     "conf": torch.full((1, 1), -20.0, device=imgs.device)
                 })
+
         # 对齐 Batch 内高斯数量
         max_k = max(g["xyz"].size(0) for g in fused_gaussians)
         d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out, d_conf_out = [], [], [], [], [], []

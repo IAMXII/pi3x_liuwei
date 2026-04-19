@@ -639,6 +639,8 @@ class BaseDataset(EasyDataset):
                     view['img'] = self.transform(view['img'])
                     if 'img_paired' in view:
                         view['img_paired'] = self.transform(view['img_paired'])
+                    if 'img_style' in view:
+                        view['img_style'] = self.transform(view['img_style'])
 
                 # # last thing done!
                 # for view in views:
@@ -703,4 +705,3 @@ class BaseDataset(EasyDataset):
         np.save(save_path, save_dict)
 
         print(f'Saved cache to {save_path}.', flush=True)
-

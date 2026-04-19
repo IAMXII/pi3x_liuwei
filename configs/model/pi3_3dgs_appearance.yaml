@@ -1,0 +1,110 @@
+# @package _global_
+
+model:
+    _target_: pi3.models.pi3_3dgs_appearance.Pi3_3DGS
+    pos_type: rope100
+    decoder_size: large
+    load_vggt: false
+    freeze_encoder: true
+    num_dec_blk_not_to_checkpoint: 999
+    ckpt: "ckpts/model.safetensors"
+    max_dense_gaussians: 1000000
+
+    # Appearance transfer specific
+    freeze_base_model: true
+    style_ref_mode: random_one
+    detach_base_gaussians_for_style: true
+    unfreeze_point_head: true
+    unfreeze_gs_head: true
+    unfreeze_point_decoder: false
+    unfreeze_gs_decoder: false
+    style_code_dim: 256
+    style_hidden_dim: 512
+    appearance_hidden_dim: 128
+    max_color_delta: 0.45
+    max_opacity_delta: 0.20
+
+loss:
+    train_loss:
+        _target_: pi3.models.loss_3dgs_appearance.Pi3LossGS
+        lambda_rgb: 0.6
+        lambda_ssim: 0.15
+        lambda_depth: 0.25
+        lambda_lpips: 0.05
+        lambda_paired_rgb: 0.75
+        lambda_paired_ssim: 0.15
+        lambda_paired_lpips: 0.05
+        lambda_style_consistency: 0.02
+        lambda_style_reg: 0.01
+        lambda_style_moment: 0.20
+        render_view_chunk_size: 1
+
+    test_loss:
+        _target_: pi3.models.loss_3dgs_appearance.Pi3LossGS
+        lambda_rgb: 0.6
+        lambda_ssim: 0.15
+        lambda_depth: 0.25
+        lambda_lpips: 0.05
+        lambda_paired_rgb: 0.75
+        lambda_paired_ssim: 0.15
+        lambda_paired_lpips: 0.05
+        lambda_style_consistency: 0.02
+        lambda_style_reg: 0.01
+        lambda_style_moment: 0.20
+        render_view_chunk_size: 1
+
+train:
+    num_workers: 16
+    batch_size: 1
+    num_epoch: 16
+    iters_per_epoch: 5000
+
+    print_freq: 40
+    base_seed: 666
+
+    model_dtype: fp32
+    dynamo_backend: NO
+    dynamic_compile: false
+
+    gradient_accumulation_steps: 16
+    clip_grad: 1.0
+    clip_loss: 100
+
+    seed: 42
+    resume: null
+    auto_resume: true
+    start_epoch: 0
+    global_step: 0
+    world_size: 1
+    rank: -1
+    gpu: -1
+    dist_on_itp: false
+    find_unused_parameters: false
+
+    distributed: false
+    dist_url: env://
+    dist_backend: "nccl"
+
+    optimizer:
+        type: AdamW
+        lr: 5e-5
+        weight_decay: 5e-2
+        betas: [0.9, 0.95]
+        verbose: true
+        filter_bias_and_bn: true
+        encoder_lr: 5e-6
+
+    lr_scheduler:
+        type: OneCycleLR
+        max_lr: ${train.optimizer.lr}
+        pct_start: 0.0
+        anneal_strategy: cos
+        div_factor: 1000.0
+        final_div_factor: 100.0
+        total_steps: -1
+
+test:
+    num_workers: 16
+    batch_size: 1
+    print_freq: 10
+    iters_per_test: 1000

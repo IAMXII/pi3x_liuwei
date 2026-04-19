@@ -3,12 +3,12 @@
 trainer: trainers.pi3_trainer.Pi3Trainer
 
 train:
-  image_num_range: [2, 24]     # hres
-  max_img_per_gpu: 24             # hres
+  image_num_range: [2, 8]     # hres
+  max_img_per_gpu: 8             # hres
 
   # low resolution
   resolution: 
     - [224, 224]
 
 model:
-  ckpt: "ckpts/pi3/model_pi3x.safetensors" # <path-to-your-pretrain-checkpoint>
+  ckpt: "ckpts/model.safetensors" # <path-to-your-pretrain-checkpoint>

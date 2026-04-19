@@ -65,6 +65,7 @@ class MidAirDataset(BaseDataset):
             # 使用字典按轨迹的后三位 ID 进行聚合
             # 结构: { "000": {"sunny": "trajectory_0000", "cloudy": "trajectory_1000", ...}, ... }
             traj_map = {}
+            traj_frames_map = {}
 
             for cond in conditions:
                 cond_dir = osp.join(subset_dir, cond)
@@ -92,20 +93,29 @@ class MidAirDataset(BaseDataset):
 
                     if traj_id not in traj_map:
                         traj_map[traj_id] = {}
+                        traj_frames_map[traj_id] = {}
                     
                     # 记录该天气下，真实的文件夹名称
                     traj_map[traj_id][cond] = traj
+                    frame_set = {
+                        f for f in os.listdir(traj_rgb_dir)
+                        if f.endswith('.JPEG')
+                        and osp.exists(osp.join(traj_depth_dir, f"{osp.splitext(f)[0]}.PNG"))
+                        and osp.exists(osp.join(traj_meta_dir, f"{osp.splitext(f)[0]}.npz"))
+                    }
+                    traj_frames_map[traj_id][cond] = frame_set
 
             # 过滤出至少具备两种有效天气的轨迹，并构建 valid_scans
             for traj_id, valid_cond_dict in traj_map.items():
                 if len(valid_cond_dict) >= 2:
-                    # 随便取一个有效的天气来读取帧列表（因为同一物理轨迹的帧名和数量是严格对齐的）
-                    base_cond = list(valid_cond_dict.keys())[0]
-                    base_traj_folder = valid_cond_dict[base_cond]
-                    base_rgb_dir = osp.join(subset_dir, base_cond, 'color_left', base_traj_folder)
-                    
-                    all_frames = sorted([f for f in os.listdir(base_rgb_dir) if f.endswith('.JPEG')])
-                    
+                    per_cond_frames = [
+                        traj_frames_map[traj_id][cond]
+                        for cond in valid_cond_dict.keys()
+                        if cond in traj_frames_map[traj_id]
+                    ]
+                    if len(per_cond_frames) < 2:
+                        continue
+                    all_frames = sorted(set.intersection(*per_cond_frames))
                     if len(all_frames) >= getattr(self, 'frame_num', 1):
                         valid_scans.append({
                             'subset': subset,
@@ -194,10 +204,14 @@ class MidAirDataset(BaseDataset):
 
                 views.append(dict(
                     img=rgb_image_A,
-                    img_paired=rgb_image_B, 
+                    img_paired=rgb_image_B,
+                    img_style=rgb_image_B,
                     depthmap=depthmap_A,
                     camera_pose=camera_pose.astype(np.float32),
                     camera_intrinsics=intrinsics,
+                    camera_pose_paired=camera_pose.astype(np.float32),
+                    camera_intrinsics_paired=intrinsics,
+                    has_depth=np.bool_(True),
                     dataset='MidAir',
                     label=f"{scan['scan_id']}_{cond_A}_vs_{cond_B}",
                     instance=frame_file,
