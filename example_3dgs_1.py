@@ -444,6 +444,54 @@ def gather_valid_pairs(pred_depths, gt_depths, min_eval_depth=1e-5, max_eval_dep
     return torch.cat(pred_flat_list), torch.cat(gt_flat_list), valid_per_frame
 
 
+def flatten_pairs_from_masks(pred_depths, gt_depths, masks):
+    pred_flat_list = []
+    gt_flat_list = []
+    for pred_depth, gt_depth, mask in zip(pred_depths, gt_depths, masks):
+        if mask.any():
+            pred_flat_list.append(pred_depth[mask].double())
+            gt_flat_list.append(gt_depth[mask].double())
+
+    if not pred_flat_list:
+        return None, None
+
+    return torch.cat(pred_flat_list), torch.cat(gt_flat_list)
+
+
+def resolve_near_depth_limit(gt_values, near_depth_fraction):
+    if near_depth_fraction is None:
+        return None
+    if near_depth_fraction <= 0.0 or near_depth_fraction > 1.0:
+        raise ValueError("--near_depth_fraction must be in (0, 1].")
+    if near_depth_fraction >= 1.0:
+        return None
+    if gt_values is None or gt_values.numel() == 0:
+        return None
+
+    return float(torch.quantile(gt_values.float(), near_depth_fraction).item())
+
+
+def apply_near_depth_limit(valid_masks, gt_depths, near_depth_limit):
+    if near_depth_limit is None:
+        return valid_masks
+    return [
+        valid_mask & (gt_depth <= near_depth_limit)
+        for valid_mask, gt_depth in zip(valid_masks, gt_depths)
+    ]
+
+
+def build_depth_eval_mask(aligned_depth, gt_depth, min_eval_depth=1e-5, max_eval_depth=None,
+                          near_depth_limit=None):
+    mask = torch.isfinite(aligned_depth) & torch.isfinite(gt_depth)
+    mask &= aligned_depth > min_eval_depth
+    mask &= gt_depth > min_eval_depth
+    if max_eval_depth is not None:
+        mask &= gt_depth <= max_eval_depth
+    if near_depth_limit is not None:
+        mask &= gt_depth <= near_depth_limit
+    return mask
+
+
 def subsample_pairs(src, tgt, max_points=200000, seed=0):
     if src.numel() <= max_points:
         return src, tgt
@@ -633,7 +681,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pi3_3DGS inference with RGB/depth evaluation")
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--depth_path", type=str, default=None, help="Directory or stack file of depth maps.")
-    parser.add_argument("--output_dir", type=str, default="output_render_hku")
+    parser.add_argument("--output_dir", type=str, default="output_render_cp_0425")
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--interval", type=int, default=-1)
     parser.add_argument("--device", type=str, default="cuda")
@@ -657,6 +705,9 @@ def main():
     parser.add_argument("--alignment_seed", type=int, default=0)
     parser.add_argument("--min_eval_depth", type=float, default=1e-5)
     parser.add_argument("--max_eval_depth", type=float, default=None)
+    parser.add_argument("--near_depth_fraction", type=float, default=1.0,
+                        help="Use the nearest fraction of valid GT depth points for alignment/eval. "
+                             "Example: 0.5 keeps the closest 50%% after min/max depth filters.")
     parser.add_argument("--min_valid_pixels", type=int, default=64)
     parser.add_argument("--save_aligned_depth", action="store_true")
     args = parser.parse_args()
@@ -832,13 +883,28 @@ def main():
         gc.collect()
         start_idx = end_idx
 
-    full_src, full_tgt, valid_masks = gather_valid_pairs(
+    full_src_all, full_tgt_all, valid_masks = gather_valid_pairs(
         pred_depths_cpu, gt_depths_cpu,
         min_eval_depth=args.min_eval_depth,
         max_eval_depth=args.max_eval_depth,
     )
-    if full_src is None or full_src.numel() == 0:
+    if full_src_all is None or full_src_all.numel() == 0:
         raise RuntimeError("No overlapping valid pixels between predicted depth and provided depth maps.")
+
+    total_valid_pairs_before_filter = full_src_all.numel()
+    near_depth_limit = resolve_near_depth_limit(full_tgt_all, args.near_depth_fraction)
+    if near_depth_limit is not None:
+        valid_masks = apply_near_depth_limit(valid_masks, gt_depths_cpu, near_depth_limit)
+        full_src, full_tgt = flatten_pairs_from_masks(pred_depths_cpu, gt_depths_cpu, valid_masks)
+        if full_src is None or full_src.numel() == 0:
+            raise RuntimeError("No valid pixels left after applying --near_depth_fraction.")
+        print(f"\nTotal valid depth pairs before near-depth filtering: {total_valid_pairs_before_filter}")
+        print(
+            f"Near-depth filtering: keeping closest {args.near_depth_fraction * 100:.2f}% "
+            f"of GT depth points (gt_depth <= {near_depth_limit:.6f})."
+        )
+    else:
+        full_src, full_tgt = full_src_all, full_tgt_all
 
     print(f"\nTotal valid depth pairs for alignment/eval: {full_src.numel()}")
     if args.alignment_scope == "global":
@@ -878,11 +944,12 @@ def main():
             continue
 
         aligned_depth = pred_depth * best_alignment["scale"] + best_alignment["shift"]
-        eval_mask = torch.isfinite(aligned_depth) & torch.isfinite(gt_depth)
-        eval_mask &= aligned_depth > args.min_eval_depth
-        eval_mask &= gt_depth > args.min_eval_depth
-        if args.max_eval_depth is not None:
-            eval_mask &= gt_depth <= args.max_eval_depth
+        eval_mask = build_depth_eval_mask(
+            aligned_depth, gt_depth,
+            min_eval_depth=args.min_eval_depth,
+            max_eval_depth=args.max_eval_depth,
+            near_depth_limit=near_depth_limit,
+        )
 
         metrics = compute_depth_metrics(aligned_depth, gt_depth, eval_mask)
         valid_pixels = 0 if metrics is None else metrics["valid_pixels"]
@@ -949,6 +1016,12 @@ def main():
         f.write(f"alignment_mode: {args.alignment_mode}\n")
         f.write(f"allow_affine_in_auto: {args.allow_affine}\n")
         f.write(f"alignment_select_metric: {args.alignment_select_metric}\n")
+        f.write(f"min_eval_depth: {args.min_eval_depth}\n")
+        f.write(f"max_eval_depth: {args.max_eval_depth}\n")
+        f.write(f"near_depth_fraction: {args.near_depth_fraction}\n")
+        f.write(f"near_depth_limit: {near_depth_limit}\n")
+        f.write(f"valid_depth_pairs_before_near_filter: {total_valid_pairs_before_filter}\n")
+        f.write(f"valid_depth_pairs_for_alignment_eval: {full_src.numel()}\n")
         if global_alignment is not None:
             f.write(f"selected_alignment: {global_alignment['mode']}\n")
             f.write(f"selected_scale: {global_alignment['scale']:.8f}\n")

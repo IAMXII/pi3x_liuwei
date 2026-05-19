@@ -1,0 +1,14 @@
+# @package _global_
+
+fsdp_plugin:
+  _target_: accelerate.FullyShardedDataParallelPlugin
+  fsdp_version: 1
+  auto_wrap_policy: no_wrap
+  reshard_after_forward: FULL_SHARD
+  state_dict_type: FULL_STATE_DICT
+  use_orig_params: true
+  sync_module_states: true
+  limit_all_gathers: true
+  cpu_offload: false
+  cpu_ram_efficient_loading: false
+  activation_checkpointing: false

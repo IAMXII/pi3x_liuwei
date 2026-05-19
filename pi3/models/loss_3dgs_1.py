@@ -386,6 +386,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import torchvision
 from gsplat import rasterization
 from torchmetrics.functional import structural_similarity_index_measure as ssim
@@ -437,9 +438,13 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=0.5, 
+            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=0.5, lambda_lpips=0.1,
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
-        train_conf=False, num_sky_anchors=8196, lpips_downsample=0.5
+        train_conf=False, num_sky_anchors=8196, lpips_downsample=1,
+        render_view_chunk_size=8, render_checkpoint=True,
+        render_max_gaussians=0, render_min_gaussians=8192, render_opacity_threshold=0.0,
+        enable_sparsity_loss=True, lambda_sparsity=0.02, sparsity_min_opacity=0.05,
+        enable_alpha_regularization=True, lambda_alpha_regul=0.001
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -447,15 +452,25 @@ class Pi3LossGS(nn.Module):
         self.lambda_depth = lambda_depth
         self.lambda_pose = lambda_pose
         self.lambda_scale = lambda_scale
-        self.lambda_lpips = 0.1
+        self.lambda_lpips = float(lambda_lpips)
         self.lambda_edge = 0.15 
+        self.enable_sparsity_loss = bool(enable_sparsity_loss)
+        self.lambda_sparsity = float(lambda_sparsity)
+        self.sparsity_min_opacity = float(sparsity_min_opacity)
+        self.enable_alpha_regularization = bool(enable_alpha_regularization)
+        self.lambda_alpha_regul = float(lambda_alpha_regul)
         
         self.train_stage = int(train_stage) 
         self.local_align_res = local_align_res
         
         self.train_conf = train_conf 
         self.num_sky_anchors = num_sky_anchors
-        # self.lpips_downsample = min(max(float(lpips_downsample), 0.1), 1.0)
+        self.lpips_downsample = min(max(float(lpips_downsample), 0.1), 1.0)
+        self.render_view_chunk_size = max(1, int(render_view_chunk_size))
+        self.render_checkpoint = bool(render_checkpoint)
+        self.render_max_gaussians = max(0, int(render_max_gaussians))
+        self.render_min_gaussians = max(1, int(render_min_gaussians))
+        self.render_opacity_threshold = max(0.0, float(render_opacity_threshold))
         self.lpips_loss_fn = lpips.LPIPS(net='alex').eval()
         for param in self.lpips_loss_fn.parameters():
             param.requires_grad = False
@@ -566,6 +581,41 @@ class Pi3LossGS(nn.Module):
             viewmats=w2c, Ks=ks, width=W, height=H, render_mode=render_mode, packed=True
         )
 
+    def _render_gs_for_loss(self, gaussians, w2c, ks, H, W, render_mode='RGB'):
+        if self.render_checkpoint and torch.is_grad_enabled():
+            def render_fn(xyz, rotation, scale, opacity, color, viewmats, intrinsics):
+                render_gaussians = {
+                    "xyz": xyz,
+                    "rotation": rotation,
+                    "scale": scale,
+                    "opacity": opacity,
+                    "color": color,
+                }
+                render_out, _, _ = self._render_gs(
+                    render_gaussians,
+                    viewmats,
+                    intrinsics,
+                    H,
+                    W,
+                    render_mode=render_mode,
+                )
+                return render_out
+
+            return checkpoint(
+                render_fn,
+                gaussians["xyz"],
+                gaussians["rotation"],
+                gaussians["scale"],
+                gaussians["opacity"],
+                gaussians["color"],
+                w2c,
+                ks,
+                use_reentrant=False,
+            )
+
+        render_out, _, _ = self._render_gs(gaussians, w2c, ks, H, W, render_mode=render_mode)
+        return render_out
+
     def _build_depth_render_gaussians(self, gaussians):
         if "conf" not in gaussians:
             return gaussians
@@ -596,6 +646,57 @@ class Pi3LossGS(nn.Module):
             ),
         }
 
+    def _gather_loss_render_gaussians(self, gaussians, gather_idx):
+        B, K_keep = gather_idx.shape
+        gathered = {}
+        for key, value in gaussians.items():
+            if torch.is_tensor(value) and value.ndim >= 2 and value.shape[0] == B:
+                if value.shape[1] == gather_idx.shape[1]:
+                    gathered[key] = value
+                elif value.shape[1] >= int(gather_idx.max().item()) + 1:
+                    expand_shape = (B, K_keep) + (1,) * (value.ndim - 2)
+                    idx = gather_idx.view(expand_shape).expand(B, K_keep, *value.shape[2:])
+                    gathered[key] = torch.gather(value, dim=1, index=idx)
+                else:
+                    gathered[key] = value
+            else:
+                gathered[key] = value
+        return gathered
+
+    def _select_loss_render_gaussians(self, gaussians):
+        opacity = gaussians["opacity"].detach().float().squeeze(-1)
+        B, K = opacity.shape
+        device, dtype = opacity.device, opacity.dtype
+
+        stats = {
+            "render_gaussian_count": torch.full((B,), float(K), device=device, dtype=dtype),
+            "render_gaussian_candidate_count": torch.full((B,), float(K), device=device, dtype=dtype),
+            "render_gaussian_active_candidates": (opacity > self.render_opacity_threshold).sum(dim=1).to(dtype=dtype),
+            "render_gaussian_opacity_threshold": torch.full(
+                (B,),
+                float(self.render_opacity_threshold),
+                device=device,
+                dtype=dtype,
+            ),
+        }
+
+        if self.render_max_gaussians <= 0 and self.render_opacity_threshold <= 0:
+            return gaussians, stats
+
+        active_counts = (opacity > self.render_opacity_threshold).sum(dim=1)
+        keep_count = int(active_counts.max().item())
+        keep_count = max(self.render_min_gaussians, keep_count)
+        if self.render_max_gaussians > 0:
+            keep_count = min(self.render_max_gaussians, keep_count)
+        keep_count = min(K, keep_count)
+
+        stats["render_gaussian_count"] = torch.full((B,), float(keep_count), device=device, dtype=dtype)
+        if keep_count >= K:
+            return gaussians, stats
+
+        gather_idx = torch.topk(opacity, k=keep_count, dim=1, largest=True, sorted=False).indices
+        return self._gather_loss_render_gaussians(gaussians, gather_idx), stats
+
     def forward(self, pred, gt_raw, batch_idx=0, current_epoch=None, total_epochs=None, **kwargs):
         gt = self.prepare_gt(gt_raw)
         
@@ -622,6 +723,7 @@ class Pi3LossGS(nn.Module):
         gt_ks, gt_imgs = gt['gt_ks'], gt['imgs']
 
         gauss_raw = pred['gaussians']
+        gauss_render, render_stats = self._select_loss_render_gaussians(gauss_raw)
         pred_c2w = pred['camera_poses']
         intrinsics_pred = pred['intrinsics'] 
 
@@ -647,6 +749,8 @@ class Pi3LossGS(nn.Module):
         pred_local_depth = pred['local_points'][..., 2:3].clamp(min=-1e4, max=1e4)
 
         loss_rgb = loss_ssim = loss_depth = loss_sobel = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
+        loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
+        loss_alpha_regul = torch.tensor(0.0, device=pred_c2w.device)
         loss_lpips = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
@@ -654,80 +758,114 @@ class Pi3LossGS(nn.Module):
 
         render_w2c = se3_inverse(render_c2w)
         
-        # 1. 渲染完整的 RGB
-        render_out_rgb, _, _ = self._render_gs(gauss_raw, render_w2c, intrinsics_pred, H, W, render_mode='RGB')
-        rgb_full = render_out_rgb[..., :3].reshape(B * N_total, H, W, 3).permute(0, 3, 1, 2)
-        del render_out_rgb
-
-        gt_imgs_reshaped = gt_imgs.reshape(B * N_total, 3, H, W)
-
+        render_view_chunk_size = min(self.render_view_chunk_size, N_total)
         if self.train_stage in [1, 2, 3]:
-            loss_rgb = F.l1_loss(rgb_full, gt_imgs_reshaped)
-            loss_ssim = 1.0 - ssim(rgb_full, gt_imgs_reshaped, data_range=1.0)
-            # loss_sobel = sobel_edge_loss(rgb_full, gt_imgs_reshaped)
+            photo_weight = 0
+            for start in range(0, N_total, render_view_chunk_size):
+                end = min(start + render_view_chunk_size, N_total)
+                n_views = end - start
+                render_out_rgb = self._render_gs_for_loss(
+                    gauss_render,
+                    render_w2c[:, start:end].contiguous(),
+                    intrinsics_pred[:, start:end].contiguous(),
+                    H,
+                    W,
+                    render_mode='RGB',
+                )
+                rgb_chunk = render_out_rgb[..., :3].reshape(B * n_views, H, W, 3).permute(0, 3, 1, 2).contiguous()
+                gt_imgs_chunk = gt_imgs[:, start:end].reshape(B * n_views, 3, H, W).contiguous()
+                chunk_weight = B * n_views
 
-            # if cur_lambda_lpips > 0:
-            #     if self.lpips_downsample < 1.0:
-            #         lp_rgb = F.interpolate(rgb_full, scale_factor=self.lpips_downsample, mode='bilinear', align_corners=False, antialias=True)
-            #         lp_gt = F.interpolate(gt_imgs_reshaped, scale_factor=self.lpips_downsample, mode='bilinear', align_corners=False, antialias=True)
-            #     else:
-            #         lp_rgb = rgb_full
-            #         lp_gt = gt_imgs_reshaped
-            #     loss_lpips = self.lpips_loss_fn(lp_rgb, lp_gt).mean()
-            #     if self.lpips_downsample < 1.0:
-            #         del lp_rgb, lp_gt
-            if self.lambda_lpips > 0:
-                loss_lpips = self.lpips_loss_fn(
-                    rgb_full,
-                    gt_imgs_reshaped,
-                    normalize=True
-                ).mean()
+                loss_rgb = loss_rgb + F.l1_loss(rgb_chunk, gt_imgs_chunk) * chunk_weight
+                loss_ssim = loss_ssim + (1.0 - ssim(rgb_chunk, gt_imgs_chunk, data_range=1.0)) * chunk_weight
+                # loss_sobel = sobel_edge_loss(rgb_chunk, gt_imgs_chunk)
 
-        del rgb_full, gt_imgs_reshaped
+                if self.lambda_lpips > 0:
+                    if self.lpips_downsample < 1.0:
+                        lp_rgb = F.interpolate(
+                            rgb_chunk,
+                            scale_factor=self.lpips_downsample,
+                            mode='bilinear',
+                            align_corners=False,
+                            antialias=True,
+                        )
+                        lp_gt = F.interpolate(
+                            gt_imgs_chunk,
+                            scale_factor=self.lpips_downsample,
+                            mode='bilinear',
+                            align_corners=False,
+                            antialias=True,
+                        )
+                    else:
+                        lp_rgb = rgb_chunk
+                        lp_gt = gt_imgs_chunk
+                    loss_lpips = loss_lpips + self.lpips_loss_fn(
+                        lp_rgb,
+                        lp_gt,
+                        normalize=True,
+                    ).mean() * chunk_weight
+                    if self.lpips_downsample < 1.0:
+                        del lp_rgb, lp_gt
+
+                photo_weight += chunk_weight
+                del render_out_rgb, rgb_chunk, gt_imgs_chunk
+
+            if photo_weight > 0:
+                loss_rgb = loss_rgb / photo_weight
+                loss_ssim = loss_ssim / photo_weight
+                loss_lpips = loss_lpips / photo_weight
 
         need_depth_loss = (self.train_stage in [1, 2, 3]) and (self.lambda_depth > 0) and bool(pseudo_mask_2d.any().item())
         if need_depth_loss:
             # gauss_raw['conf'] is Gaussian-level confidence and is used exactly like depth rendering in inference.
-            gauss_render_depth = self._build_depth_render_gaussians(gauss_raw)
+            gauss_render_depth = self._build_depth_render_gaussians(gauss_render)
 
-            render_out_depth, _, _ = self._render_gs(gauss_render_depth, render_w2c, intrinsics_pred, H, W, render_mode='ED')
-            depth_map = render_out_depth[..., 0:1].reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-            del render_out_depth
+            depth_abs_sum = torch.tensor(0.0, device=pred_c2w.device)
+            depth_valid_count = torch.tensor(0.0, device=pred_c2w.device)
+            for start in range(0, N_total, render_view_chunk_size):
+                end = min(start + render_view_chunk_size, N_total)
+                n_views = end - start
+                render_out_depth = self._render_gs_for_loss(
+                    gauss_render_depth,
+                    render_w2c[:, start:end].contiguous(),
+                    intrinsics_pred[:, start:end].contiguous(),
+                    H,
+                    W,
+                    render_mode='ED',
+                )
+                depth_map = render_out_depth[..., 0:1].reshape(B * n_views, H, W, 1).permute(0, 3, 1, 2)
+                pseudo_mask = pseudo_mask_2d[:, start:end].reshape(B * n_views, H, W, 1).permute(0, 3, 1, 2)
+                pseudo_gt_depth = pred_local_depth[:, start:end].reshape(B * n_views, H, W, 1).permute(0, 3, 1, 2)
 
-            pseudo_mask = pseudo_mask_2d.reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-            pseudo_gt_depth = pred_local_depth.reshape(B * N_total, H, W, 1).permute(0, 3, 1, 2)
-            if pseudo_mask.sum() > 10:
-                loss_depth = F.l1_loss(depth_map[pseudo_mask], pseudo_gt_depth[pseudo_mask].detach())
-            del depth_map, pseudo_mask, pseudo_gt_depth
-        # ==========================================
-        # 【新增：渲染层面的稀疏惩罚与体积克制】
-        # loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
-        # loss_volume = torch.tensor(0.0, device=pred_c2w.device)
-        
-        # valid_render_mask = gauss_raw['opacity'].squeeze(-1) > 0.05
-        # if valid_render_mask.sum() > 0:
-        #     active_opacities = gauss_raw['opacity'][valid_render_mask]
-        #     # active_scales = gauss_raw['scale'][valid_render_mask]
-            
-        #     # 【修复 3】：将 opacity 截断，防止极小的负浮点数导致 log 出现 nan
-        #     eps = 1e-6
-        #     active_opacities_safe = active_opacities.clamp(eps, 1.0 - eps)
-        #     loss_sparsity = -(
-        #         active_opacities_safe * torch.log(active_opacities_safe) + 
-        #         (1.0 - active_opacities_safe) * torch.log(1.0 - active_opacities_safe)
-        #     ).mean()
-            
-            # 【修复 1】：将 scale 强转为 fp32 计算体积，防止 fp16 溢出 (65504 上限)
-            # active_scales_fp32 = active_scales.float()
-            # vol = active_scales_fp32[..., 0] * active_scales_fp32[..., 1] * active_scales_fp32[..., 2]
-            # loss_volume = (vol * active_opacities.squeeze(-1).float()).mean()
+                depth_diff = torch.abs(depth_map[pseudo_mask] - pseudo_gt_depth[pseudo_mask].detach())
+                depth_abs_sum = depth_abs_sum + depth_diff.sum()
+                depth_valid_count = depth_valid_count + pseudo_mask.sum().to(dtype=depth_abs_sum.dtype)
+                del render_out_depth, depth_map, pseudo_mask, pseudo_gt_depth, depth_diff
+
+            if bool((depth_valid_count > 10).item()):
+                loss_depth = depth_abs_sum / depth_valid_count.clamp_min(1.0)
+        if self.enable_sparsity_loss and self.lambda_sparsity > 0:
+            valid_render_mask = gauss_raw['opacity'].squeeze(-1) > self.sparsity_min_opacity
+            if bool(valid_render_mask.any().item()):
+                active_opacities = gauss_raw['opacity'].float()[valid_render_mask]
+                active_opacities_safe = active_opacities.clamp(1e-6, 1.0 - 1e-6)
+                loss_sparsity = -(
+                    active_opacities_safe * torch.log(active_opacities_safe) +
+                    (1.0 - active_opacities_safe) * torch.log(1.0 - active_opacities_safe)
+                ).mean()
+        if self.enable_alpha_regularization and self.lambda_alpha_regul > 0:
+            valid_alpha_mask = gauss_raw['opacity'].squeeze(-1) > self.sparsity_min_opacity
+            if bool(valid_alpha_mask.any().item()):
+                loss_alpha_regul = gauss_raw['opacity'].float()[valid_alpha_mask].mean()
+
         final_loss = (
             self.lambda_rgb * loss_rgb + 
             self.lambda_ssim * loss_ssim +
-            # self.lambda_depth * loss_depth +
-            self.lambda_lpips * loss_lpips
+            self.lambda_depth * loss_depth +
+            self.lambda_lpips * loss_lpips +
+            self.lambda_sparsity * loss_sparsity +
+            self.lambda_alpha_regul * loss_alpha_regul
             # 0.05 * loss_sobel +
-            # 0.02 * loss_sparsity 
             # 0.0001 * loss_volume
         )
 
@@ -737,15 +875,35 @@ class Pi3LossGS(nn.Module):
         details.update({
             "loss_rgb": loss_rgb,
             "loss_ssim": loss_ssim,
-            # "loss_depth": loss_depth,
+            "loss_depth": loss_depth,
             # "loss_sobel": loss_sobel,
             "loss_lpips": loss_lpips,
-            # "loss_sparsity": loss_sparsity,
+            "loss_sparsity": loss_sparsity,
+            "loss_alpha_regul": loss_alpha_regul,
+            "cur_weight_sparsity": torch.tensor(
+                self.lambda_sparsity if self.enable_sparsity_loss else 0.0,
+                device=pred_c2w.device,
+            ),
+            "cur_weight_alpha_regul": torch.tensor(
+                self.lambda_alpha_regul if self.enable_alpha_regularization else 0.0,
+                device=pred_c2w.device,
+            ),
+            "render_view_chunk_size": torch.tensor(
+                float(render_view_chunk_size),
+                device=pred_c2w.device,
+            ),
             # "loss_volume": loss_volume,
             # "cur_weight_rgb": torch.tensor(cur_lambda_rgb, device=pred_c2w.device),   
             # "cur_weight_depth": torch.tensor(cur_lambda_depth, device=pred_c2w.device), 
             "total_loss": final_loss
         })
+
+        if "gaussian_stats" in pred:
+            for key, value in pred["gaussian_stats"].items():
+                details[f"gaussian_{key}"] = value.detach().float().mean()
+
+        for key, value in render_stats.items():
+            details[key] = value.detach().float().mean()
 
         # if "selected_gaussians" in pred:
         #     details["selected_gaussians"] = pred["selected_gaussians"].detach().float()

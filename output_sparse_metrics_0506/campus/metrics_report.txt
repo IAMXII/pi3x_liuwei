@@ -1,0 +1,38 @@
+Pi3_3DGS RGB + Depth Evaluation Report
+================================================
+data_path: /data/liuwei/dataset/ntu_seq/campus/rgb
+model_impl: pi3.models.pi3_3dgs_7
+scene_mode: single_scene
+gs_view_stride: 2
+gaussian_input_frames: 26 / 50
+gaussian_input_indices: 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 49
+depth_eval: True
+depth_path: /data/liuwei/dataset/ntu_seq/campus/depth
+depth_match_mode: stem
+frames: 50
+model_resolution: 378x672
+depth_unit_scale: 0.001
+alignment_scope: global
+alignment_mode: auto
+allow_affine_in_auto: False
+alignment_select_metric: drmse
+selected_alignment: robust_scale
+selected_scale: 0.18796028
+selected_shift: 0.00000000
+
+Average PSNR:   18.9726 dB
+Average SSIM:   0.5015
+Average LPIPS:  0.4333
+Average AbsRel: 0.301432
+Average dRMSE:  5.908468
+Average SRO:    0.782452 (higher is better)
+Average LRC:    0.146109 (lower is better)
+Average S-LDQ:  0.676254 (higher is better)
+Depth frames used: 50 / 50
+Sparse structure metric config: radius=16, max_pairs=20000, sro_min_depth_delta=0.25, sro_min_rel_delta=0.03, lrc_max_depth_delta=0.25, lrc_max_rel_delta=0.05
+
+Global alignment candidates:
+  median_scale: status=ok scale=0.198295 shift=0.000000 abs_rel=0.320566 d_rmse=5.989433
+  l2_scale: status=ok scale=0.188136 shift=0.000000 abs_rel=0.301608 d_rmse=5.945714
+  robust_scale: status=ok scale=0.187960 shift=0.000000 abs_rel=0.301401 d_rmse=5.945672
+  robust_rel_scale: status=ok scale=0.178675 shift=0.000000 abs_rel=0.296103 d_rmse=5.978115

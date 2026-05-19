@@ -52,6 +52,19 @@ from accelerate.utils import (
 )
 import numpy as np
 
+
+class _LimitedIterable:
+    def __init__(self, iterable, max_items):
+        self.iterable = iterable
+        self.max_items = max(0, int(max_items))
+
+    def __iter__(self):
+        return itertools.islice(iter(self.iterable), self.max_items)
+
+    def __len__(self):
+        return self.max_items
+
+
 class BaseTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -89,7 +102,8 @@ class BaseTrainer:
         self.accelerator.wait_for_everyone()
 
         ## 5. Prepare optimizer and scheduler (fsdp should after preparing the model using accelerate)
-        if self.cfg.get("fsdp_plugin"):
+        if self._using_fsdp():
+            self.model = self._maybe_wrap_model_for_hsdp(self.model)
             self.model = self.accelerator.prepare(self.model)
             self.accelerator.wait_for_everyone()
 
@@ -195,6 +209,126 @@ class BaseTrainer:
         self.first_epoch = latest_epoch
 
         os.makedirs(self.cfg.log.ckpt_dir, exist_ok=True)
+
+    def _fsdp_requested(self):
+        return bool(self.cfg.get("fsdp_plugin")) or (
+            os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true"
+        )
+
+    def _using_fsdp(self):
+        return self._fsdp_requested() or (
+            getattr(self.accelerator, "distributed_type", None) == DistributedType.FSDP
+        )
+
+    def _get_hsdp_cfg(self):
+        hsdp_cfg = self.cfg.get("hsdp")
+        if hsdp_cfg and hsdp_cfg.get("enabled", False):
+            return hsdp_cfg
+        return None
+
+    def _build_hsdp_process_groups(self, shard_group_size):
+        if hasattr(self, "_hsdp_process_group_pair"):
+            return self._hsdp_process_group_pair
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("HSDP requires torch.distributed to be initialized before wrapping the model.")
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        if shard_group_size <= 1:
+            raise ValueError(f"hsdp.shard_group_size must be > 1, got {shard_group_size}.")
+        if world_size % shard_group_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by hsdp.shard_group_size ({shard_group_size})."
+            )
+
+        num_shard_groups = world_size // shard_group_size
+        shard_rank_groups = [
+            list(range(group_idx * shard_group_size, (group_idx + 1) * shard_group_size))
+            for group_idx in range(num_shard_groups)
+        ]
+        replicate_rank_groups = [
+            list(range(offset, world_size, shard_group_size))
+            for offset in range(shard_group_size)
+        ]
+
+        shard_pg = None
+        shard_ranks = None
+        for ranks in shard_rank_groups:
+            pg = dist.new_group(ranks=ranks)
+            if rank in ranks:
+                shard_pg = pg
+                shard_ranks = ranks
+
+        replicate_pg = None
+        replicate_ranks = None
+        for ranks in replicate_rank_groups:
+            pg = dist.new_group(ranks=ranks)
+            if rank in ranks:
+                replicate_pg = pg
+                replicate_ranks = ranks
+
+        if shard_pg is None or replicate_pg is None:
+            raise RuntimeError(
+                f"Rank {rank} could not be assigned to HSDP groups. "
+                f"Shard groups: {shard_rank_groups}, replicate groups: {replicate_rank_groups}"
+            )
+
+        self.log_info(
+            f"HSDP rank {rank}: shard_group={shard_ranks}, replicate_group={replicate_ranks}"
+        )
+        self._hsdp_process_group_pair = (shard_pg, replicate_pg)
+        return self._hsdp_process_group_pair
+
+    def _maybe_wrap_model_for_hsdp(self, model):
+        hsdp_cfg = self._get_hsdp_cfg()
+        if hsdp_cfg is None:
+            return model
+
+        from torch.distributed.fsdp import (
+            CPUOffload,
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision,
+            ShardingStrategy,
+        )
+
+        if isinstance(model, FSDP):
+            return model
+
+        shard_group_size = int(hsdp_cfg.get("shard_group_size", 2))
+        process_group = self._build_hsdp_process_groups(shard_group_size)
+        sharding_strategy_name = str(hsdp_cfg.get("sharding_strategy", "HYBRID_SHARD")).upper()
+        if not hasattr(ShardingStrategy, sharding_strategy_name):
+            raise ValueError(f"Unsupported hsdp.sharding_strategy: {sharding_strategy_name}")
+
+        cpu_offload = None
+        if hsdp_cfg.get("cpu_offload", False):
+            cpu_offload = CPUOffload(offload_params=True)
+
+        mixed_precision = MixedPrecision(
+            param_dtype=self.weight_dtype,
+            reduce_dtype=self.weight_dtype,
+            buffer_dtype=self.weight_dtype,
+            cast_forward_inputs=True,
+            cast_root_forward_inputs=True,
+        )
+
+        self.log_info(
+            f"Wrapping model with HSDP: strategy={sharding_strategy_name}, shard_group_size={shard_group_size}"
+        )
+        return FSDP(
+            model,
+            process_group=process_group,
+            sharding_strategy=getattr(ShardingStrategy, sharding_strategy_name),
+            cpu_offload=cpu_offload,
+            auto_wrap_policy=None,
+            mixed_precision=mixed_precision,
+            device_id=self.accelerator.device,
+            sync_module_states=bool(hsdp_cfg.get("sync_module_states", True)),
+            forward_prefetch=bool(hsdp_cfg.get("forward_prefetch", False)),
+            limit_all_gathers=bool(hsdp_cfg.get("limit_all_gathers", True)),
+            use_orig_params=bool(hsdp_cfg.get("use_orig_params", True)),
+        )
 
     def prepare_model(self):
         model = hydra.utils.instantiate(self.cfg.model)
@@ -374,9 +508,9 @@ class BaseTrainer:
 
         self.log_info(f"Start validation for epoch {epoch}")
         with torch.no_grad():
-            # [修改点 1]: 加上 enumerate 取出局部 batch_idx (这里命名为 it)
+            val_iterable = _LimitedIterable(self.test_loader, self.iters_per_test)
             for it, batch in enumerate(metric_logger.log_every(
-                self.test_loader, self.cfg.train.print_freq, header
+                val_iterable, self.cfg.train.print_freq, header
             )):
                 batch = move_to_device(batch, self.accelerator.device)
 
@@ -688,21 +822,20 @@ class BaseTrainer:
         )
 
         # fsdp
-        if self.cfg.get("fsdp_plugin"):
-            fsdp_plugin_kwargs = {}
-            fsdp_plugin_kwargs[
-                "mixed_precision_policy"
-            ] = torch.distributed.fsdp.MixedPrecision(
-                param_dtype=self.weight_dtype,
-                reduce_dtype=self.weight_dtype,
-                buffer_dtype=self.weight_dtype,
-                cast_forward_inputs=True,
-                cast_root_forward_inputs=True,
-            )
+        if self._fsdp_requested():
+            if self.cfg.get("fsdp_plugin"):
+                from torch.distributed.fsdp import MixedPrecision
 
-            fsdp_plugin = hydra.utils.instantiate(self.cfg.fsdp_plugin)(**fsdp_plugin_kwargs)
-            # fsdp_plugin = hydra.utils.instantiate(self.cfg.fsdp_plugin, **fsdp_plugin_kwargs)
-            accelerate_config["fsdp_plugin"] = fsdp_plugin
+                fsdp_plugin = hydra.utils.instantiate(self.cfg.fsdp_plugin)
+                # Keep FSDP input casting aligned with the original bf16/fp16 training path.
+                fsdp_plugin.mixed_precision_policy = MixedPrecision(
+                    param_dtype=self.weight_dtype,
+                    reduce_dtype=self.weight_dtype,
+                    buffer_dtype=self.weight_dtype,
+                    cast_forward_inputs=True,
+                    cast_root_forward_inputs=True,
+                )
+                accelerate_config["fsdp_plugin"] = fsdp_plugin
         else:
             ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=self.cfg.train.find_unused_parameters)
             accelerate_config['kwargs_handlers'] = [ddp_kwargs]
@@ -827,16 +960,23 @@ class BaseTrainer:
             return torch.load(path, map_location="cpu")
 
     def _load_model_only(self, path):
-        model_path = os.path.join(path, "model.safetensors")
-        if os.path.exists(model_path):
-            state_dict = load_safetensors(model_path, device="cpu")
-        else:
-            model_path = os.path.join(path, "pytorch_model.bin")
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(
-                    f"Could not find model weights under checkpoint directory: {path}"
-                )
-            state_dict = self._torch_load_cpu(model_path)
+        state_dict = None
+        candidate_loaders = [
+            (os.path.join(path, "model.safetensors"), lambda p: load_safetensors(p, device="cpu")),
+            (os.path.join(path, "pytorch_model.bin"), self._torch_load_cpu),
+            (os.path.join(path, "pytorch_model_fsdp.bin"), self._torch_load_cpu),
+        ]
+        model_path = None
+        for candidate_path, loader in candidate_loaders:
+            if os.path.exists(candidate_path):
+                model_path = candidate_path
+                state_dict = loader(candidate_path)
+                break
+
+        if state_dict is None:
+            raise FileNotFoundError(
+                f"Could not find model weights under checkpoint directory: {path}"
+            )
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         result = unwrapped_model.load_state_dict(state_dict, strict=False)

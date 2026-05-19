@@ -56,6 +56,7 @@ class Pi3Trainer(BaseTrainer):
             encoder_params = []
             point_decoder_params = []
             gs_decoder_params = []
+            gs_head_params = []
             camera_decoder_params = []
             other_params = []
 
@@ -70,6 +71,8 @@ class Pi3Trainer(BaseTrainer):
                     point_decoder_params.append((name, param))
                 elif 'gs_decoder' in name:
                     gs_decoder_params.append((name, param))
+                elif 'gs_head' in name:
+                    gs_head_params.append((name, param))
                 elif 'camera_decoder' in name:
                     camera_decoder_params.append((name, param))
                 else:
@@ -79,6 +82,7 @@ class Pi3Trainer(BaseTrainer):
             print(f'Trainable encoder params:', sum(p.numel() for _, p in encoder_params))
             print(f'Trainable point_decoder params:', sum(p.numel() for _, p in point_decoder_params))
             print(f'Trainable gs_decoder params:', sum(p.numel() for _, p in gs_decoder_params))
+            print(f'Trainable gs_head params:', sum(p.numel() for _, p in gs_head_params))
             print(f'Trainable camera_decoder params:', sum(p.numel() for _, p in camera_decoder_params))
             print(f'Trainable other params:', sum(p.numel() for _, p in other_params))
 
@@ -101,6 +105,7 @@ class Pi3Trainer(BaseTrainer):
 
             res = []
             base_lr = cfg_optimizer.lr
+            gs_head_lr_multiplier = float(getattr(cfg_optimizer, 'gs_head_lr_multiplier', 2.0))
             
             # 3. 分配差异化学习率 (核心精进策略)
             
@@ -119,10 +124,14 @@ class Pi3Trainer(BaseTrainer):
             # GS Decoder (颜色/透明度等): 现阶段的优化主力，保持 100% 基础学习率
             if gs_decoder_params:
                 res.extend(handle_weight_decay(gs_decoder_params, cfg_optimizer.weight_decay, base_lr * 1.0))
+
+            # GS Head 直接输出 opacity/color/scale 等渲染属性，给更高学习率以加快光度收敛
+            if gs_head_params:
+                res.extend(handle_weight_decay(gs_head_params, cfg_optimizer.weight_decay, base_lr * gs_head_lr_multiplier))
             
             # 其他主干网络 (如 Transformer 主体): 压低学习率 (10%)，稳定已有的特征空间
             if other_params:
-                res.extend(handle_weight_decay(other_params, cfg_optimizer.weight_decay, base_lr * 0.1))
+                res.extend(handle_weight_decay(other_params, cfg_optimizer.weight_decay, base_lr * 1.0))
 
             return res
         

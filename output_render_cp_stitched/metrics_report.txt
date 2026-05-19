@@ -1,0 +1,28 @@
+Pi3_3DGS RGB + Depth Evaluation Report
+================================================
+data_path: /data/liuwei/dataset/ntu_seq/cp/rgb
+depth_path: /data/liuwei/dataset/ntu_seq/cp/depth
+depth_match_mode: stem
+frames: 146
+model_resolution: 434x574
+depth_unit_scale: 0.001
+alignment_scope: global
+alignment_mode: auto
+allow_affine_in_auto: False
+alignment_select_metric: drmse
+selected_alignment: l2_scale
+selected_scale: 0.28583806
+selected_shift: 0.00000000
+
+Average PSNR:   16.8700 dB
+Average SSIM:   0.5486
+Average LPIPS:  0.5079
+Average AbsRel: 0.297520
+Average dRMSE:  3.774403
+Depth frames used: 146 / 146
+
+Global alignment candidates:
+  median_scale: status=ok scale=0.318210 shift=0.000000 abs_rel=0.316542 d_rmse=4.305831
+  l2_scale: status=ok scale=0.285838 shift=0.000000 abs_rel=0.296561 d_rmse=4.151483
+  robust_scale: status=ok scale=0.280931 shift=0.000000 abs_rel=0.296157 d_rmse=4.155275
+  robust_rel_scale: status=ok scale=0.279678 shift=0.000000 abs_rel=0.296175 d_rmse=4.157405

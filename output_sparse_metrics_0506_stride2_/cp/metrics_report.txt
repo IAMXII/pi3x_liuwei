@@ -1,0 +1,47 @@
+Pi3_3DGS RGB + Depth Evaluation Report
+================================================
+data_path: /data/liuwei/dataset/ntu_seq/cp/rgb
+model_impl: pi3.models.pi3_3dgs_7
+scene_mode: single_scene
+gs_view_stride: 2
+gaussian_input_frames: 21 / 40
+gaussian_input_indices: 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 39
+depth_eval: True
+depth_path: /data/liuwei/dataset/ntu_seq/cp/depth
+depth_match_mode: stem
+frames: 40
+model_resolution: 434x574
+depth_unit_scale: 0.001
+alignment_scope: global
+alignment_mode: auto
+allow_affine_in_auto: False
+alignment_select_metric: drmse
+depth_sigma_filter: True
+depth_sigma: 3.0
+min_sigma_points: 64
+sigma_status: ok
+sigma_input_pixels: 658731
+sigma_kept_pixels: 636600
+sigma_keep_ratio: 0.966404
+sigma_residual_mean: -0.164960
+sigma_residual_std: 0.322959
+selected_alignment: l2_scale
+selected_scale: 0.11099919
+selected_shift: 0.00000000
+
+Average PSNR:   21.7662 dB
+Average SSIM:   0.7095
+Average LPIPS:  0.4073
+Average AbsRel: 0.136579
+Average dRMSE:  2.660858
+Average SRO:    0.940201 (higher is better)
+Average LRC:    0.050336 (lower is better)
+Average S-LDQ:  0.894181 (higher is better)
+Depth frames used: 40 / 40
+Sparse structure metric config: radius=16, max_pairs=20000, sro_min_depth_delta=0.25, sro_min_rel_delta=0.03, lrc_max_depth_delta=0.25, lrc_max_rel_delta=0.05
+
+Global alignment candidates:
+  median_scale: status=ok scale=0.122549 shift=0.000000 abs_rel=0.099682 d_rmse=2.862318
+  l2_scale: status=ok scale=0.110999 shift=0.000000 abs_rel=0.136973 d_rmse=2.669862
+  robust_scale: status=ok scale=0.118733 shift=0.000000 abs_rel=0.101893 d_rmse=2.758108
+  robust_rel_scale: status=ok scale=0.121244 shift=0.000000 abs_rel=0.098975 d_rmse=2.822509

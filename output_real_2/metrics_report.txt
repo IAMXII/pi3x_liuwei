@@ -1,0 +1,10 @@
+Pi3_3DGS RGB Evaluation Report
+================================================
+data_path: 1287386498681744
+depth_eval: False
+frames: 100
+model_resolution: 378x672
+
+Average PSNR:   20.4342 dB
+Average SSIM:   0.7327
+Average LPIPS:  0.3360

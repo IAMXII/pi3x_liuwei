@@ -1,0 +1,10 @@
+Pi3_3DGS RGB Evaluation Report
+================================================
+data_path: /data/liuwei/dataset/360_v2/garden/images
+depth_eval: False
+frames: 5
+model_resolution: 406x616
+
+Average PSNR:   20.7114 dB
+Average SSIM:   0.3766
+Average LPIPS:  0.4643
