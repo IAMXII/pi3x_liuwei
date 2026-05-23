@@ -1,23 +1,16 @@
-# 第二部分去重（局部竞争）实现简述：
+# Pi3_3DGS_9 第二部分去重（局部竞争）实现简述：
 # 1. forward 中每个 batch 的高斯候选合并后，调用 _apply_local_competition。
 # 2. 先估计每个高斯的局部尺度：优先用相机位姿、内参和可见像素足迹计算
 #    cube_size，并转成 local_radius；不可见或信息不足时退回由预测 scale 得到
-#    的 fallback radius。大规模 hash 近似时用 local_radius 的中位数作 voxel_size。
-# 3. _estimate_color_aware_redundancy 统计局部冗余度：小点集用精确 cdist，
-#    大点集用空间 voxel hash 的 27 邻域近似；若启用颜色约束，只把空间近且
-#    RGB/输入图颜色相近的高斯计为重复候选。为对齐 reduced-3dgs 默认
-#    num_neighbours=30 的口径，冗余分数最多计 30 个邻居 + 自身。
+#    的 fallback radius。这个尺度只决定 Reduced-3DGS 风格的局部球半径。
+# 3. _estimate_color_aware_redundancy 统计局部冗余度：按 Reduced-3DGS 的
+#    固定 K 近邻候选（默认 30）计算冗余，不再用 counts/view/hash 作为
+#    local competition 的资格条件；唯一额外约束是颜色相近的近邻才计入冗余。
 # 4. 将 redundancy_score 通过 mean + lambda * std（且不低于 redundancy_minimum）
 #    得到阈值，再归一化成 redundancy_coef。只有 redundancy_coef > 0 的高斯
-#    才会真正进入竞争。
-# 5. 局部竞争分组使用“空间 voxel + competition_color 量化 bin”的 hash；只有
-#    组内数量大于 1、且来自至少两个 source_view 的组才算有效竞争组。
-# 6. 有效组内按 opacity logit 做 temperature softmax，并用 counts^target_power
-#    估计目标保留量生成 gate_compete；最终 gate = 1 - strength * redundancy_coef
-#    * (1 - gate_compete)，再 clamp 到 competition_min_gate 以上。
-# 7. 正常去重是软抑制：opacity *= gate，同时记录 redundancy_score、
-#    redundancy_coef、competition_gate、competition_active 和统计量；只有超过
-#    max_dense_gaussians 的极端情况才额外按质量 top-k 做物理硬裁剪。
+#    才会进入透明度压制。
+# 5. local competition 后半段保持软抑制：opacity *= gate；不做 Reduced-3DGS
+#    的物理 prune，也不再做额外 top-k 截断。
 
 import torch
 import torch.nn as nn
@@ -824,12 +817,12 @@ class Pi3_3DGS(nn.Module):
         radius = radius.clamp_min(self.redundancy_pixel_footprint_min)
         return cube_size.to(device=device), radius.to(device=device)
 
-    def _radius_to_hash_voxel_size(self, local_radius, fallback_radius):
-        """Convert per-Gaussian local radii to one hash cell size.
+    def _local_radius_summary(self, local_radius, fallback_radius):
+        """Return a scalar summary of the Reduced-3DGS local radius.
 
-        Exact redundancy mode uses each Gaussian's own radius. The hash mode is
-        an approximation for large point sets, so we use the median local radius
-        as the cell size to avoid the old global-scale-only behavior.
+        Redundancy itself uses each Gaussian's own radius whenever available.
+        The returned scalar is only a diagnostic/fallback scale, not a grouping
+        or filtering hash size.
         """
         if local_radius is None or local_radius.numel() == 0:
             return float(fallback_radius.detach().float().mean().clamp_min(1e-5).item())
@@ -839,20 +832,13 @@ class Pi3_3DGS(nn.Module):
         return float(fallback_radius.detach().float().mean().clamp_min(1e-5).item())
 
     def _apply_local_competition(self, gaussian_dict, source_view, scene_size, camera_poses=None, intrinsics=None, image_hw=None):
-        """Color-aware redundancy-coefficient local competition.
+        """Reduced-3DGS-style redundancy detection plus soft opacity suppression.
 
-        This replaces the previous hash-only local competition. The procedure is:
-
-        1. Estimate a Reduced-3DGS-style local redundancy score for every
-           Gaussian. Redundancy is counted only when Gaussians are spatially
-           close and, if enabled, have similar colors.
-        2. Convert the redundancy score into a normalized redundancy coefficient
-           in [0, 1]. Only Gaussians with coefficient > 0 are considered truly
-           redundant competitors.
-        3. Within spatial/color local groups that contain multiple source views,
-           run opacity-based competition. The final opacity gate is weighted by
-           the redundancy coefficient, so mildly redundant Gaussians are only
-           weakly suppressed while highly redundant ones are strongly suppressed.
+        Redundant Gaussians are selected from the whole Gaussian set by the
+        global redundancy score threshold. No source-view, repeated-count, or
+        spatial/color hash group is used as an additional eligibility condition.
+        The only deviation from Reduced-3DGS is that neighbor intersections must
+        also pass the optional color-similarity check.
         """
         xyz = gaussian_dict["xyz"]
         K = xyz.shape[0]
@@ -950,17 +936,16 @@ class Pi3_3DGS(nn.Module):
                 scene_size_scalar=scene_size_scalar,
             )
             # Reduced-3DGS uses cube_size * pixel_scale as the local cube side
-            # and half-diagonal as the sphere radius. Exact mode below uses
-            # local_radius_i per Gaussian. Hash mode needs one cell size, so use
-            # the median local radius as a memory-friendly approximation.
-            voxel_size = self._radius_to_hash_voxel_size(local_radius, fallback_radius)
+            # and half-diagonal as the sphere radius. The scalar below is only
+            # reported for diagnostics; redundancy uses local_radius_i directly.
+            neighborhood_size = self._local_radius_summary(local_radius, fallback_radius)
 
             # 1) Reduced-3DGS-style redundancy score, with color similarity gate.
             #    This score is the actual criterion for deciding whether a
             #    Gaussian is redundant enough to participate in competition.
             redundancy = self._estimate_color_aware_redundancy(
                 gaussian_dict,
-                voxel_size,
+                neighborhood_size,
                 local_radius=local_radius,
             )
             mean_redundancy = redundancy.mean()
@@ -973,47 +958,12 @@ class Pi3_3DGS(nn.Module):
             redundancy_coef = (redundancy - redundancy_threshold) / (max_redundancy - redundancy_threshold + 1e-6)
             redundancy_coef = torch.clamp(redundancy_coef, 0.0, 1.0)
 
-            # 2) Build local groups for opacity competition. We still hash by
-            #    spatial voxel + color bin, but the group alone is not enough:
-            #    a point only competes when redundancy_coef > 0.
-            pts = xyz.detach().float()
-            vox = torch.floor(pts / voxel_size).to(torch.int64)
-            competition_color = gaussian_dict.get("competition_color", gaussian_dict["color"])
-            color_bins = torch.clamp(
-                (competition_color.detach().float().clamp(0.0, 1.0) * self.competition_color_bins).to(torch.int64),
-                min=0,
-                max=self.competition_color_bins - 1,
-            )
-            hashes = (
-                    vox[:, 0] * 73856093
-                    + vox[:, 1] * 19349663
-                    + vox[:, 2] * 83492791
-                    + color_bins[:, 0] * 15485863
-                    + color_bins[:, 1] * 32452843
-                    + color_bins[:, 2] * 49979687
-            )
-            _, inverse, counts = torch.unique(
-                hashes,
-                sorted=True,
-                return_inverse=True,
-                return_counts=True,
-            )
-
-            num_groups = counts.numel()
-            source_view = source_view.detach().to(device=device, dtype=torch.int64).reshape(-1)
-            large = torch.full((num_groups,), torch.iinfo(torch.int64).max, device=device, dtype=torch.int64)
-            small = torch.full((num_groups,), torch.iinfo(torch.int64).min, device=device, dtype=torch.int64)
-            min_view = large.scatter_reduce(0, inverse, source_view, reduce="amin", include_self=True)
-            max_view = small.scatter_reduce(0, inverse, source_view, reduce="amax", include_self=True)
-
-            # A local group is a real competition group only when:
-            #   - it has repeated candidates;
-            #   - candidates come from at least two source views;
-            #   - the individual Gaussian has redundancy_coef > 0.
-            cross_view_group = (counts > 1) & (max_view > min_view)
-            active_mask = cross_view_group[inverse] & (redundancy_coef > 0)
+            # 2) Match Reduced-3DGS candidate selection: redundant primitives are
+            #    exactly those above the global mercy threshold. No counts/view/
+            #    hash group can veto this mask.
+            active_mask = redundancy > redundancy_threshold
             active_count = int(active_mask.sum().item())
-            active_group_count = int(torch.unique(inverse[active_mask]).numel()) if active_count > 0 else 0
+            active_group_count = 0
             redundancy_coef_mean = float(redundancy_coef.mean().item())
             redundancy_coef_max = float(redundancy_coef.max().item())
 
@@ -1023,7 +973,7 @@ class Pi3_3DGS(nn.Module):
                 dtype,
                 K,
                 threshold=float(redundancy_threshold.item()),
-                voxel_size=voxel_size,
+                voxel_size=neighborhood_size,
                 mean_redundancy=float(mean_redundancy.item()),
             )
             stats = add_competition_stats(
@@ -1045,35 +995,13 @@ class Pi3_3DGS(nn.Module):
             )
             return gaussian_dict, stats
 
-        opacity = gaussian_dict["opacity"].float().squeeze(-1)
-        score = torch.logit(opacity.clamp(1e-4, 1.0 - 1e-4))
-
-        with torch.no_grad():
-            num_groups = counts.numel()
-            neg_inf = torch.full((num_groups,), -float("inf"), device=device, dtype=torch.float32)
-            group_max = neg_inf.scatter_reduce(
-                0,
-                inverse,
-                score.detach().float(),
-                reduce="amax",
-                include_self=True,
-            )
-            group_target = counts.float().pow(self.competition_target_power).clamp_min(1.0)
-
-        exp_score = torch.exp(
-            (score.float() - group_max[inverse]) / self.competition_temperature
-        ) * active_mask.float()
-        group_sum = torch.zeros_like(group_max).scatter_add(0, inverse, exp_score)
-        gate_compete = exp_score / group_sum[inverse].clamp_min(1e-6)
-        gate_compete = gate_compete * group_target[inverse]
-        gate_compete = gate_compete.clamp(min=self.competition_min_gate, max=1.0)
-
-        # The redundancy coefficient controls both the binary activation and the
-        # continuous strength of suppression:
-        #   coef = 0 -> gate = 1, no suppression;
-        #   coef = 1 -> full local competition gate.
-        redundancy_weight = redundancy_coef.to(device=device, dtype=gate_compete.dtype)
-        gate = 1.0 - self.competition_strength * redundancy_weight * (1.0 - gate_compete)
+        # Keep the second half as soft opacity suppression, but drive it only by
+        # the Reduced-style redundant set and coefficient. With no local hash
+        # group, the strongest redundant point maps to the same floor that the
+        # old grouped gate could reach.
+        redundancy_weight = redundancy_coef.to(device=device, dtype=torch.float32)
+        gate_floor = torch.tensor(float(self.competition_min_gate), device=device, dtype=torch.float32)
+        gate = 1.0 - self.competition_strength * redundancy_weight * (1.0 - gate_floor)
         gate = torch.where(active_mask, gate, torch.ones_like(gate))
         gate = gate.clamp(min=self.competition_min_gate, max=1.0)
 
@@ -1100,7 +1028,7 @@ class Pi3_3DGS(nn.Module):
             pruned=float(expected_suppressed.item()),
             candidates=active_count,
             threshold=float(redundancy_threshold.item()),
-            voxel_size=voxel_size,
+            voxel_size=neighborhood_size,
             mean_redundancy=float(mean_redundancy.item()),
         )
         stats = add_competition_stats(
@@ -1217,103 +1145,155 @@ class Pi3_3DGS(nn.Module):
             return redundancy
         return redundancy.clamp_max(float(self.redundancy_neighbor_limit + 1))
 
+    def _rotate_by_inverse_quaternion(self, vectors, quaternions):
+        """Rotate vectors by the inverse of normalized wxyz quaternions."""
+        q = F.normalize(quaternions.detach().float(), dim=-1)
+        q_vec = q[..., 1:4]
+        q_w = q[..., 0:1]
+        uv = torch.cross(q_vec, vectors, dim=-1)
+        uuv = torch.cross(q_vec, uv, dim=-1)
+        return vectors - 2.0 * q_w * uv + 2.0 * uuv
+
     def _estimate_color_aware_redundancy(self, gaussian_dict, voxel_size, local_radius=None):
         """Estimate Reduced-3DGS-style local redundancy with an extra color gate.
 
-        For small point sets we use exact pairwise distance + RGB distance.
-        For large point sets we use a memory-friendly spatial voxel hash and,
-        when enabled, append a quantized RGB hash so that only spatially close
-        and color-similar Gaussians are counted as redundant competitors. Both
-        paths are capped to the fixed-neighbour count used by reduced-3dgs.
+        Reduced-3DGS first finds a fixed number of nearest spatial neighbours,
+        tests whether the local sphere intersects each neighbour ellipsoid, adds
+        the center primitive itself, and then propagates the minimum redundancy
+        value to intersecting primitives. This implementation follows that flow
+        and only adds a color-similarity check to the intersection mask.
         """
         xyz = gaussian_dict["xyz"]
         K = xyz.shape[0]
         device = xyz.device
         pts = xyz.detach().float()
+        if K == 0:
+            return torch.zeros((0,), device=device, dtype=torch.float32)
+        if K == 1:
+            return torch.ones((1,), device=device, dtype=torch.float32)
+
         color = self._get_redundancy_color(gaussian_dict)
         use_color = (
                 self.redundancy_use_color
                 and color is not None
                 and self.redundancy_color_threshold > 0
         )
+        scale = gaussian_dict["scale"].detach().float().clamp_min(1e-8)
+        rotation = gaussian_dict.get("rotation", None)
+        if rotation is not None:
+            rotation = rotation.detach().float()
 
-        # Exact mode: closest to the intended definition.
-        # redundancy_i = #{j | ||x_i-x_j|| <= r_i and ||c_i-c_j|| <= tau_c}
-        # When local_radius is provided, each Gaussian uses its own Reduced-3DGS
-        # pixel-footprint sphere radius. Otherwise we fall back to scalar radius.
-        if 0 < K <= self.redundancy_exact_max_points:
-            redundancy_parts = []
-            chunk = 512 if use_color else 1024
-            if local_radius is not None:
-                radius = local_radius.detach().float().to(device=device).view(-1).clamp_min(1e-8)
-            else:
-                radius = None
-            for start in range(0, K, chunk):
-                end = min(start + chunk, K)
-                dist = torch.cdist(pts[start:end], pts)
-                if radius is not None:
-                    spatial_mask = dist <= radius[start:end].view(-1, 1)
-                else:
-                    spatial_mask = dist <= voxel_size
-                if use_color:
-                    color_mask = torch.cdist(color[start:end], color) <= self.redundancy_color_threshold
-                    local_redundancy = (spatial_mask & color_mask).sum(dim=-1).float()
-                else:
-                    local_redundancy = spatial_mask.sum(dim=-1).float()
-                redundancy_parts.append(local_redundancy)
-            return self._cap_redundancy_count(torch.cat(redundancy_parts, dim=0))
-
-        # Approximate mode: count points in neighboring voxels. If color is enabled,
-        # points must also share a quantized color bin. This avoids K^2 memory.
-        # voxel_size is the median of the per-Gaussian pixel-footprint radii when
-        # available, so this remains tied to Reduced-3DGS-style local scale.
-        vox = torch.floor(pts / voxel_size).to(torch.int64)
-        spatial_hash = vox[:, 0] * 73856093 + vox[:, 1] * 19349663 + vox[:, 2] * 83492791
-
-        if use_color:
-            color_bins = torch.clamp(
-                (color * self.redundancy_color_bins).to(torch.int64),
-                min=0,
-                max=self.redundancy_color_bins - 1,
-            )
-            color_hash = (
-                    color_bins[:, 0] * 15485863
-                    + color_bins[:, 1] * 32452843
-                    + color_bins[:, 2] * 49979687
-            )
-            hashes = spatial_hash + color_hash
+        if local_radius is not None:
+            radius = local_radius.detach().float().to(device=device).view(-1).clamp_min(1e-8)
         else:
-            color_hash = None
-            hashes = spatial_hash
+            radius = torch.full((K,), float(max(voxel_size, 1e-8)), device=device, dtype=torch.float32)
 
-        unique_hashes, counts = torch.unique(hashes, sorted=True, return_counts=True)
+        num_neighbours = int(self.redundancy_neighbor_limit) if self.redundancy_neighbor_limit > 0 else 30
+        num_neighbours = min(max(num_neighbours, 1), K - 1)
+        raw_redundancy = torch.ones((K,), device=device, dtype=torch.float32)
+        min_redundancy = torch.full((K,), float("inf"), device=device, dtype=torch.float32)
 
-        offsets = torch.tensor(
-            [
-                [dx, dy, dz]
-                for dx in (-1, 0, 1)
-                for dy in (-1, 0, 1)
-                for dz in (-1, 0, 1)
-            ],
-            device=device,
-            dtype=torch.int64,
-        )
-        neighbour_vox = vox[:, None, :] + offsets[None, :, :]
-        neighbour_hashes = (
-                neighbour_vox[..., 0] * 73856093
-                + neighbour_vox[..., 1] * 19349663
-                + neighbour_vox[..., 2] * 83492791
-        )
-        if use_color:
-            neighbour_hashes = neighbour_hashes + color_hash[:, None]
+        def process_neighbour_indices(center_idx, neighbour_idx):
+            if neighbour_idx.numel() == 0:
+                return
+            center_xyz = pts.index_select(0, center_idx)[:, None, :]
+            neighbour_xyz = pts[neighbour_idx]
+            delta = center_xyz - neighbour_xyz
+            center_radius = radius.index_select(0, center_idx).view(-1, 1, 1)
 
-        hash_pos = torch.searchsorted(unique_hashes, neighbour_hashes)
-        hash_pos_clamped = hash_pos.clamp_max(unique_hashes.numel() - 1)
-        valid_hash = (hash_pos < unique_hashes.numel()) & (unique_hashes[hash_pos_clamped] == neighbour_hashes)
-        redundancy = (
-                counts[hash_pos_clamped].to(device=device, dtype=torch.float32)
-                * valid_hash.float()
-        ).sum(dim=-1)
+            neighbour_scale = scale[neighbour_idx]
+            if rotation is not None:
+                neighbour_rotation = rotation[neighbour_idx]
+                local_delta = self._rotate_by_inverse_quaternion(delta, neighbour_rotation)
+                expanded_scale = neighbour_scale + center_radius
+                intersection_mask = ((local_delta / expanded_scale).square().sum(dim=-1) <= 1.0)
+            else:
+                neighbour_radius = neighbour_scale.amax(dim=-1)
+                distance = torch.linalg.norm(delta, dim=-1)
+                intersection_mask = distance <= (center_radius.squeeze(-1) + neighbour_radius)
+
+            if use_color:
+                center_color = color.index_select(0, center_idx)[:, None, :]
+                neighbour_color = color[neighbour_idx]
+                color_mask = torch.linalg.norm(center_color - neighbour_color, dim=-1) <= self.redundancy_color_threshold
+                intersection_mask = intersection_mask & color_mask
+
+            score = intersection_mask.float().sum(dim=-1) + 1.0
+            raw_redundancy[center_idx] = score
+
+            all_indices = torch.cat([center_idx.view(-1, 1), neighbour_idx], dim=1)
+            all_mask = torch.cat(
+                [
+                    torch.ones((center_idx.numel(), 1), device=device, dtype=torch.bool),
+                    intersection_mask,
+                ],
+                dim=1,
+            )
+            all_scores = score.view(-1, 1).expand_as(all_indices)
+            min_redundancy.scatter_reduce_(
+                0,
+                all_indices[all_mask],
+                all_scores[all_mask],
+                reduce="amin",
+                include_self=True,
+            )
+
+        process_chunk = max(1024, min(65536, 2_000_000 // max(num_neighbours, 1)))
+        used_simple_knn = False
+        try:
+            from simple_knn._C import distIndex2
+            if pts.is_cuda:
+                _, all_indices = distIndex2(pts.contiguous(), num_neighbours)
+                all_indices = all_indices.view(K, num_neighbours).to(device=device, dtype=torch.long)
+                for start in range(0, K, process_chunk):
+                    end = min(start + process_chunk, K)
+                    center_idx = torch.arange(start, end, device=device, dtype=torch.long)
+                    process_neighbour_indices(center_idx, all_indices[start:end])
+                used_simple_knn = True
+        except Exception:
+            used_simple_knn = False
+
+        if not used_simple_knn:
+            try:
+                from scipy.spatial import cKDTree
+            except Exception as exc:
+                raise RuntimeError(
+                    "Pi3_3DGS_9 local competition needs simple_knn._C.distIndex2 "
+                    "or scipy.spatial.cKDTree for Reduced-3DGS-style KNN redundancy."
+                ) from exc
+
+            pts_cpu = pts.detach().cpu().numpy().astype(np.float32, copy=False)
+            tree = cKDTree(pts_cpu)
+            query_k = num_neighbours + 1
+            for start in range(0, K, process_chunk):
+                end = min(start + process_chunk, K)
+                query_pts = pts_cpu[start:end]
+                try:
+                    _, idx_np = tree.query(query_pts, k=query_k, workers=-1)
+                except TypeError:
+                    _, idx_np = tree.query(query_pts, k=query_k)
+                idx_np = np.asarray(idx_np, dtype=np.int64)
+                if idx_np.ndim == 1:
+                    idx_np = idx_np.reshape(-1, query_k)
+
+                center_np = np.arange(start, end, dtype=np.int64)[:, None]
+                not_self = idx_np != center_np
+                if np.all(not_self.sum(axis=1) >= num_neighbours):
+                    idx_np = idx_np[not_self].reshape(end - start, -1)[:, :num_neighbours]
+                else:
+                    filtered = np.empty((end - start, num_neighbours), dtype=np.int64)
+                    for row in range(end - start):
+                        row_idx = idx_np[row][idx_np[row] != start + row]
+                        if row_idx.shape[0] < num_neighbours:
+                            row_idx = np.pad(row_idx, (0, num_neighbours - row_idx.shape[0]), mode="edge")
+                        filtered[row] = row_idx[:num_neighbours]
+                    idx_np = filtered
+
+                neighbour_idx = torch.from_numpy(np.ascontiguousarray(idx_np)).to(device=device, dtype=torch.long)
+                center_idx = torch.arange(start, end, device=device, dtype=torch.long)
+                process_neighbour_indices(center_idx, neighbour_idx)
+
+        redundancy = torch.where(torch.isfinite(min_redundancy), min_redundancy, raw_redundancy)
         return self._cap_redundancy_count(redundancy)
 
     def _finalize_redundancy_stats(self, stats, gaussian_dict, before_count, device, dtype):

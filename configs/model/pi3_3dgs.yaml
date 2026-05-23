@@ -14,7 +14,7 @@ model:
     enable_redundancy_pruning: true
     redundancy_voxel_size_ratio: 0.002
     redundancy_radius_scale: 2.0
-    redundancy_lambda_mercy: 1.0
+    redundancy_lambda_mercy: 0.1
     redundancy_minimum: 3
     redundancy_opacity_quantile: 0.5
     redundancy_max_prune_ratio: 0.5

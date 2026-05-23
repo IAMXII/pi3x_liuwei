@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gc
+import inspect
 import math
 import os
 import sys
@@ -14,7 +15,7 @@ from gsplat import rasterization
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, \
     LearnedPerceptualImagePatchSimilarity
 
-from pi3.models.pi3_3dgs_woquad import Pi3_3DGS
+from pi3.models.pi3_3dgs_9 import Pi3_3DGS
 from pi3.utils.alignment import align_depth_affine, align_depth_scale
 
 
@@ -38,7 +39,7 @@ def save_ply_binary(gaussians, path, opacity_threshold=0.05):
     color = gaussians["color"].detach().cpu().float().numpy().reshape(-1, 3)
 
     total_count = xyz.shape[0]
-    keep_mask = opacity >= opacity_threshold
+    keep_mask = opacity > opacity_threshold
     xyz = xyz[keep_mask]
     rot = rot[keep_mask]
     scale = scale[keep_mask]
@@ -935,6 +936,40 @@ def resolve_checkpoint_path(ckpt_path):
     return ckpt_path
 
 
+def infer_hydra_config_path(ckpt_path):
+    current = os.path.abspath(os.path.dirname(ckpt_path))
+    while True:
+        candidate = os.path.join(current, ".hydra", "config.yaml")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def load_model_kwargs_from_config(config_path):
+    if not config_path:
+        return {}, None
+    try:
+        import yaml
+    except ImportError:
+        print("PyYAML is not available; using built-in model defaults.")
+        return {}, None
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    model_cfg = cfg.get("model") or {}
+    valid_keys = set(inspect.signature(Pi3_3DGS.__init__).parameters)
+    valid_keys.discard("self")
+    kwargs = {
+        key: value
+        for key, value in model_cfg.items()
+        if key in valid_keys and key != "ckpt"
+    }
+    return kwargs, config_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pi3_3DGS inference with RGB/depth evaluation")
     parser.add_argument("--data_path", type=str, required=True)
@@ -950,6 +985,16 @@ def main():
                         help="Use the old behavior: build one Gaussian space per chunk instead of one for all frames.")
     parser.add_argument("--gs_view_stride", type=int, default=2,
                         help="View stride used by the model Gaussian branch. 1 uses all input views.")
+    parser.add_argument("--model_config", type=str, default=None,
+                        help="Hydra config.yaml used to restore model construction args. Default: auto-detect near ckpt.")
+    parser.add_argument("--ignore_model_config", action="store_true",
+                        help="Use hard-coded model defaults instead of ckpt-side Hydra config.")
+    parser.add_argument("--disable_quadtree", action="store_true",
+                        help="Ablation: use dense Gaussian candidates instead of quadtree-selected candidates.")
+    parser.add_argument("--disable_local_competition", action="store_true",
+                        help="Ablation: disable local competition opacity suppression.")
+    parser.add_argument("--ablation_name", type=str, default="full",
+                        help="Name written to reports, e.g. full/no_quadtree/no_local_competition/pure_gaussian.")
     parser.add_argument("--pixel_limit", type=int, default=255000)
     parser.add_argument("--subset_start", type=int, default=None, help="Start index after interval sampling")
     parser.add_argument("--subset_end", type=int, default=None, help="End index after interval sampling")
@@ -1008,28 +1053,56 @@ def main():
     aligned_dir = os.path.join(args.output_dir, "aligned_depth")
 
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA device requested, but torch.cuda.is_available() is False. "
+            "Please fix the NVIDIA driver/CUDA runtime first or pass --device cpu for a tiny smoke test."
+        )
     if args.interval < 0:
         args.interval = 10 if args.data_path.endswith(".mp4") else 1
 
     args.ckpt = resolve_checkpoint_path(args.ckpt)
     print(f"Loading Pi3_3DGS model from {args.ckpt}...")
-    print(f"Using Pi3_3DGS implementation: pi3.models.pi3_3dgs_woquad")
+    print(f"Using Pi3_3DGS implementation: pi3.models.pi3_3dgs_9")
+    print(f"Ablation: {args.ablation_name}")
+    print(f"Quadtree enabled: {not args.disable_quadtree}")
+    print(f"Local competition enabled: {not args.disable_local_competition}")
+    print("Local competition hard cap enabled: False")
     print(f"Gaussian branch view stride: {args.gs_view_stride}")
-    model = Pi3_3DGS(
-        pos_type="rope100",
-        decoder_size="large",
-        ckpt=None,
-        debug_mem=False,
-        gs_view_stride=args.gs_view_stride,
-    ).to(device).eval()
+    config_path = None if args.ignore_model_config else (args.model_config or infer_hydra_config_path(args.ckpt))
+    config_kwargs, loaded_config_path = load_model_kwargs_from_config(config_path)
+    if loaded_config_path:
+        print(f"Loaded model construction args from: {loaded_config_path}")
+
+    model_kwargs = {
+        "pos_type": "rope100",
+        "decoder_size": "large",
+        "ckpt": None,
+        "debug_mem": False,
+    }
+    model_kwargs.update(config_kwargs)
+    model_kwargs.update({
+        "ckpt": None,
+        "debug_mem": False,
+        "gs_view_stride": args.gs_view_stride,
+        "enable_quadtree": not args.disable_quadtree,
+        "enable_local_competition": not args.disable_local_competition,
+    })
+    model = Pi3_3DGS(**model_kwargs).to(device).eval()
 
     if args.ckpt.endswith(".safetensors"):
         from safetensors.torch import load_file
         weight = load_file(args.ckpt)
-        model.load_state_dict(weight, strict=False)
+        if hasattr(model, "_load_state_dict_flexible"):
+            model._load_state_dict_flexible(weight)
+        else:
+            model.load_state_dict(weight, strict=False)
     else:
         weight = torch.load(args.ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(weight, strict=False)
+        if hasattr(model, "_load_state_dict_flexible"):
+            model._load_state_dict_flexible(weight)
+        else:
+            model.load_state_dict(weight, strict=False)
 
     print(f"Loading RGB frames from {args.data_path}...")
     imgs_cpu, frame_items, orig_hw, target_hw = load_rgb_sequence(
@@ -1094,6 +1167,7 @@ def main():
 
     pred_depths_cpu = []
     frame_reports = []
+    scene_gaussian_reports = []
     global_candidate_results = None
     global_alignment = None
     scene_mode = "per_chunk_scene" if args.per_chunk_scene else "single_scene"
@@ -1116,17 +1190,39 @@ def main():
         pred_w2c = se3_inverse(pred_c2w)
         current_gaussians = select_render_gaussians(gaussians, batch_index=0)
         current_num_near = num_near[0:1] if num_near is not None else None
+        opacity_flat = current_gaussians["opacity"].detach().float().reshape(-1)
+        total_count = int(opacity_flat.numel())
+        active_count = int((opacity_flat > 0.05).sum().item())
+        stat_values = {}
+        gaussian_stats = res.get("gaussian_stats", {})
+        if isinstance(gaussian_stats, dict):
+            for stat_key, stat_tensor in gaussian_stats.items():
+                if isinstance(stat_tensor, torch.Tensor) and stat_tensor.numel() > 0:
+                    stat_flat = stat_tensor.detach().float().reshape(stat_tensor.shape[0], -1)
+                    if stat_flat.shape[0] > 0 and stat_flat.shape[1] == 1:
+                        stat_values[f"stat_{stat_key}"] = float(stat_flat[0, 0].cpu().item())
 
         ply_filename = os.path.join(args.output_dir, f"gaussians_{scene_label}.ply")
         if args.skip_save_ply:
             print(f"Skipped PLY point cloud for scene {scene_label}")
+            kept_count = active_count
+            saved_ply_path = ""
         else:
             kept_count, total_count = save_ply_binary(current_gaussians, ply_filename)
             removed_count = total_count - kept_count
+            saved_ply_path = ply_filename
             print(
                 f"Saved PLY point cloud: {ply_filename} "
-                f"({kept_count}/{total_count} kept, {removed_count} removed with opacity < 0.05)"
+                f"({kept_count}/{total_count} kept, {removed_count} removed with opacity <= 0.05)"
             )
+        scene_gaussian_reports.append({
+            "scene": scene_label,
+            "ply_path": saved_ply_path,
+            "total_count": total_count,
+            "active_count_opacity_gt_005": kept_count,
+            "opacity_threshold": 0.05,
+            **stat_values,
+        })
 
         for i, global_frame_idx in enumerate(frame_indices):
             frame_name = frame_items[global_frame_idx]["stem"]
@@ -1485,7 +1581,15 @@ def main():
         f.write(report_title + "\n")
         f.write("=" * 48 + "\n")
         f.write(f"data_path: {args.data_path}\n")
-        f.write("model_impl: pi3.models.pi3_3dgs_woquad\n")
+        f.write("model_impl: pi3.models.pi3_3dgs_9\n")
+        f.write(f"ablation_name: {args.ablation_name}\n")
+        f.write(f"quadtree_enabled: {not args.disable_quadtree}\n")
+        f.write(f"local_competition_enabled: {not args.disable_local_competition}\n")
+        f.write("local_competition_hard_cap_enabled: False\n")
+        if loaded_config_path:
+            f.write(f"model_config: {loaded_config_path}\n")
+        f.write(f"render_frames_saved: {not args.skip_save_frames}\n")
+        f.write(f"ply_saved: {not args.skip_save_ply}\n")
         f.write(f"scene_mode: {scene_mode}\n")
         f.write(f"gs_view_stride: {args.gs_view_stride}\n")
         if args.per_chunk_scene:
@@ -1550,7 +1654,37 @@ def main():
                     f"abs_rel={format_optional(candidate.get('abs_rel'))} "
                     f"d_rmse={format_optional(candidate.get('d_rmse'))}\n"
                 )
+
+        if scene_gaussian_reports:
+            f.write("\nGaussian scene counts (opacity > 0.05):\n")
+            for report in scene_gaussian_reports:
+                f.write(
+                    f"  {report['scene']}: "
+                    f"{report['active_count_opacity_gt_005']} / {report['total_count']} "
+                    f"ply={report['ply_path'] or 'skipped'}\n"
+                )
     print(f"Metrics saved to: {metrics_file}")
+
+    if scene_gaussian_reports:
+        gaussian_csv = os.path.join(args.output_dir, "gaussian_counts.csv")
+        stat_fieldnames = sorted({
+            key
+            for report in scene_gaussian_reports
+            for key in report.keys()
+            if key.startswith("stat_")
+        })
+        with open(gaussian_csv, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "scene", "ply_path", "total_count",
+                    "active_count_opacity_gt_005", "opacity_threshold",
+                    *stat_fieldnames,
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(scene_gaussian_reports)
+        print(f"Gaussian counts saved to: {gaussian_csv}")
 
     if use_depth_eval:
         frame_csv = os.path.join(args.output_dir, "depth_metrics_per_frame.csv")
