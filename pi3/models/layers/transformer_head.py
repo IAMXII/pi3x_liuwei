@@ -6,7 +6,7 @@ from torch.utils.checkpoint import checkpoint
 from .attention import FlashAttentionRope
 from .block import BlockRope
 from ..dinov2.layers import Mlp
-from .conv_head import ConvHead  # 导入全新的卷积头
+from .conv_head import ConvHead, normalized_view_plane_uv  # 导入全新的卷积头
 
 class TransformerDecoder(nn.Module):
     def __init__(self, in_dim, out_dim, dec_embed_dim=512, depth=5, dec_num_heads=8, mlp_ratio=4, rope=None,
@@ -31,6 +31,72 @@ class TransformerDecoder(nn.Module):
                 hidden = checkpoint(blk, hidden, xpos=xpos, use_reentrant=False)
             else:
                 hidden = blk(hidden, xpos=xpos)
+        return self.linear_out(hidden)
+
+
+class AlternatingViewTransformerDecoder(nn.Module):
+    """
+    GS decoder with per-view token refinement followed by cross-view fusion.
+
+    This keeps the lightweight Pi3 branch interface while borrowing the
+    frame/global alternating-attention idea used by Hunyuan/VGGT-style geometry
+    transformers.
+    """
+    def __init__(self, in_dim, out_dim, dec_embed_dim=1024, depth=5, dec_num_heads=16, mlp_ratio=4, rope=None,
+                 need_project=True, use_checkpoint=False):
+        super().__init__()
+        self.projects = nn.Linear(in_dim, dec_embed_dim) if need_project else nn.Identity()
+        self.use_checkpoint = use_checkpoint
+        self.view_blocks = nn.ModuleList([
+            BlockRope(
+                dim=dec_embed_dim, num_heads=dec_num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, proj_bias=True, ffn_bias=True, drop_path=0.0,
+                norm_layer=partial(nn.LayerNorm, eps=1e-6), act_layer=nn.GELU,
+                ffn_layer=Mlp, init_values=None, qk_norm=False,
+                attn_class=FlashAttentionRope, rope=rope
+            ) for _ in range(depth)])
+        self.fusion_blocks = nn.ModuleList([
+            BlockRope(
+                dim=dec_embed_dim, num_heads=dec_num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=True, proj_bias=True, ffn_bias=True, drop_path=0.0,
+                norm_layer=partial(nn.LayerNorm, eps=1e-6), act_layer=nn.GELU,
+                ffn_layer=Mlp, init_values=None, qk_norm=False,
+                attn_class=FlashAttentionRope, rope=rope
+            ) for _ in range(depth)])
+        self.linear_out = nn.Linear(dec_embed_dim, out_dim)
+
+    def _run_block(self, block, hidden, xpos=None):
+        if self.use_checkpoint and self.training:
+            return checkpoint(block, hidden, xpos=xpos, use_reentrant=False)
+        return block(hidden, xpos=xpos)
+
+    def forward(self, hidden, xpos=None, batch_size=None, num_views=None):
+        hidden = self.projects(hidden)
+        flat_views, seq_len, channels = hidden.shape
+
+        if batch_size is None and num_views is None:
+            batch_size = 1
+            num_views = flat_views
+        elif batch_size is None:
+            batch_size = flat_views // int(num_views)
+        elif num_views is None:
+            num_views = flat_views // int(batch_size)
+
+        batch_size = int(batch_size)
+        num_views = int(num_views)
+        if batch_size * num_views != flat_views:
+            raise ValueError(
+                f"Cannot reshape {flat_views} GS views into batch_size={batch_size}, num_views={num_views}"
+            )
+
+        for view_blk, fusion_blk in zip(self.view_blocks, self.fusion_blocks):
+            hidden = self._run_block(view_blk, hidden, xpos=xpos)
+
+            hidden_mv = hidden.reshape(batch_size, num_views * seq_len, channels)
+            xpos_mv = None if xpos is None else xpos.reshape(batch_size, num_views * seq_len, -1)
+            hidden_mv = self._run_block(fusion_blk, hidden_mv, xpos=xpos_mv)
+            hidden = hidden_mv.reshape(flat_views, seq_len, channels)
+
         return self.linear_out(hidden)
 
 
@@ -114,6 +180,101 @@ class ConvDenseGaussianHead(nn.Module):
         feat = torch.cat(out, dim=1)
         
         # 转换回 [B, H, W, 11]
+        return feat.permute(0, 2, 3, 1)
+
+
+class ImageAwareConvDenseGaussianHead(nn.Module):
+    """
+    Dense Gaussian head with an RGB image skip similar to HunyuanWorld-Mirror.
+
+    Tokens still drive the Gaussian attributes, but a shallow image merger is
+    added before the output heads so color/opacity/detail predictions can use
+    local texture cues, which is especially helpful for SSIM-oriented training.
+    """
+    def __init__(self, patch_size, dec_embed_dim, dim_out=[4, 3, 1, 3, 3, 1, 1],
+                 image_channels=3, image_gate_init=0.1):
+        super().__init__()
+        self.patch_size = patch_size
+        self.conv_head = ConvHead(
+            num_features=4,
+            dim_in=dec_embed_dim,
+            projects=nn.Identity(),
+            dim_out=dim_out,
+            dim_proj=1024,
+            dim_upsample=[256, 128, 64],
+            dim_times_res_block_hidden=2,
+            num_res_blocks=2,
+            res_block_norm='group_norm',
+            last_res_blocks=0,
+            last_conv_channels=32,
+            last_conv_size=1,
+            using_uv=True
+        )
+        self.image_merger = nn.Sequential(
+            nn.Conv2d(image_channels, 64, kernel_size=7, stride=1, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+        )
+        self.image_gate = nn.Parameter(torch.tensor(float(image_gate_init)))
+        self._init_image_and_residual_paths()
+
+    def _init_image_and_residual_paths(self):
+        # Start as a near drop-in replacement for the old head; training can open
+        # the image skip and xyz residual branch as useful signal appears.
+        nn.init.zeros_(self.image_merger[-1].weight)
+        nn.init.zeros_(self.image_merger[-1].bias)
+        if isinstance(self.conv_head.output_block, nn.ModuleList) and len(self.conv_head.output_block) > 4:
+            residual_last = self.conv_head.output_block[4][-1]
+            if isinstance(residual_last, nn.Conv2d):
+                nn.init.zeros_(residual_last.weight)
+                nn.init.zeros_(residual_last.bias)
+
+    def forward(self, decout, img_shape, image=None):
+        H, W = img_shape
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        tokens = decout[-1] if isinstance(decout, list) else decout
+
+        x = self.conv_head.projects(tokens).permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous()
+
+        img_h = patch_h * self.patch_size
+        img_w = patch_w * self.patch_size
+        for block in self.conv_head.upsample_blocks:
+            if self.conv_head.using_uv:
+                uv = normalized_view_plane_uv(
+                    width=x.shape[-1],
+                    height=x.shape[-2],
+                    aspect_ratio=img_w / img_h,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+                x = torch.cat([x, uv], dim=1)
+            for layer in block:
+                x = checkpoint(layer, x, use_reentrant=False)
+
+        x = F.interpolate(x, (img_h, img_w), mode="bilinear", align_corners=False)
+
+        if image is not None:
+            if image.dim() == 5:
+                image = image.reshape(-1, *image.shape[-3:])
+            image = image.to(device=x.device, dtype=x.dtype)
+            if image.shape[-2:] != x.shape[-2:]:
+                image = F.interpolate(image, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            x = x + self.image_gate.to(dtype=x.dtype) * self.image_merger(image)
+
+        if self.conv_head.using_uv:
+            uv = normalized_view_plane_uv(
+                width=x.shape[-1],
+                height=x.shape[-2],
+                aspect_ratio=img_w / img_h,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+            x = torch.cat([x, uv], dim=1)
+
+        out = [checkpoint(block, x, use_reentrant=False) for block in self.conv_head.output_block]
+        feat = torch.cat(out, dim=1)
         return feat.permute(0, 2, 3, 1)
 
 class AppearanceModulationHead(nn.Module):

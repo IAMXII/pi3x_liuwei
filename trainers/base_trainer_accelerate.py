@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import fnmatch
 import itertools
 import os
 import random
@@ -438,8 +439,11 @@ class BaseTrainer:
             # Perform validation at the end of each epoch
             val_stats = self.validate(epoch)
 
+            save_checkpoints = bool(self.cfg.log.get("save_checkpoints", True))
+            save_best_model = bool(self.cfg.log.get("save_best_model", save_checkpoints))
+
             current_val_metric = val_stats.get("loss", float('inf'))  # Replace "val_loss" with your metric key
-            if current_val_metric < best_val_metric:
+            if save_best_model and current_val_metric < best_val_metric:
                 best_val_metric = current_val_metric
                 best_model_path = os.path.join(
                     self.cfg.log.ckpt_dir,
@@ -450,9 +454,10 @@ class BaseTrainer:
 
             self.accelerator.wait_for_everyone()
 
-            if (
-                epoch + 1
-            ) % self.cfg.log.ckpt_interval == 0 or epoch + 1 == self.cfg.train.num_epoch:
+            if save_checkpoints and (
+                (epoch + 1) % self.cfg.log.ckpt_interval == 0
+                or epoch + 1 == self.cfg.train.num_epoch
+            ):
                 if self.accelerator.sync_gradients:
                     self.global_step = (self.iters_per_epoch * (epoch + 1)) // self.cfg.train.gradient_accumulation_steps
                     save_path = os.path.join(
@@ -690,8 +695,7 @@ class BaseTrainer:
 
                     metric_logger.update(lr=max_lr)
                     metric_logger.update(min_lr=min_lr)
-                    self.accelerator.log({"lr": max_lr}, step=start_steps)
-                    self.accelerator.log({"min_lr": min_lr}, step=start_steps)
+                    self.log_scalar_metrics({"lr": max_lr, "min_lr": min_lr}, step=start_steps)
 
                     weight_decay_value = None
                     for group in self.optimizer.param_groups:
@@ -699,10 +703,10 @@ class BaseTrainer:
                             weight_decay_value = group["weight_decay"]
                     metric_logger.update(weight_decay=weight_decay_value)
                     metric_logger.update(grad_norm=grad_norm)
-                    self.accelerator.log(
-                        {"weight_decay": weight_decay_value}, step=start_steps
+                    self.log_scalar_metrics(
+                        {"weight_decay": weight_decay_value, "grad_norm": grad_norm},
+                        step=start_steps,
                     )
-                    self.accelerator.log({"grad_norm": grad_norm}, step=start_steps)
 
                     self.global_step = start_steps
                     del forward_output, batch_output, loss, batch
@@ -714,7 +718,38 @@ class BaseTrainer:
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-    def log_all(self, output, step, prefix=""):        
+    def _format_log_key(self, key, prefix=""):
+        return f"{prefix}/{key}" if prefix else str(key)
+
+    def _metric_allowed(self, key):
+        allowlist = self.cfg.log.get("metric_allowlist", None)
+        if allowlist is None:
+            return True
+        key = str(key).lstrip("/")
+        for pattern in allowlist:
+            pattern = str(pattern).lstrip("/")
+            if pattern == "*" or fnmatch.fnmatchcase(key, pattern):
+                return True
+        return False
+
+    def log_scalar_metrics(self, metrics, step, prefix=""):
+        log_scaler = {}
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.item()
+            if not (np.isscalar(value) or isinstance(value, (int, float))):
+                continue
+            log_key = self._format_log_key(key, prefix=prefix)
+            if self._metric_allowed(log_key):
+                log_scaler[log_key] = value
+        if log_scaler:
+            self.accelerator.log(log_scaler, step)
+
+    def log_all(self, output, step, prefix=""):
         if 'log_keys' in output:
             log_keys = output.log_keys
         else:
@@ -722,6 +757,7 @@ class BaseTrainer:
 
         log_scaler = {}
         log_img = {}
+        log_images = bool(self.cfg.log.get("log_images", False))
         for k in log_keys:
             v = output[k]
             # ------------------- [修改开始: 增加对 Tensor 标量的兼容] -------------------
@@ -729,15 +765,19 @@ class BaseTrainer:
                 v = v.item()
                 
             if np.isscalar(v) or isinstance(v, (int, float)):
-                log_scaler[prefix+'/'+k] = v
+                log_key = self._format_log_key(k, prefix=prefix)
+                if self._metric_allowed(log_key):
+                    log_scaler[log_key] = v
                 continue
             # ------------------- [修改结束] -------------------
-            if isinstance(v, Image.Image):
+            if log_images and isinstance(v, Image.Image):
                 log_img[prefix+'/'+k] = v
 
-        self.accelerator.log(log_scaler, step)
-        for tracker in self.accelerator.trackers:
-            tracker.log_images(log_img, step)
+        if log_scaler:
+            self.accelerator.log(log_scaler, step)
+        if log_images and log_img:
+            for tracker in self.accelerator.trackers:
+                tracker.log_images(log_img, step)
 
     def forward_batch(self, batch, mode='train'):
         output = self.model(batch)

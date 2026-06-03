@@ -438,14 +438,14 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.4, lambda_depth=0.5, lambda_lpips=0.1,
+            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=0.5, lambda_lpips=0.1,
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
         train_conf=False, num_sky_anchors=8196, lpips_downsample=1,
         render_view_chunk_size=8, render_checkpoint=True,
         render_max_gaussians=0, render_min_gaussians=8192, render_opacity_threshold=0.0,
         enable_sparsity_loss=True, lambda_sparsity=0.02, sparsity_min_opacity=0.05,
         enable_alpha_regularization=True, lambda_alpha_regul=0.001,
-        lambda_edge=0.0, norm_strategy="mean", use_scheduled_weights=False
+        lambda_edge=0.03, norm_strategy="mean", use_scheduled_weights=False
     ):
         super().__init__()
         self.lambda_rgb = lambda_rgb
@@ -476,7 +476,6 @@ class Pi3LossGS(nn.Module):
         self.render_max_gaussians = max(0, int(render_max_gaussians))
         self.render_min_gaussians = max(1, int(render_min_gaussians))
         self.render_opacity_threshold = max(0.0, float(render_opacity_threshold))
-        self._render_chunk_target_work = 120000
         self.lpips_loss_fn = lpips.LPIPS(net='alex').eval()
         for param in self.lpips_loss_fn.parameters():
             param.requires_grad = False
@@ -503,65 +502,6 @@ class Pi3LossGS(nn.Module):
             return values.reshape(-1)[0]
         return torch.quantile(values, q)
 
-    @staticmethod
-    def _sample_flat_for_stats(values, max_values=65536):
-        values = values.detach().reshape(-1)
-        if values.numel() > max_values:
-            stride = max(1, values.numel() // max_values)
-            values = values[::stride][:max_values]
-        return values
-
-    @staticmethod
-    def _maybe_release_cuda_cache(tensor, min_slack_bytes=256 * 1024 * 1024):
-        if not torch.cuda.is_available() or not torch.is_tensor(tensor) or not tensor.is_cuda:
-            return
-        device = tensor.device
-        reserved = torch.cuda.memory_reserved(device)
-        allocated = torch.cuda.memory_allocated(device)
-        if reserved > allocated and reserved - allocated >= min_slack_bytes:
-            torch.cuda.empty_cache()
-
-    def _resolve_render_view_chunk_size(self, gaussians, H, W, N_total):
-        chunk_size = min(self.render_view_chunk_size, N_total)
-        if chunk_size <= 1 or "xyz" not in gaussians:
-            return max(1, chunk_size)
-
-        means = gaussians["xyz"]
-        if not torch.is_tensor(means) or means.ndim < 2:
-            return max(1, chunk_size)
-
-        K = int(means.shape[1])
-        pixel_scale = max(1.0, float(H * W) / 250000.0)
-        target_work = max(1, int(self._render_chunk_target_work / pixel_scale))
-        auto_chunk = max(1, target_work // max(K, 1))
-        chunk_size = min(chunk_size, auto_chunk)
-
-        if means.is_cuda and torch.cuda.is_available():
-            self._maybe_release_cuda_cache(means)
-            free_bytes, _ = torch.cuda.mem_get_info(means.device)
-            if free_bytes < 8 * 1024**3:
-                chunk_size = min(chunk_size, 1)
-            elif free_bytes < 16 * 1024**3:
-                chunk_size = min(chunk_size, 2)
-
-        return max(1, chunk_size)
-
-    def _ssim_loss(self, pred, target):
-        def ssim_fn(x, y):
-            return 1.0 - ssim(x, y, data_range=1.0)
-
-        if self.render_checkpoint and torch.is_grad_enabled() and pred.requires_grad:
-            return checkpoint(ssim_fn, pred, target, use_reentrant=False)
-        return ssim_fn(pred, target)
-
-    def _lpips_loss(self, pred, target):
-        def lpips_fn(x, y):
-            return self.lpips_loss_fn(x, y, normalize=True).mean()
-
-        if self.render_checkpoint and torch.is_grad_enabled() and pred.requires_grad:
-            return checkpoint(lpips_fn, pred, target, use_reentrant=False)
-        return lpips_fn(pred, target)
-
     def normalize_pred(self, pred, gt):
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
@@ -570,32 +510,34 @@ class Pi3LossGS(nn.Module):
         
         mask_bool = masks.squeeze(-1) 
 
-        with torch.no_grad():
-            all_dis = local_points.detach().norm(dim=-1).reshape(B, -1)
-            mask_flat = mask_bool.reshape(B, -1)
+        all_dis = local_points.norm(dim=-1).reshape(B, -1)
+        mask_flat = mask_bool.reshape(B, -1)
 
-            norm_factors = []
-            norm_stat_chunks = []
-            for b in range(B):
-                valid_dis = all_dis[b][mask_flat[b]]
-                if valid_dis.numel() == 0:
-                    valid_dis = all_dis[b]
-                valid_stat = self._sample_flat_for_stats(valid_dis, max_values=8192).float()
-                norm_stat_chunks.append(valid_stat)
+        norm_factors = []
+        norm_stat_chunks = []
+        for b in range(B):
+            valid_dis = all_dis[b][mask_flat[b]]
+            if valid_dis.numel() == 0:
+                valid_dis = all_dis[b]
+            valid_stat = valid_dis.detach().float()
+            if valid_stat.numel() > 8192:
+                stride = max(1, valid_stat.numel() // 8192)
+                valid_stat = valid_stat[::stride][:8192]
+            norm_stat_chunks.append(valid_stat)
 
-                if self.norm_strategy == "median":
-                    norm_b = valid_dis.median()
-                elif self.norm_strategy == "trimmed_mean" and valid_dis.numel() > 8:
-                    valid_float = valid_dis.float()
-                    lo = torch.quantile(valid_float, 0.1).to(dtype=valid_dis.dtype)
-                    hi = torch.quantile(valid_float, 0.9).to(dtype=valid_dis.dtype)
-                    trimmed = valid_dis[(valid_dis >= lo) & (valid_dis <= hi)]
-                    norm_b = trimmed.mean() if trimmed.numel() > 0 else valid_dis.mean()
-                else:
-                    norm_b = valid_dis.mean()
-                norm_factors.append(norm_b)
+            if self.norm_strategy == "median":
+                norm_b = valid_dis.median()
+            elif self.norm_strategy == "trimmed_mean" and valid_dis.numel() > 8:
+                valid_float = valid_dis.float()
+                lo = torch.quantile(valid_float, 0.1).to(dtype=valid_dis.dtype)
+                hi = torch.quantile(valid_float, 0.9).to(dtype=valid_dis.dtype)
+                trimmed = valid_dis[(valid_dis >= lo) & (valid_dis <= hi)]
+                norm_b = trimmed.mean() if trimmed.numel() > 0 else valid_dis.mean()
+            else:
+                norm_b = valid_dis.mean()
+            norm_factors.append(norm_b)
 
-            norm_factor = torch.stack(norm_factors).to(device=local_points.device, dtype=local_points.dtype)
+        norm_factor = torch.stack(norm_factors).to(device=local_points.device, dtype=local_points.dtype)
         norm_factor = norm_factor.clamp_min(1e-4) 
         
         local_points = local_points / norm_factor[..., None, None, None, None]
@@ -672,7 +614,6 @@ class Pi3LossGS(nn.Module):
         opacities = gaussians["opacity"]
         
         means = gaussians["xyz"]
-        self._maybe_release_cuda_cache(means)
         quats = gaussians["rotation"]
         scales = gaussians["scale"]
         colors = gaussians["color"]
@@ -767,8 +708,6 @@ class Pi3LossGS(nn.Module):
         return gathered
 
     def _select_loss_render_gaussians(self, gaussians):
-        render_keys = ("xyz", "rotation", "scale", "opacity", "color", "conf")
-        gaussians = {key: gaussians[key] for key in render_keys if key in gaussians}
         opacity = gaussians["opacity"].detach().float().squeeze(-1)
         B, K = opacity.shape
         device, dtype = opacity.device, opacity.dtype
@@ -785,14 +724,10 @@ class Pi3LossGS(nn.Module):
             ),
         }
 
-        positive_counts = (opacity > 0).sum(dim=1)
-        has_zero_padding = bool((positive_counts.min() < K).item())
-        if self.render_max_gaussians <= 0 and self.render_opacity_threshold <= 0 and not has_zero_padding:
+        if self.render_max_gaussians <= 0 and self.render_opacity_threshold <= 0:
             return gaussians, stats
 
         active_counts = (opacity > self.render_opacity_threshold).sum(dim=1)
-        if self.render_opacity_threshold <= 0 and has_zero_padding:
-            active_counts = positive_counts
         keep_count = int(active_counts.max().item())
         keep_count = max(self.render_min_gaussians, keep_count)
         if self.render_max_gaussians > 0:
@@ -856,8 +791,8 @@ class Pi3LossGS(nn.Module):
         
         depth_ratio = 1.0 - 0.5 * progress 
         cur_lambda_depth = self.lambda_depth * depth_ratio
-        pred_local_depth = pred['local_points'][..., 2:3].detach().clamp(min=-1e4, max=1e4)
-        local_depth_sample = self._sample_flat_for_stats(pred_local_depth, max_values=65536).float().abs()
+        pred_local_depth = pred['local_points'][..., 2:3].clamp(min=-1e4, max=1e4)
+        local_depth_abs = pred_local_depth.detach().float().abs()
 
         loss_rgb = loss_ssim = loss_depth = loss_sobel = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
         loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
@@ -865,9 +800,11 @@ class Pi3LossGS(nn.Module):
         loss_lpips = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
-        render_w2c = se3_inverse(pred_c2w)
+        render_c2w = pred_c2w.clone()
+
+        render_w2c = se3_inverse(render_c2w)
         
-        render_view_chunk_size = self._resolve_render_view_chunk_size(gauss_render, H, W, N_total)
+        render_view_chunk_size = min(self.render_view_chunk_size, N_total)
         if self.train_stage in [1, 2, 3]:
             photo_weight = 0
             for start in range(0, N_total, render_view_chunk_size):
@@ -886,7 +823,7 @@ class Pi3LossGS(nn.Module):
                 chunk_weight = B * n_views
 
                 loss_rgb = loss_rgb + F.l1_loss(rgb_chunk, gt_imgs_chunk) * chunk_weight
-                loss_ssim = loss_ssim + self._ssim_loss(rgb_chunk, gt_imgs_chunk) * chunk_weight
+                loss_ssim = loss_ssim + (1.0 - ssim(rgb_chunk, gt_imgs_chunk, data_range=1.0)) * chunk_weight
                 if self.lambda_edge > 0:
                     loss_sobel = loss_sobel + sobel_edge_loss(rgb_chunk, gt_imgs_chunk) * chunk_weight
 
@@ -909,7 +846,11 @@ class Pi3LossGS(nn.Module):
                     else:
                         lp_rgb = rgb_chunk
                         lp_gt = gt_imgs_chunk
-                    loss_lpips = loss_lpips + self._lpips_loss(lp_rgb, lp_gt) * chunk_weight
+                    loss_lpips = loss_lpips + self.lpips_loss_fn(
+                        lp_rgb,
+                        lp_gt,
+                        normalize=True,
+                    ).mean() * chunk_weight
                     if self.lpips_downsample < 1.0:
                         del lp_rgb, lp_gt
 
@@ -971,7 +912,7 @@ class Pi3LossGS(nn.Module):
         weight_lpips = cur_lambda_lpips if self.use_scheduled_weights else self.lambda_lpips
 
         final_loss = (
-            weight_rgb * loss_rgb +
+            weight_rgb * loss_rgb + 
             weight_ssim * loss_ssim +
             weight_depth * loss_depth +
             weight_lpips * loss_lpips +
@@ -1017,9 +958,9 @@ class Pi3LossGS(nn.Module):
                 "norm_factor_used_p90",
                 torch.tensor(0.0, device=pred_c2w.device),
             ),
-            "local_depth_p50": self._quantile_or_value(local_depth_sample, 0.50).to(device=pred_c2w.device),
-            "local_depth_p90": self._quantile_or_value(local_depth_sample, 0.90).to(device=pred_c2w.device),
-            "local_depth_p99": self._quantile_or_value(local_depth_sample, 0.99).to(device=pred_c2w.device),
+            "local_depth_p50": self._quantile_or_value(local_depth_abs, 0.50).to(device=pred_c2w.device),
+            "local_depth_p90": self._quantile_or_value(local_depth_abs, 0.90).to(device=pred_c2w.device),
+            "local_depth_p99": self._quantile_or_value(local_depth_abs, 0.99).to(device=pred_c2w.device),
             "cur_weight_rgb": torch.tensor(float(weight_rgb), device=pred_c2w.device),
             "cur_weight_ssim": torch.tensor(float(weight_ssim), device=pred_c2w.device),
             "cur_weight_depth": torch.tensor(float(weight_depth), device=pred_c2w.device),
@@ -1055,19 +996,15 @@ class Pi3LossGS(nn.Module):
             for key, value in pred["gaussian_stats"].items():
                 details[f"gaussian_{key}"] = value.detach().float().mean()
 
-        if "quadtree_stats" in pred:
-            for key, value in pred["quadtree_stats"].items():
-                details[key] = value.detach().float().mean()
-
         for key, value in render_stats.items():
             details[key] = value.detach().float().mean()
 
         # if "selected_gaussians" in pred:
         #     details["selected_gaussians"] = pred["selected_gaussians"].detach().float()
         
-        del render_w2c
+        del render_c2w, render_w2c
         if need_depth_loss:
             del gauss_render_depth
-        self._maybe_release_cuda_cache(pred_c2w) # 让 Pytorch 回收碎片显存留给 backward 用
+        torch.cuda.empty_cache() # 让 Pytorch 回收碎片显存留给 backward 用
 
         return final_loss, details

@@ -118,3 +118,5 @@ test:
     batch_size: 1              # not use, dynamic batch size
     print_freq: 10
     iters_per_test: 1000
+    eval_only_dataset: null
+    eval_only_scene: null

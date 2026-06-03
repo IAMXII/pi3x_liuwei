@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gc
+import importlib
 import inspect
 import math
 import os
@@ -10,17 +11,26 @@ from contextlib import nullcontext
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from gsplat import rasterization
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, \
     LearnedPerceptualImagePatchSimilarity
 
-from pi3.models.pi3_3dgs_9 import Pi3_3DGS
 from pi3.utils.alignment import align_depth_affine, align_depth_scale
 
 
 RGB_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 DEPTH_EXTS = RGB_EXTS + (".npy", ".npz")
+DEFAULT_MODEL_IMPL = "pi3.models.pi3_3dgs_9.Pi3_3DGS"
+MODEL_IMPL_ALIASES = {
+    "_8": "pi3.models.pi3_3dgs_8.Pi3_3DGS",
+    "8": "pi3.models.pi3_3dgs_8.Pi3_3DGS",
+    "_9": "pi3.models.pi3_3dgs_9.Pi3_3DGS",
+    "9": "pi3.models.pi3_3dgs_9.Pi3_3DGS",
+    "_10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
+    "10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
+}
 
 
 def save_heatmap(tensor, path):
@@ -232,6 +242,28 @@ def compute_target_size(width, height, pixel_limit):
     return max(1, k) * 14, max(1, m) * 14
 
 
+def parse_resolution_pair(value):
+    if isinstance(value, (list, tuple)):
+        width, height = value
+        return int(width), int(height)
+    if "x" in value:
+        width, height = value.lower().split("x", 1)
+    elif "," in value:
+        width, height = value.split(",", 1)
+    else:
+        raise ValueError(f"Resolution must look like 518x336 or 518,336, got {value!r}")
+    return int(width), int(height)
+
+
+def format_frame_name_preview(frame_items, max_items=120):
+    names = [item.get("frame_name") or os.path.basename(item.get("path") or item["stem"]) for item in frame_items]
+    if len(names) <= max_items:
+        return ";".join(names)
+    head_count = max_items // 2
+    tail_count = max_items - head_count
+    return ";".join(names[:head_count] + ["..."] + names[-tail_count:])
+
+
 def load_rgb_sequence(path, interval=1, subset_start=None, subset_end=None, subset_step=1, pixel_limit=255000):
     frame_items = []
     sources = []
@@ -296,6 +328,48 @@ def load_rgb_sequence(path, interval=1, subset_start=None, subset_end=None, subs
 
     imgs = torch.stack(tensor_list, dim=0)
     return imgs, frame_items, (orig_h, orig_w), (target_h, target_w)
+
+
+def load_three_sixty_v2_sequence(args):
+    from datasets.base.transforms import ImgToTensor
+    from datasets.three_sixty_v2_dataset import ThreeSixtyV2Dataset
+
+    target_w, target_h = parse_resolution_pair(args.dataset_resolution)
+    dataset = ThreeSixtyV2Dataset(
+        data_root=args.dataset_root,
+        mode=args.dataset_split,
+        image_dir_name=args.dataset_image_dir_name,
+        hold_every=args.dataset_hold_every,
+        frame_num=args.dataset_frame_num,
+        resolution=[[target_w, target_h]],
+        transform=ImgToTensor,
+        scene_names=args.dataset_scene,
+        z_far=0,
+        shuffle=args.dataset_shuffle_views,
+    )
+    if len(dataset) == 0:
+        raise RuntimeError(
+            f"No 360_v2 frames found for scene={args.dataset_scene}, split={args.dataset_split}, "
+            f"root={args.dataset_root}, image_dir={args.dataset_image_dir_name}."
+        )
+
+    dataset._rng = np.random.default_rng(args.dataset_seed)
+    dataset_index = args.dataset_index % len(dataset)
+    views = dataset[dataset_index]
+    imgs = torch.stack([view["img"] for view in views], dim=0)
+    target_h, target_w = imgs.shape[2], imgs.shape[3]
+    frame_items = []
+    for source_index, view in enumerate(views):
+        frame_name = str(view.get("instance", f"{source_index:06d}"))
+        frame_items.append({
+            "stem": os.path.splitext(frame_name)[0],
+            "source_index": source_index,
+            "path": None,
+            "frame_name": frame_name,
+            "dataset_scene": str(view.get("label", args.dataset_scene or "")),
+            "dataset_index": dataset_index,
+        })
+    return imgs, frame_items, (target_h, target_w), (target_h, target_w)
 
 
 def select_npz_array(npz_data):
@@ -891,7 +965,7 @@ def is_retryable_inference_error(exc):
 
 
 def select_render_gaussians(gaussians, batch_index=0):
-    render_keys = {"xyz", "rotation", "scale", "opacity", "color"}
+    render_keys = {"xyz", "rotation", "scale", "opacity", "color", "competition_color"}
     current = {
         k: v[batch_index:batch_index + 1]
         for k, v in gaussians.items()
@@ -909,6 +983,151 @@ def select_render_gaussians(gaussians, batch_index=0):
             current["conf"] = conf_tensor[batch_index:batch_index + 1]
 
     return current
+
+
+def filter_gaussians_by_opacity(gaussians, opacity_threshold=None):
+    if opacity_threshold is None:
+        return gaussians
+
+    threshold = float(opacity_threshold)
+    opacity = gaussians["opacity"].detach().float()
+    keep_mask = opacity[0].reshape(-1) > threshold
+    if not keep_mask.any() and keep_mask.numel() > 0:
+        keep_mask[int(torch.argmax(opacity[0].reshape(-1)).item())] = True
+
+    filtered = {}
+    for key, value in gaussians.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim >= 2
+            and value.shape[0] == 1
+            and value.shape[1] == keep_mask.shape[0]
+        ):
+            filtered[key] = value[:, keep_mask]
+        else:
+            filtered[key] = value
+    return filtered
+
+
+def _scatter_weighted_average(values, weights, inverse_indices, num_voxels):
+    weighted = values * weights.unsqueeze(-1)
+    out = torch.zeros((num_voxels, values.shape[-1]), device=values.device, dtype=values.dtype)
+    out.scatter_add_(0, inverse_indices[:, None].expand_as(weighted), weighted)
+    weight_sums = torch.zeros((num_voxels,), device=values.device, dtype=values.dtype)
+    weight_sums.scatter_add_(0, inverse_indices, weights)
+    return out / weight_sums.clamp_min(1e-8).unsqueeze(-1), weight_sums
+
+
+def prune_dense_gaussians_like_hunyuan(gaussians, voxel_size):
+    if voxel_size <= 0:
+        return gaussians
+
+    batch_items = []
+    max_count = 0
+    B = gaussians["xyz"].shape[0]
+    for b in range(B):
+        opacity = gaussians["opacity"][b].squeeze(-1)
+        valid = opacity > 0
+        if not valid.any():
+            batch_item = {
+                "xyz": gaussians["xyz"][b, :1],
+                "rotation": gaussians["rotation"][b, :1],
+                "scale": gaussians["scale"][b, :1],
+                "opacity": torch.zeros_like(gaussians["opacity"][b, :1]),
+                "color": gaussians["color"][b, :1],
+            }
+            batch_items.append(batch_item)
+            max_count = max(max_count, 1)
+            continue
+
+        xyz = gaussians["xyz"][b][valid]
+        rotation = gaussians["rotation"][b][valid]
+        scale = gaussians["scale"][b][valid]
+        color = gaussians["color"][b][valid]
+        weights = opacity[valid].clamp_min(1e-6)
+
+        voxel_indices = torch.floor(xyz / voxel_size).long()
+        voxel_indices = voxel_indices - voxel_indices.min(dim=0, keepdim=True).values
+        max_dims = voxel_indices.max(dim=0).values + 1
+        flat_indices = (
+            voxel_indices[:, 0] * max_dims[1] * max_dims[2]
+            + voxel_indices[:, 1] * max_dims[2]
+            + voxel_indices[:, 2]
+        )
+        _, inverse_indices = torch.unique(flat_indices, return_inverse=True)
+        num_voxels = int(inverse_indices.max().item()) + 1
+
+        xyz_merged, weight_sums = _scatter_weighted_average(xyz, weights, inverse_indices, num_voxels)
+        scale_merged, _ = _scatter_weighted_average(scale, weights, inverse_indices, num_voxels)
+        color_merged, _ = _scatter_weighted_average(color, weights, inverse_indices, num_voxels)
+        rot_merged, _ = _scatter_weighted_average(rotation, weights, inverse_indices, num_voxels)
+        rot_merged = F.normalize(rot_merged, dim=-1)
+        opacity_merged = torch.zeros((num_voxels,), device=xyz.device, dtype=xyz.dtype)
+        opacity_merged.scatter_add_(0, inverse_indices, weights * weights)
+        opacity_merged = (opacity_merged / weight_sums.clamp_min(1e-8)).unsqueeze(-1)
+
+        batch_item = {
+            "xyz": xyz_merged,
+            "rotation": rot_merged,
+            "scale": scale_merged,
+            "opacity": opacity_merged,
+            "color": color_merged,
+        }
+        batch_items.append(batch_item)
+        max_count = max(max_count, num_voxels)
+
+    padded = {key: [] for key in ("xyz", "rotation", "scale", "opacity", "color")}
+    for item in batch_items:
+        pad_len = max_count - item["xyz"].shape[0]
+        padded["xyz"].append(F.pad(item["xyz"], (0, 0, 0, pad_len), value=0.0))
+        padded["rotation"].append(F.pad(item["rotation"], (0, 0, 0, pad_len), value=1.0))
+        padded["scale"].append(F.pad(item["scale"], (0, 0, 0, pad_len), value=1e-5))
+        padded["opacity"].append(F.pad(item["opacity"], (0, 0, 0, pad_len), value=0.0))
+        padded["color"].append(F.pad(item["color"], (0, 0, 0, pad_len), value=0.0))
+    return {key: torch.stack(value, dim=0) for key, value in padded.items()}
+
+
+def build_hunyuan_like_dense_gaussians(res, imgs_batch, source_indices, args):
+    local_points = res["local_points"][:, source_indices]
+    camera_poses = res["camera_poses"][:, source_indices]
+    intrinsics = res["intrinsics"][:, source_indices]
+    src_imgs = imgs_batch[:, source_indices]
+
+    B, S, _, H, W = src_imgs.shape
+    local_flat = local_points.reshape(B, S, H * W, 3)
+    cam_rot = camera_poses[:, :, :3, :3]
+    cam_trans = camera_poses[:, :, :3, 3]
+    xyz = torch.matmul(cam_rot[:, :, None], local_flat[..., None]).squeeze(-1) + cam_trans[:, :, None]
+    xyz = xyz.reshape(B, S * H * W, 3)
+
+    colors = src_imgs.permute(0, 1, 3, 4, 2).reshape(B, S * H * W, 3).contiguous()
+    depth = local_flat[..., 2].abs().reshape(B, S * H * W)
+    fx = intrinsics[:, :, 0, 0].reshape(B, S, 1).expand(B, S, H * W).reshape(B, S * H * W).abs()
+    fy = intrinsics[:, :, 1, 1].reshape(B, S, 1).expand(B, S, H * W).reshape(B, S * H * W).abs()
+    pixel_footprint = depth * 0.5 * (fx.clamp_min(1e-6).reciprocal() + fy.clamp_min(1e-6).reciprocal())
+    scale = pixel_footprint * args.hunyuan_like_pixel_scale
+    scale = scale.clamp(min=args.hunyuan_like_scale_min, max=args.hunyuan_like_scale_max)
+    scale = scale.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+
+    rotation = torch.zeros((B, S * H * W, 4), device=xyz.device, dtype=xyz.dtype)
+    rotation[..., 0] = 1.0
+    opacity = torch.full((B, S * H * W, 1), args.hunyuan_like_opacity, device=xyz.device, dtype=xyz.dtype)
+
+    finite = torch.isfinite(xyz).all(dim=-1) & torch.isfinite(scale).all(dim=-1)
+    valid_depth = depth > args.hunyuan_like_min_depth
+    valid = finite & valid_depth
+    opacity = torch.where(valid.unsqueeze(-1), opacity, torch.zeros_like(opacity))
+
+    gaussians = {
+        "xyz": xyz,
+        "rotation": rotation,
+        "scale": scale,
+        "opacity": opacity,
+        "color": colors,
+    }
+    if args.hunyuan_like_prune:
+        gaussians = prune_dense_gaussians_like_hunyuan(gaussians, args.hunyuan_like_voxel_size)
+    return gaussians
 
 
 def format_optional(value):
@@ -948,7 +1167,14 @@ def infer_hydra_config_path(ckpt_path):
         current = parent
 
 
-def load_model_kwargs_from_config(config_path):
+def import_model_class(model_impl):
+    model_impl = MODEL_IMPL_ALIASES.get(model_impl, model_impl)
+    module_name, class_name = model_impl.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
+
+
+def load_hydra_config(config_path):
     if not config_path:
         return {}, None
     try:
@@ -959,20 +1185,35 @@ def load_model_kwargs_from_config(config_path):
 
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
+    return cfg, config_path
+
+
+def load_model_kwargs_from_config(cfg, model_cls):
     model_cfg = cfg.get("model") or {}
-    valid_keys = set(inspect.signature(Pi3_3DGS.__init__).parameters)
+    valid_keys = set(inspect.signature(model_cls.__init__).parameters)
     valid_keys.discard("self")
     kwargs = {
         key: value
         for key, value in model_cfg.items()
         if key in valid_keys and key != "ckpt"
     }
-    return kwargs, config_path
+    return kwargs
 
 
 def main():
     parser = argparse.ArgumentParser(description="Pi3_3DGS inference with RGB/depth evaluation")
-    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--data_path", type=str, default=None)
+    parser.add_argument("--eval_source", type=str, choices=["raw_folder", "three_sixty_v2_dataset"], default="raw_folder")
+    parser.add_argument("--dataset_root", type=str, default="/data/liuwei/dataset/360_v2")
+    parser.add_argument("--dataset_scene", type=str, default=None)
+    parser.add_argument("--dataset_split", type=str, choices=["train", "test", "all"], default="test")
+    parser.add_argument("--dataset_image_dir_name", type=str, default="images_4")
+    parser.add_argument("--dataset_hold_every", type=int, default=8)
+    parser.add_argument("--dataset_frame_num", type=int, default=8)
+    parser.add_argument("--dataset_resolution", type=str, default="518x336")
+    parser.add_argument("--dataset_seed", type=int, default=2024)
+    parser.add_argument("--dataset_index", type=int, default=0)
+    parser.add_argument("--dataset_shuffle_views", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--depth_path", type=str, default=None,
                         help="Directory or stack file of depth maps. If omitted and not auto-detected, depth eval is skipped.")
     parser.add_argument("--output_dir", type=str, default="output_render_campus_0425")
@@ -987,12 +1228,56 @@ def main():
                         help="View stride used by the model Gaussian branch. 1 uses all input views.")
     parser.add_argument("--model_config", type=str, default=None,
                         help="Hydra config.yaml used to restore model construction args. Default: auto-detect near ckpt.")
+    parser.add_argument("--model_impl", type=str, default=None,
+                        help="Import path for the model class. Default: use model._target_ from --model_config, then fallback to pi3.models.pi3_3dgs_9.Pi3_3DGS.")
     parser.add_argument("--ignore_model_config", action="store_true",
                         help="Use hard-coded model defaults instead of ckpt-side Hydra config.")
     parser.add_argument("--disable_quadtree", action="store_true",
                         help="Ablation: use dense Gaussian candidates instead of quadtree-selected candidates.")
     parser.add_argument("--disable_local_competition", action="store_true",
                         help="Ablation: disable local competition opacity suppression.")
+    parser.add_argument("--disable_learnable_sampling", action="store_true",
+                        help="Ablation: disable learned density extras; only proposal candidates are used.")
+    parser.add_argument("--disable_density_opacity_gate", action="store_true",
+                        help="Ablation: keep learned support sampling but stop density logits from reducing opacity.")
+    parser.add_argument("--proposal_sampling_mode", type=str, choices=["quadtree", "random_equal"], default=None,
+                        help="Override Pi3_3DGS_10 proposal sampling. random_equal keeps quadtree's per-view count but samples random pixels.")
+    parser.add_argument("--random_sampling_seed", type=int, default=None,
+                        help="Seed used by --proposal_sampling_mode random_equal.")
+    parser.add_argument("--color_source", choices=["predicted", "input"], default="predicted",
+                        help="Ablation: render with predicted RGB or the source-view input RGB attached to each Gaussian.")
+    parser.add_argument("--gaussian_mode", choices=["model", "hunyuan_like"], default="model",
+                        help="Render the model-produced Gaussians or a Hunyuan-style dense RGBDC splat baseline from the same Pi3 geometry.")
+    parser.add_argument("--hunyuan_like_pixel_scale", type=float, default=1.0,
+                        help="Pixel-footprint multiplier used by --gaussian_mode hunyuan_like.")
+    parser.add_argument("--hunyuan_like_opacity", type=float, default=0.95,
+                        help="Constant opacity used by --gaussian_mode hunyuan_like.")
+    parser.add_argument("--hunyuan_like_scale_min", type=float, default=1e-5,
+                        help="Minimum scale for --gaussian_mode hunyuan_like.")
+    parser.add_argument("--hunyuan_like_scale_max", type=float, default=0.3,
+                        help="Maximum scale for --gaussian_mode hunyuan_like, matching Hunyuan's clamp_max.")
+    parser.add_argument("--hunyuan_like_min_depth", type=float, default=1e-5,
+                        help="Minimum positive camera depth kept by --gaussian_mode hunyuan_like.")
+    parser.add_argument("--hunyuan_like_prune", action="store_true",
+                        help="Apply a Hunyuan-style voxel merge to the dense RGBDC splats.")
+    parser.add_argument("--hunyuan_like_voxel_size", type=float, default=0.002,
+                        help="Voxel size used when --hunyuan_like_prune is enabled.")
+    parser.add_argument("--density_gate_min_prob", type=float, default=None,
+                        help="Override Pi3_3DGS density_gate_min_prob for ablations.")
+    parser.add_argument("--density_gate_opacity_power", type=float, default=None,
+                        help="Override Pi3_3DGS density_gate_opacity_power for ablations.")
+    parser.add_argument("--opacity_filter_threshold", type=float, default=None,
+                        help="Override Pi3_3DGS opacity_filter_threshold for ablations.")
+    parser.add_argument("--render_opacity_threshold", type=float, default=None,
+                        help="If set, render only Gaussians with opacity above this threshold.")
+    parser.add_argument("--ply_opacity_threshold", type=float, default=0.05,
+                        help="Opacity threshold used when saving the PLY point cloud.")
+    parser.add_argument("--scale_bias_strength", type=float, default=None,
+                        help="Override Pi3_3DGS scale_bias_strength for ablations.")
+    parser.add_argument("--scale_activation_multiplier", type=float, default=None,
+                        help="Override Pi3_3DGS scale activation multiplier for ablations.")
+    parser.add_argument("--low_conf_scale_boost", type=float, default=None,
+                        help="Override Pi3_3DGS low_conf_scale_boost for ablations.")
     parser.add_argument("--ablation_name", type=str, default="full",
                         help="Name written to reports, e.g. full/no_quadtree/no_local_competition/pure_gaussian.")
     parser.add_argument("--pixel_limit", type=int, default=255000)
@@ -1004,6 +1289,8 @@ def main():
     parser.add_argument("--depth_resize_mode", type=str, choices=["sparse", "nearest"], default="sparse")
     parser.add_argument("--rgb_only", action="store_true",
                         help="Skip depth loading, alignment, and depth metrics even if depth_path can be inferred.")
+    parser.add_argument("--metric_lpips_net", type=str, choices=["alex", "vgg", "squeeze"], default="alex",
+                        help="LPIPS backbone for RGB metrics. Default alex matches Pi3LossGS training/validation loss.")
     parser.add_argument("--alignment_mode", type=str,
                         choices=["auto", "median_scale", "l2_scale", "robust_scale", "robust_rel_scale",
                                  "l2_affine", "robust_affine"],
@@ -1048,6 +1335,10 @@ def main():
                         help="Local residual consistency also limits relative depth gaps.")
     args = parser.parse_args()
     args.use_depth_sigma_filter = not args.disable_depth_sigma_filter
+    if args.eval_source == "raw_folder" and not args.data_path:
+        raise ValueError("--data_path is required when --eval_source raw_folder.")
+    if args.eval_source == "three_sixty_v2_dataset" and not args.dataset_scene:
+        raise ValueError("--dataset_scene is required when --eval_source three_sixty_v2_dataset.")
 
     os.makedirs(args.output_dir, exist_ok=True)
     aligned_dir = os.path.join(args.output_dir, "aligned_depth")
@@ -1059,18 +1350,24 @@ def main():
             "Please fix the NVIDIA driver/CUDA runtime first or pass --device cpu for a tiny smoke test."
         )
     if args.interval < 0:
-        args.interval = 10 if args.data_path.endswith(".mp4") else 1
+        args.interval = 10 if args.data_path and args.data_path.endswith(".mp4") else 1
 
     args.ckpt = resolve_checkpoint_path(args.ckpt)
     print(f"Loading Pi3_3DGS model from {args.ckpt}...")
-    print(f"Using Pi3_3DGS implementation: pi3.models.pi3_3dgs_9")
     print(f"Ablation: {args.ablation_name}")
     print(f"Quadtree enabled: {not args.disable_quadtree}")
     print(f"Local competition enabled: {not args.disable_local_competition}")
     print("Local competition hard cap enabled: False")
+    print(f"Gaussian render mode: {args.gaussian_mode}")
     print(f"Gaussian branch view stride: {args.gs_view_stride}")
     config_path = None if args.ignore_model_config else (args.model_config or infer_hydra_config_path(args.ckpt))
-    config_kwargs, loaded_config_path = load_model_kwargs_from_config(config_path)
+    cfg, loaded_config_path = load_hydra_config(config_path)
+    model_cfg = cfg.get("model") or {}
+    model_impl = args.model_impl or model_cfg.get("_target_") or DEFAULT_MODEL_IMPL
+    model_impl = MODEL_IMPL_ALIASES.get(model_impl, model_impl)
+    model_cls = import_model_class(model_impl)
+    print(f"Using Pi3_3DGS implementation: {model_impl}")
+    config_kwargs = load_model_kwargs_from_config(cfg, model_cls)
     if loaded_config_path:
         print(f"Loaded model construction args from: {loaded_config_path}")
 
@@ -1088,7 +1385,30 @@ def main():
         "enable_quadtree": not args.disable_quadtree,
         "enable_local_competition": not args.disable_local_competition,
     })
-    model = Pi3_3DGS(**model_kwargs).to(device).eval()
+    if args.disable_learnable_sampling:
+        model_kwargs["enable_learnable_sampling"] = False
+    if args.disable_density_opacity_gate:
+        model_kwargs["density_gate_opacity_power"] = 0.0
+    valid_model_keys = set(inspect.signature(model_cls.__init__).parameters)
+    for arg_name in (
+        "density_gate_min_prob",
+        "density_gate_opacity_power",
+        "opacity_filter_threshold",
+        "scale_bias_strength",
+        "scale_activation_multiplier",
+        "low_conf_scale_boost",
+    ):
+        arg_value = getattr(args, arg_name)
+        if arg_value is not None:
+            model_kwargs[arg_name] = arg_value
+    for arg_name in ("proposal_sampling_mode", "random_sampling_seed"):
+        arg_value = getattr(args, arg_name)
+        if arg_value is not None:
+            if arg_name in valid_model_keys:
+                model_kwargs[arg_name] = arg_value
+            else:
+                print(f"Warning: {model_impl} does not accept {arg_name}; ignoring override.")
+    model = model_cls(**model_kwargs).to(device).eval()
 
     if args.ckpt.endswith(".safetensors"):
         from safetensors.torch import load_file
@@ -1104,15 +1424,22 @@ def main():
         else:
             model.load_state_dict(weight, strict=False)
 
-    print(f"Loading RGB frames from {args.data_path}...")
-    imgs_cpu, frame_items, orig_hw, target_hw = load_rgb_sequence(
-        args.data_path,
-        interval=args.interval,
-        subset_start=args.subset_start,
-        subset_end=args.subset_end,
-        subset_step=args.subset_step,
-        pixel_limit=args.pixel_limit,
-    )
+    if args.eval_source == "three_sixty_v2_dataset":
+        print(
+            "Loading RGB frames from ThreeSixtyV2Dataset "
+            f"scene={args.dataset_scene}, split={args.dataset_split}..."
+        )
+        imgs_cpu, frame_items, orig_hw, target_hw = load_three_sixty_v2_sequence(args)
+    else:
+        print(f"Loading RGB frames from {args.data_path}...")
+        imgs_cpu, frame_items, orig_hw, target_hw = load_rgb_sequence(
+            args.data_path,
+            interval=args.interval,
+            subset_start=args.subset_start,
+            subset_end=args.subset_end,
+            subset_step=args.subset_step,
+            pixel_limit=args.pixel_limit,
+        )
     if imgs_cpu.numel() == 0:
         raise RuntimeError("No RGB frames loaded.")
 
@@ -1123,7 +1450,7 @@ def main():
     gt_depths_cpu = None
     depth_match_mode = None
     used_depth_unit_scale = None
-    use_depth_eval = not args.rgb_only
+    use_depth_eval = not args.rgb_only and args.eval_source == "raw_folder"
     if use_depth_eval:
         args.depth_path = resolve_depth_path(args.data_path, args.depth_path)
         if args.depth_path is None:
@@ -1145,7 +1472,10 @@ def main():
             print(f"Depth unit scale in use: {used_depth_unit_scale}")
     else:
         args.depth_path = None
-        print("RGB-only mode enabled; skipping depth loading and depth metrics.")
+        if args.eval_source == "three_sixty_v2_dataset":
+            print("Dataset-backed 360_v2 mode has no depth target here; skipping depth metrics.")
+        else:
+            print("RGB-only mode enabled; skipping depth loading and depth metrics.")
 
     if args.save_aligned_depth and use_depth_eval:
         os.makedirs(aligned_dir, exist_ok=True)
@@ -1155,7 +1485,7 @@ def main():
     print("Initializing RGB metrics (PSNR, SSIM, LPIPS)...")
     metric_psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     metric_ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    metric_lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).to(device)
+    metric_lpips = LearnedPerceptualImagePatchSimilarity(net_type=args.metric_lpips_net, normalize=True).to(device)
     all_rgb_metrics = {"psnr": [], "ssim": [], "lpips": []}
 
     if device.type == "cuda":
@@ -1173,11 +1503,14 @@ def main():
     scene_mode = "per_chunk_scene" if args.per_chunk_scene else "single_scene"
     full_scene_gs_indices = build_gaussian_input_indices(total_frames, args.gs_view_stride)
 
-    def render_scene_predictions(res, imgs_batch, frame_indices, scene_label):
+    def render_scene_predictions(res, imgs_batch, frame_indices, source_indices, scene_label):
         if not frame_indices:
             return
 
-        gaussians = res["gaussians"]
+        if args.gaussian_mode == "hunyuan_like":
+            gaussians = build_hunyuan_like_dense_gaussians(res, imgs_batch, source_indices, args)
+        else:
+            gaussians = res["gaussians"]
         pred_c2w = res["camera_poses"]
         pred_K = res["intrinsics"]
         if pred_c2w.shape[1] != len(frame_indices):
@@ -1188,11 +1521,28 @@ def main():
         num_near = gaussians.get("num_near", None)
 
         pred_w2c = se3_inverse(pred_c2w)
-        current_gaussians = select_render_gaussians(gaussians, batch_index=0)
-        current_num_near = num_near[0:1] if num_near is not None else None
+        raw_gaussians = select_render_gaussians(gaussians, batch_index=0)
+        if args.color_source == "input" and args.gaussian_mode == "model":
+            if "competition_color" not in raw_gaussians:
+                raise RuntimeError(
+                    "--color_source input requires gaussians['competition_color'], "
+                    "which is produced by pi3.models.pi3_3dgs_9."
+                )
+            raw_gaussians = dict(raw_gaussians)
+            raw_gaussians["color"] = raw_gaussians["competition_color"].to(
+                device=raw_gaussians["color"].device,
+                dtype=raw_gaussians["color"].dtype,
+            )
+        current_gaussians = filter_gaussians_by_opacity(raw_gaussians, args.render_opacity_threshold)
+        current_num_near = None if args.render_opacity_threshold is not None else (
+            num_near[0:1] if num_near is not None else None
+        )
+        raw_opacity_flat = raw_gaussians["opacity"].detach().float().reshape(-1)
+        raw_total_count = int(raw_opacity_flat.numel())
+        raw_active_count = int((raw_opacity_flat > 0.05).sum().item())
         opacity_flat = current_gaussians["opacity"].detach().float().reshape(-1)
-        total_count = int(opacity_flat.numel())
-        active_count = int((opacity_flat > 0.05).sum().item())
+        rendered_count = int(opacity_flat.numel())
+        rendered_active_count = int((opacity_flat > 0.05).sum().item())
         stat_values = {}
         gaussian_stats = res.get("gaussian_stats", {})
         if isinstance(gaussian_stats, dict):
@@ -1205,22 +1555,34 @@ def main():
         ply_filename = os.path.join(args.output_dir, f"gaussians_{scene_label}.ply")
         if args.skip_save_ply:
             print(f"Skipped PLY point cloud for scene {scene_label}")
-            kept_count = active_count
+            kept_count = rendered_count
             saved_ply_path = ""
         else:
-            kept_count, total_count = save_ply_binary(current_gaussians, ply_filename)
-            removed_count = total_count - kept_count
+            kept_count, ply_input_count = save_ply_binary(
+                current_gaussians,
+                ply_filename,
+                opacity_threshold=args.ply_opacity_threshold,
+            )
+            removed_count = ply_input_count - kept_count
             saved_ply_path = ply_filename
             print(
                 f"Saved PLY point cloud: {ply_filename} "
-                f"({kept_count}/{total_count} kept, {removed_count} removed with opacity <= 0.05)"
+                f"({kept_count}/{ply_input_count} kept, "
+                f"{removed_count} removed with opacity <= {args.ply_opacity_threshold:g})"
             )
         scene_gaussian_reports.append({
             "scene": scene_label,
             "ply_path": saved_ply_path,
-            "total_count": total_count,
-            "active_count_opacity_gt_005": kept_count,
-            "opacity_threshold": 0.05,
+            "total_count": raw_total_count,
+            "active_count_opacity_gt_005": raw_active_count,
+            "raw_total_count": raw_total_count,
+            "raw_active_count_opacity_gt_005": raw_active_count,
+            "rendered_count": rendered_count,
+            "rendered_active_count_opacity_gt_005": rendered_active_count,
+            "ply_kept_count": kept_count,
+            "opacity_threshold": args.ply_opacity_threshold,
+            "render_opacity_threshold": args.render_opacity_threshold,
+            "ply_opacity_threshold": args.ply_opacity_threshold,
             **stat_values,
         })
 
@@ -1273,7 +1635,7 @@ def main():
 
         print(f"Saved rendered frames {frame_indices[0]} - {frame_indices[-1]}")
 
-        del gaussians, pred_c2w, pred_K, pred_w2c, current_gaussians, current_num_near
+        del gaussians, raw_gaussians, pred_c2w, pred_K, pred_w2c, current_gaussians, current_num_near
 
     if args.per_chunk_scene:
         active_chunk_size = max(1, args.chunk_size)
@@ -1318,6 +1680,7 @@ def main():
                 res,
                 imgs_batch,
                 frame_indices,
+                chunk_gs_local,
                 f"chunk_{start_idx:04d}_to_{end_idx - 1:04d}",
             )
 
@@ -1359,6 +1722,7 @@ def main():
             res,
             imgs_batch,
             frame_indices,
+            full_scene_gs_indices,
             f"scene_{0:04d}_to_{total_frames - 1:04d}",
         )
 
@@ -1580,12 +1944,46 @@ def main():
         report_title = "Pi3_3DGS RGB + Depth Evaluation Report" if use_depth_eval else "Pi3_3DGS RGB Evaluation Report"
         f.write(report_title + "\n")
         f.write("=" * 48 + "\n")
-        f.write(f"data_path: {args.data_path}\n")
-        f.write("model_impl: pi3.models.pi3_3dgs_9\n")
+        f.write(f"eval_source: {args.eval_source}\n")
+        f.write(f"data_path: {args.data_path or 'N/A'}\n")
+        if args.eval_source == "three_sixty_v2_dataset":
+            f.write(f"dataset: 360_v2\n")
+            f.write(f"split: {args.dataset_split}\n")
+            f.write(f"scene: {args.dataset_scene}\n")
+            f.write(f"dataset_root: {args.dataset_root}\n")
+            f.write(f"dataset_image_dir_name: {args.dataset_image_dir_name}\n")
+            f.write(f"hold_every: {args.dataset_hold_every}\n")
+            f.write(f"dataset_frame_num: {args.dataset_frame_num}\n")
+            f.write(f"dataset_seed: {args.dataset_seed}\n")
+            f.write(f"dataset_shuffle_views: {args.dataset_shuffle_views}\n")
+        f.write(f"model_impl: {model_impl}\n")
         f.write(f"ablation_name: {args.ablation_name}\n")
         f.write(f"quadtree_enabled: {not args.disable_quadtree}\n")
         f.write(f"local_competition_enabled: {not args.disable_local_competition}\n")
         f.write("local_competition_hard_cap_enabled: False\n")
+        f.write(f"learnable_sampling_enabled: {not args.disable_learnable_sampling}\n")
+        f.write(f"density_opacity_gate_enabled: {not args.disable_density_opacity_gate}\n")
+        f.write(f"proposal_sampling_mode: {args.proposal_sampling_mode}\n")
+        f.write(f"random_sampling_seed: {args.random_sampling_seed}\n")
+        f.write(f"render_opacity_threshold: {args.render_opacity_threshold}\n")
+        f.write(f"ply_opacity_threshold: {args.ply_opacity_threshold}\n")
+        f.write(f"gaussian_mode: {args.gaussian_mode}\n")
+        f.write(f"color_source: {args.color_source}\n")
+        f.write(f"hunyuan_like_pixel_scale: {args.hunyuan_like_pixel_scale}\n")
+        f.write(f"hunyuan_like_opacity: {args.hunyuan_like_opacity}\n")
+        f.write(f"hunyuan_like_scale_min: {args.hunyuan_like_scale_min}\n")
+        f.write(f"hunyuan_like_scale_max: {args.hunyuan_like_scale_max}\n")
+        f.write(f"hunyuan_like_prune: {args.hunyuan_like_prune}\n")
+        f.write(f"hunyuan_like_voxel_size: {args.hunyuan_like_voxel_size}\n")
+        for arg_name in (
+            "density_gate_min_prob",
+            "density_gate_opacity_power",
+            "opacity_filter_threshold",
+            "scale_bias_strength",
+            "scale_activation_multiplier",
+            "low_conf_scale_boost",
+        ):
+            f.write(f"{arg_name}: {getattr(args, arg_name)}\n")
         if loaded_config_path:
             f.write(f"model_config: {loaded_config_path}\n")
         f.write(f"render_frames_saved: {not args.skip_save_frames}\n")
@@ -1603,6 +2001,7 @@ def main():
             f.write(f"depth_match_mode: {depth_match_mode}\n")
         f.write(f"frames: {total_frames}\n")
         f.write(f"model_resolution: {H}x{W}\n")
+        f.write(f"metric_lpips_net: {args.metric_lpips_net}\n")
         if use_depth_eval:
             f.write(f"depth_unit_scale: {used_depth_unit_scale}\n")
             f.write(f"alignment_scope: {args.alignment_scope}\n")
@@ -1623,6 +2022,7 @@ def main():
                 f.write(f"selected_alignment: {global_alignment['mode']}\n")
                 f.write(f"selected_scale: {global_alignment['scale']:.8f}\n")
                 f.write(f"selected_shift: {global_alignment['shift']:.8f}\n")
+        f.write(f"frame_names: {format_frame_name_preview(frame_items, max_items=240)}\n")
         f.write("\n")
         f.write(f"Average PSNR:   {avg_psnr:.4f} dB\n")
         f.write(f"Average SSIM:   {avg_ssim:.4f}\n")
@@ -1656,11 +2056,13 @@ def main():
                 )
 
         if scene_gaussian_reports:
-            f.write("\nGaussian scene counts (opacity > 0.05):\n")
+            f.write("\nGaussian scene counts:\n")
             for report in scene_gaussian_reports:
                 f.write(
                     f"  {report['scene']}: "
-                    f"{report['active_count_opacity_gt_005']} / {report['total_count']} "
+                    f"raw_active>0.05={report['raw_active_count_opacity_gt_005']} / {report['raw_total_count']}, "
+                    f"rendered={report['rendered_count']}, "
+                    f"ply_kept={report['ply_kept_count']} "
                     f"ply={report['ply_path'] or 'skipped'}\n"
                 )
     print(f"Metrics saved to: {metrics_file}")
@@ -1678,7 +2080,10 @@ def main():
                 f,
                 fieldnames=[
                     "scene", "ply_path", "total_count",
-                    "active_count_opacity_gt_005", "opacity_threshold",
+                    "active_count_opacity_gt_005", "raw_total_count",
+                    "raw_active_count_opacity_gt_005", "rendered_count",
+                    "rendered_active_count_opacity_gt_005", "ply_kept_count",
+                    "opacity_threshold", "render_opacity_threshold", "ply_opacity_threshold",
                     *stat_fieldnames,
                 ],
             )

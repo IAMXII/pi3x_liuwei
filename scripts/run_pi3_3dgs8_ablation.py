@@ -16,42 +16,65 @@ DATASETS = {
     #     "subset_end": 1346,
     #     "subset_step": 5,
     # },
-    "campus": {
-        "rgb": "/data/liuwei/dataset/ntu_seq/campus/rgb",
-        "depth": "/data/liuwei/dataset/ntu_seq/campus/depth",
-        "subset_start": 148,
-        "subset_end": 248,
-        "subset_step": 5,
-    },
-    "hku": {
-        "rgb": "/data/liuwei/dataset/ntu_seq/hku1/rgb",
-        "depth": "/data/liuwei/dataset/ntu_seq/hku1/depth",
-        "subset_start": 412,
-        "subset_end": 512,
-        "subset_step": 5,
-    },
+    # "campus": {
+    #     "rgb": "/data/liuwei/dataset/ntu_seq/campus/rgb",
+    #     "depth": "/data/liuwei/dataset/ntu_seq/campus/depth",
+    #     "subset_start": 148,
+    #     "subset_end": 248,
+    #     "subset_step": 5,
+    # },
+    # "hku": {
+    #     "rgb": "/data/liuwei/dataset/ntu_seq/hku1/rgb",
+    #     "depth": "/data/liuwei/dataset/ntu_seq/hku1/depth",
+    #     "subset_start": 412,
+    #     "subset_end": 512,
+    #     "subset_step": 5,
+    # },
     "bicycle": {
-        "rgb": "/data/liuwei/dataset/360_v2/bicycle/images",
+        "rgb": "/data/liuwei/dataset/360_v2/bicycle/images_4",
         "depth": None,
         "subset_start": 0,
-        "subset_end": 194,
-        "subset_step": 5,
+        "subset_end": 90,
+        "subset_step": 8,
     },
     "stump": {
-        "rgb": "/data/liuwei/dataset/360_v2/stump/images",
+        "rgb": "/data/liuwei/dataset/360_v2/stump/images_4",
         "depth": None,
         "subset_start": 0,
-        "subset_end": 125,
+        "subset_end": 60,
         "subset_step": 3,
     },
 }
 
 
 VARIANTS = {
-    "full": [],
-    "no_quadtree": ["--disable_quadtree"],
-    "no_local_competition": ["--disable_local_competition"],
-    "pure_gaussian": ["--disable_quadtree", "--disable_local_competition"],
+    # Full Pi3_3DGS_10 path: quadtree proposals + local competition + opacity>0.05 render set.
+    "full": [
+        "--proposal_sampling_mode", "quadtree",
+        "--render_opacity_threshold", "0.05",
+        "--ply_opacity_threshold", "0.05",
+    ],
+    # Quadtree sampling ablation: keep quadtree's per-view proposal count, but choose random pixels.
+    "random_equal_sample": [
+        "--proposal_sampling_mode", "random_equal",
+        "--render_opacity_threshold", "0.05",
+        "--ply_opacity_threshold", "0.05",
+    ],
+    # Local competition ablation requested here: no local competition and no opacity>0.05 render filter.
+    "no_local_no_opacity_filter": [
+        "--proposal_sampling_mode", "quadtree",
+        "--disable_local_competition",
+        "--render_opacity_threshold", "0.0",
+        "--ply_opacity_threshold", "0.0",
+    ],
+    # Dense all-Gaussian output: no quadtree, no local competition, no model/render/export opacity filter.
+    "pure_all_gaussians": [
+        "--disable_quadtree",
+        "--disable_local_competition",
+        "--opacity_filter_threshold", "0.0",
+        "--render_opacity_threshold", "0.0",
+        "--ply_opacity_threshold", "0.0",
+    ],
 }
 
 
@@ -78,6 +101,15 @@ def parse_metrics(report_path):
     metrics = {key: math.nan for key in METRIC_PATTERNS}
     metrics["depth_frames_used"] = ""
     metrics["depth_frames_total"] = ""
+    metrics["eval_source"] = ""
+    metrics["split"] = ""
+    metrics["scene"] = ""
+    metrics["model_impl"] = ""
+    metrics["metric_lpips_net"] = ""
+    metrics["frame_names"] = ""
+    metrics["proposal_sampling_mode"] = ""
+    metrics["render_opacity_threshold"] = ""
+    metrics["ply_opacity_threshold"] = ""
     if not report_path.is_file():
         return metrics
 
@@ -91,25 +123,53 @@ def parse_metrics(report_path):
     if frame_match:
         metrics["depth_frames_used"] = frame_match.group(1)
         metrics["depth_frames_total"] = frame_match.group(2)
+    for key in (
+        "eval_source",
+        "split",
+        "scene",
+        "model_impl",
+        "metric_lpips_net",
+        "frame_names",
+        "proposal_sampling_mode",
+        "render_opacity_threshold",
+        "ply_opacity_threshold",
+    ):
+        meta_match = re.search(rf"^{key}:\s*(.*)$", text, flags=re.MULTILINE)
+        if meta_match:
+            metrics[key] = meta_match.group(1).strip()
     return metrics
+
+
+def is_stale_report(report_path, command_path):
+    if not report_path.is_file() or not command_path.is_file():
+        return False
+    return report_path.stat().st_mtime < command_path.stat().st_mtime
 
 
 def parse_gaussian_counts(csv_path):
     total = 0
     active = 0
+    rendered = 0
+    saved = 0
     ply_paths = []
     if not csv_path.is_file():
-        return total, active, ""
+        return total, active, rendered, saved, ""
 
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            total += int(float(row.get("total_count") or 0))
-            active += int(float(row.get("active_count_opacity_gt_005") or 0))
+            raw_total = row.get("raw_total_count") or row.get("total_count") or 0
+            raw_active = row.get("raw_active_count_opacity_gt_005") or row.get("active_count_opacity_gt_005") or 0
+            rendered_count = row.get("rendered_count") or row.get("active_count_opacity_gt_005") or 0
+            saved_count = row.get("ply_kept_count") or row.get("active_count_opacity_gt_005") or 0
+            total += int(float(raw_total))
+            active += int(float(raw_active))
+            rendered += int(float(rendered_count))
+            saved += int(float(saved_count))
             ply_path = row.get("ply_path") or ""
             if ply_path:
                 ply_paths.append(ply_path)
-    return total, active, ";".join(ply_paths)
+    return total, active, rendered, saved, ";".join(ply_paths)
 
 
 def summarize_results(output_root, datasets, variants):
@@ -117,12 +177,40 @@ def summarize_results(output_root, datasets, variants):
     for dataset in datasets:
         for variant in variants:
             out_dir = output_root / dataset / variant
-            metrics = parse_metrics(out_dir / "metrics_report.txt")
-            total, active, ply_paths = parse_gaussian_counts(out_dir / "gaussian_counts.csv")
+            report_path = out_dir / "metrics_report.txt"
+            command_path = out_dir / "command.txt"
+            stale_report = is_stale_report(report_path, command_path)
+            if stale_report:
+                print(f"WARNING: stale metrics ignored for {dataset}/{variant}: {report_path}")
+                metrics = {key: math.nan for key in METRIC_PATTERNS}
+                metrics["depth_frames_used"] = ""
+                metrics["depth_frames_total"] = ""
+                metrics["eval_source"] = ""
+                metrics["split"] = ""
+                metrics["scene"] = ""
+                metrics["model_impl"] = ""
+                metrics["metric_lpips_net"] = ""
+                metrics["frame_names"] = ""
+                metrics["proposal_sampling_mode"] = ""
+                metrics["render_opacity_threshold"] = ""
+                metrics["ply_opacity_threshold"] = ""
+                total, active, rendered, saved, ply_paths = 0, 0, 0, 0, ""
+            else:
+                metrics = parse_metrics(report_path)
+                total, active, rendered, saved, ply_paths = parse_gaussian_counts(out_dir / "gaussian_counts.csv")
             rows.append({
                 "dataset": dataset,
                 "variant": variant,
                 "output_dir": str(out_dir),
+                "metrics_status": "stale_command_newer_than_report" if stale_report else "ok",
+                "eval_source": metrics["eval_source"],
+                "split": metrics["split"],
+                "scene": metrics["scene"],
+                "model_impl": metrics["model_impl"],
+                "metric_lpips_net": metrics["metric_lpips_net"],
+                "proposal_sampling_mode": metrics["proposal_sampling_mode"],
+                "render_opacity_threshold": metrics["render_opacity_threshold"],
+                "ply_opacity_threshold": metrics["ply_opacity_threshold"],
                 "psnr": metrics["psnr"],
                 "ssim": metrics["ssim"],
                 "lpips": metrics["lpips"],
@@ -135,7 +223,10 @@ def summarize_results(output_root, datasets, variants):
                 "depth_frames_total": metrics["depth_frames_total"],
                 "gaussian_total": total,
                 "gaussian_active_opacity_gt_005": active,
+                "gaussian_rendered": rendered,
+                "gaussian_saved_ply": saved,
                 "ply_paths": ply_paths,
+                "frame_names": metrics["frame_names"],
             })
 
     summary_path = output_root / "summary.csv"
@@ -156,37 +247,73 @@ def build_command(args, dataset_name, variant_name):
         args.python,
         "example_3dgs_5.py",
         "--ckpt", args.ckpt,
-        "--data_path", dataset["rgb"],
         "--output_dir", str(out_dir),
         "--device", args.device,
-        "--interval", "1",
-        "--subset_start", str(dataset["subset_start"]),
-        "--subset_end", str(dataset["subset_end"]),
-        "--subset_step", str(dataset["subset_step"]),
+        "--eval_source", args.eval_source,
         "--pixel_limit", str(args.pixel_limit),
         "--gs_view_stride", str(args.gs_view_stride),
         "--chunk_size", str(args.chunk_size),
         "--ablation_name", variant_name,
+        "--metric_lpips_net", args.metric_lpips_net,
     ]
-    if dataset.get("depth"):
+    if args.model_impl:
+        command.extend(["--model_impl", args.model_impl])
+    if args.eval_source == "raw_folder":
+        command.extend([
+            "--data_path", dataset["rgb"],
+            "--interval", "1",
+            "--subset_start", str(dataset["subset_start"]),
+            "--subset_end", str(dataset["subset_end"]),
+            "--subset_step", str(dataset["subset_step"]),
+        ])
+    else:
+        command.extend([
+            "--dataset_root", args.dataset_root,
+            "--dataset_scene", dataset.get("scene", dataset_name),
+            "--dataset_split", args.dataset_split,
+            "--dataset_image_dir_name", args.dataset_image_dir_name,
+            "--dataset_hold_every", str(args.dataset_hold_every),
+            "--dataset_frame_num", str(args.dataset_frame_num),
+            "--dataset_resolution", args.dataset_resolution,
+            "--dataset_seed", str(args.dataset_seed),
+            "--dataset_index", str(args.dataset_index),
+        ])
+        if not args.dataset_shuffle_views:
+            command.append("--no-dataset_shuffle_views")
+    if args.eval_source == "raw_folder" and dataset.get("depth"):
         command.extend(["--depth_path", dataset["depth"]])
     if args.per_chunk_scene:
         command.append("--per_chunk_scene")
     if args.save_aligned_depth:
         command.append("--save_aligned_depth")
     command.extend(VARIANTS[variant_name])
+    if variant_name == "random_equal_sample":
+        command.extend(["--random_sampling_seed", str(args.random_sampling_seed)])
     return command, out_dir
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Pi3_3DGS_8 ablations on the readme_data.md datasets.")
-    parser.add_argument("--ckpt", default="outputs/pi3_highres_0517_v8_local_comp/ckpts/best_model/model.safetensors")
-    parser.add_argument("--output_root", default="outputs/pi3_3dgs8_ablation_0517_rendered")
+    parser = argparse.ArgumentParser(description="Run Pi3_3DGS_10 ablations on the configured datasets.")
+    parser.add_argument("--ckpt", default="outputs/pi3_3dgs10_hunyuan_decoder/ckpts/best_model/model.safetensors")
+    parser.add_argument("--output_root", default="outputs/pi3_3dgs10_ablation_0530_rendered")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model_impl", default="_10", help="Full model import path or shorthand _8/_9/_10.")
+    parser.add_argument("--eval_source", choices=["raw_folder", "three_sixty_v2_dataset"], default="raw_folder")
+    parser.add_argument("--dataset_root", default="/data/liuwei/dataset/360_v2")
+    parser.add_argument("--dataset_split", choices=["train", "test", "all"], default="test")
+    parser.add_argument("--dataset_image_dir_name", default="images_4")
+    parser.add_argument("--dataset_hold_every", type=int, default=8)
+    parser.add_argument("--dataset_frame_num", type=int, default=8)
+    parser.add_argument("--dataset_resolution", default="518x336")
+    parser.add_argument("--dataset_seed", type=int, default=2024)
+    parser.add_argument("--dataset_index", type=int, default=0)
+    parser.add_argument("--dataset_shuffle_views", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--metric_lpips_net", choices=["alex", "vgg", "squeeze"], default="alex")
     parser.add_argument("--pixel_limit", type=int, default=255000)
     parser.add_argument("--gs_view_stride", type=int, default=1)
     parser.add_argument("--chunk_size", type=int, default=100)
+    parser.add_argument("--random_sampling_seed", type=int, default=2024)
     parser.add_argument("--per_chunk_scene", action="store_true")
     parser.add_argument("--save_aligned_depth", action="store_true")
     parser.add_argument("--datasets", nargs="+", choices=DATASETS.keys(), default=list(DATASETS.keys()))
@@ -203,11 +330,12 @@ def main():
         for variant_name in args.variants:
             command, out_dir = build_command(args, dataset_name, variant_name)
             command_log = out_dir / "command.txt"
-            command_log.write_text(" ".join(command) + "\n", encoding="utf-8")
 
             if args.skip_existing and (out_dir / "metrics_report.txt").is_file():
                 print(f"Skipping existing result: {dataset_name}/{variant_name}")
                 continue
+
+            command_log.write_text(" ".join(command) + "\n", encoding="utf-8")
 
             print("\n" + "=" * 80)
             print(f"Running {dataset_name}/{variant_name}")

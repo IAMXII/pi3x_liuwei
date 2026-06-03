@@ -130,6 +130,7 @@ class ThreeSixtyV2Dataset(BaseDataset):
         image_dir_name="images_4",
         hold_every=8,
         max_stride=10,
+        scene_names=None,
         verbose=False,
         **kwargs,
     ):
@@ -139,6 +140,7 @@ class ThreeSixtyV2Dataset(BaseDataset):
         self.image_dir_name = image_dir_name
         self.hold_every = int(hold_every)
         self.max_stride = int(max_stride)
+        self.scene_names = self._normalize_scene_names(scene_names)
         self.verbose = verbose
         self.dataset_label = "360_v2"
 
@@ -148,12 +150,17 @@ class ThreeSixtyV2Dataset(BaseDataset):
         self.sequences = []
         self.num_image = {}
 
-        scene_names = sorted([
+        scene_names_all = sorted([
             name for name in os.listdir(self.data_root)
             if osp.isdir(osp.join(self.data_root, name))
         ])
+        if self.scene_names is not None:
+            scene_names_all = [
+                name for name in scene_names_all
+                if name in self.scene_names
+            ]
 
-        for scene_name in scene_names:
+        for scene_name in scene_names_all:
             scene_path = osp.join(self.data_root, scene_name)
             sparse_dir = osp.join(scene_path, "sparse", "0")
             cameras_path = osp.join(sparse_dir, "cameras.bin")
@@ -203,6 +210,17 @@ class ThreeSixtyV2Dataset(BaseDataset):
 
         if self.verbose:
             print(f"[360_v2] Loaded {len(self.sequences)} scenes from {self.data_root} for {self.mode}.")
+
+    @staticmethod
+    def _normalize_scene_names(scene_names):
+        if scene_names is None or scene_names == "":
+            return None
+        if isinstance(scene_names, str):
+            raw_names = scene_names.split(",")
+        else:
+            raw_names = list(scene_names)
+        names = {str(name).strip() for name in raw_names if str(name).strip()}
+        return names or None
 
     def _resolve_image_dir(self, scene_path):
         preferred_dir = osp.join(scene_path, self.image_dir_name)

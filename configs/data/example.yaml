@@ -16,7 +16,7 @@ dataset_switches:
     real: true
     kitti: true
     waymo: true
-    "360_v2": true
+    360_v2: true
 # =========================================================
 
 train_dataset:
@@ -33,7 +33,7 @@ train_dataset:
         real: 20000
         kitti: 10000
         waymo: 10000
-        "360_v2": 5000
+        360_v2: 5000
         hypersim: 10000
 
     TarTanAir:
@@ -161,7 +161,7 @@ train_dataset:
         aug_focal: 0.9
         mode: 'train'
 
-    "360_v2":
+    360_v2:
         _target_: datasets.three_sixty_v2_dataset.ThreeSixtyV2Dataset
         data_root: /data/liuwei/dataset/360_v2
         image_dir_name: images_4
@@ -201,7 +201,7 @@ test_dataset:
         real: 2000
         kitti: 2000
         waymo: 2000
-        "360_v2": 2000
+        360_v2: 2000
 
     ScanNet:
         _target_: datasets.scannet_dataset.ScannetDataset
@@ -318,7 +318,7 @@ test_dataset:
             _target_: datasets.base.transforms.ImgToTensor
         mode: 'test'
 
-    "360_v2":
+    360_v2:
         _target_: datasets.three_sixty_v2_dataset.ThreeSixtyV2Dataset
         data_root: /data/liuwei/dataset/360_v2
         image_dir_name: images_4
@@ -345,4 +345,4 @@ test_dataset:
 
 test_dataloader:
     drop_last: False
-    shuffle: False
+    shuffle: True

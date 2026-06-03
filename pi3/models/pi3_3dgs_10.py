@@ -1,4 +1,4 @@
-# Pi3_3DGS_9 第二部分去重（局部竞争）实现简述：
+# Pi3_3DGS_10: Pi3_3DGS_9 plus Hunyuan-style GS decoding.
 # 1. forward 中每个 batch 的高斯候选合并后，调用 _apply_local_competition。
 # 2. 先估计每个高斯的局部尺度：优先用相机位姿、内参和可见像素足迹计算
 #    cube_size，并转成 local_radius；不可见或信息不足时退回由预测 scale 得到
@@ -32,7 +32,14 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.conv_head import ConvHead
 # 导入更新后的包装头
-from .layers.transformer_head import TransformerDecoder, ConvPts3dHead, ConvDenseGaussianHead, SkyGaussianHead
+from .layers.transformer_head import (
+    AlternatingViewTransformerDecoder,
+    ImageAwareConvDenseGaussianHead,
+    TransformerDecoder,
+    ConvPts3dHead,
+    ConvDenseGaussianHead,
+    SkyGaussianHead,
+)
 from .layers.camera_head import CameraHead
 from .dinov2.hub.backbones import dinov2_vitl14_reg
 import numpy as np
@@ -314,8 +321,8 @@ class Pi3_3DGS(nn.Module):
             gs_view_stride=1,
             gs_decoder_view_chunk_size=24,
             enable_quadtree=True,
-            quadtree_base_threshold=0.04,
-            quadtree_relax_factor=0.1,
+            quadtree_base_threshold=0.1,
+            quadtree_relax_factor=0.2,
             quadtree_patch_sizes=(32, 16, 8, 4, 2, 1),
             enable_redundancy_pruning=True,
             redundancy_voxel_size_ratio=0.002,
@@ -343,6 +350,9 @@ class Pi3_3DGS(nn.Module):
             redundancy_pixel_footprint_min=1e-5,
             redundancy_pixel_footprint_max_ratio=0.05,
             use_input_intrinsics=False,
+            enable_xyz_residual=True,
+            xyz_residual_scale_ratio=0.02,
+            xyz_residual_scale_min=1e-4,
             enable_learnable_sampling=True,
             learned_sampling_extra_ratio=0.10,
             learned_sampling_min_extra=128,
@@ -352,6 +362,8 @@ class Pi3_3DGS(nn.Module):
             scale_bias_strength=0.5,
             scale_activation_multiplier=0.1,
             opacity_filter_threshold=0.02,
+            proposal_sampling_mode="quadtree",
+            random_sampling_seed=2024,
             enable_local_competition=True,
             competition_voxel_size_ratio=0.002,
             competition_radius_scale=1.5,
@@ -423,6 +435,9 @@ class Pi3_3DGS(nn.Module):
         self.redundancy_pixel_footprint_min = max(float(redundancy_pixel_footprint_min), 1e-8)
         self.redundancy_pixel_footprint_max_ratio = max(float(redundancy_pixel_footprint_max_ratio), 0.0)
         self.use_input_intrinsics = bool(use_input_intrinsics)
+        self.enable_xyz_residual = bool(enable_xyz_residual)
+        self.xyz_residual_scale_ratio = max(0.0, float(xyz_residual_scale_ratio))
+        self.xyz_residual_scale_min = max(0.0, float(xyz_residual_scale_min))
         self.enable_learnable_sampling = bool(enable_learnable_sampling)
         self.learned_sampling_extra_ratio = max(0.0, float(learned_sampling_extra_ratio))
         self.learned_sampling_min_extra = max(0, int(learned_sampling_min_extra))
@@ -432,6 +447,10 @@ class Pi3_3DGS(nn.Module):
         self.scale_bias_strength = max(0.0, float(scale_bias_strength))
         self.scale_activation_multiplier = max(float(scale_activation_multiplier), 1e-8)
         self.opacity_filter_threshold = min(max(float(opacity_filter_threshold), 0.0), 1.0)
+        if proposal_sampling_mode not in ("quadtree", "random_equal"):
+            raise ValueError(f"Unsupported proposal_sampling_mode: {proposal_sampling_mode}")
+        self.proposal_sampling_mode = proposal_sampling_mode
+        self.random_sampling_seed = int(random_sampling_seed)
         self.enable_local_competition = bool(enable_local_competition)
         self.competition_voxel_size_ratio = max(0.0, float(competition_voxel_size_ratio))
         self.competition_radius_scale = max(0.0, float(competition_radius_scale))
@@ -555,11 +574,23 @@ class Pi3_3DGS(nn.Module):
             using_uv=True
         )
 
-        # 使用 ConvDenseGaussianHead 预测高斯的所有属性
-        self.gs_decoder = TransformerDecoder(in_dim=2 * self.dec_embed_dim, dec_embed_dim=1024, dec_num_heads=16,
-                                             out_dim=1024, rope=self.rope)
-        # 13 dims: rotation(4), scale(3), opacity(1), color(3), density_logit(1), scale_bias(1).
-        self.gs_head = ConvDenseGaussianHead(patch_size=14, dec_embed_dim=1024, dim_out=[4, 3, 1, 3, 1, 1])
+        # Hunyuan-style GS branch: token refinement with alternating per-view/global
+        # attention, followed by a dense image-aware head for SSIM-sensitive detail.
+        self.gs_decoder = AlternatingViewTransformerDecoder(
+            in_dim=2 * self.dec_embed_dim,
+            dec_embed_dim=1024,
+            dec_num_heads=16,
+            out_dim=1024,
+            rope=self.rope,
+        )
+        # 16 dims:
+        # rotation(4), scale(3), opacity(1), color(3),
+        # xyz_residual(3), density_logit(1), scale_bias(1).
+        self.gs_head = ImageAwareConvDenseGaussianHead(
+            patch_size=14,
+            dec_embed_dim=1024,
+            dim_out=[4, 3, 1, 3, 3, 1, 1],
+        )
 
         # self.sky_head = SkyGaussianHead(
         #     num_sky_anchors=num_sky_anchors,
@@ -636,29 +667,41 @@ class Pi3_3DGS(nn.Module):
         current_state = self.state_dict()
         compatible = {}
         skipped = []
-        old_residual_gs_head = any(
+        checkpoint_has_xyz_residual_head = any(
             key.startswith("gs_head.conv_head.output_block.6.")
             for key in checkpoint.keys()
         )
 
         for key, value in checkpoint.items():
-            target_key = key
-            if old_residual_gs_head and key.startswith("gs_head.conv_head.output_block."):
+            target_keys = [key]
+            if key.startswith("gs_decoder.blocks."):
+                target_keys = [
+                    key.replace("gs_decoder.blocks.", "gs_decoder.view_blocks.", 1),
+                    key.replace("gs_decoder.blocks.", "gs_decoder.fusion_blocks.", 1),
+                ]
+
+            if (
+                not checkpoint_has_xyz_residual_head
+                and key.startswith("gs_head.conv_head.output_block.")
+            ):
                 key_parts = key.split(".")
                 if len(key_parts) > 3 and key_parts[3].isdigit():
                     output_idx = int(key_parts[3])
-                    if output_idx == 4:
-                        skipped.append((key, tuple(value.shape), "removed_xyz_residual"))
-                        continue
-                    if output_idx > 4:
-                        key_parts[3] = str(output_idx - 1)
-                        target_key = ".".join(key_parts)
+                    if output_idx >= 4:
+                        key_parts[3] = str(output_idx + 1)
+                        target_keys = [".".join(key_parts)]
 
-            if target_key in current_state and current_state[target_key].shape == value.shape:
-                compatible[target_key] = value
-            else:
-                target_shape = tuple(current_state[target_key].shape) if target_key in current_state else None
-                skipped.append((key, tuple(value.shape), target_shape))
+            loaded_any = False
+            local_skipped = []
+            for target_key in target_keys:
+                if target_key in current_state and current_state[target_key].shape == value.shape:
+                    compatible[target_key] = value
+                    loaded_any = True
+                else:
+                    target_shape = tuple(current_state[target_key].shape) if target_key in current_state else None
+                    local_skipped.append((key, tuple(value.shape), target_shape))
+            if local_skipped and not (loaded_any and len(target_keys) > 1):
+                skipped.extend(local_skipped)
 
         res = self.load_state_dict(compatible, strict=False)
         if skipped:
@@ -666,7 +709,7 @@ class Pi3_3DGS(nn.Module):
                 f"{key}: {src}->{dst}" for key, src, dst in skipped[:8]
             )
             suffix = "" if len(skipped) <= 8 else f", ... ({len(skipped)} skipped total)"
-            print(f"[Pi3_3DGS_7] Skipped incompatible checkpoint tensors: {preview}{suffix}")
+            print(f"[Pi3_3DGS_10] Skipped incompatible checkpoint tensors: {preview}{suffix}")
         return res
 
     def _stats_tensor(self, value, device, dtype):
@@ -696,6 +739,111 @@ class Pi3_3DGS(nn.Module):
             learned_mask = torch.zeros_like(candidate_score, dtype=torch.bool)
             learned_mask[top_idx] = True
             return learned_mask.reshape_as(proposal_mask)
+
+    def _build_random_equal_support_mask(self, reference_mask, exclude_mask=None):
+        """Sample random proposals with the same per-view count as reference_mask."""
+        with torch.no_grad():
+            reference_mask = reference_mask.bool()
+            if reference_mask.ndim == 5 and reference_mask.shape[-1] == 1:
+                squeeze_last = True
+                reference = reference_mask.squeeze(-1)
+            else:
+                squeeze_last = False
+                reference = reference_mask
+
+            if exclude_mask is None:
+                excluded = torch.zeros_like(reference, dtype=torch.bool)
+            else:
+                excluded = exclude_mask.bool()
+                if excluded.ndim == 5 and excluded.shape[-1] == 1:
+                    excluded = excluded.squeeze(-1)
+
+            out = torch.zeros_like(reference, dtype=torch.bool)
+            flat_reference = reference.reshape(-1, reference.shape[-2] * reference.shape[-1])
+            flat_excluded = excluded.reshape_as(flat_reference)
+            flat_out = out.reshape_as(flat_reference)
+            device = reference.device
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.random_sampling_seed)
+
+            for row in range(flat_reference.shape[0]):
+                target_count = int(flat_reference[row].sum().item())
+                if target_count <= 0:
+                    continue
+                candidate_idx = torch.nonzero(~flat_excluded[row], as_tuple=False).flatten()
+                if candidate_idx.numel() == 0:
+                    continue
+                target_count = min(target_count, int(candidate_idx.numel()))
+                scores = torch.rand(candidate_idx.numel(), device=device, generator=generator)
+                chosen = candidate_idx[torch.topk(scores, k=target_count, largest=True).indices]
+                flat_out[row, chosen] = True
+
+            if squeeze_last:
+                return out.unsqueeze(-1)
+            return out
+
+    def _build_quadtree_center_points(self, local_pts, scale_map, exclude_mask=None):
+        """Place each quadtree representative on the cell-center ray with averaged depth."""
+        leading_shape = local_pts.shape[:-3]
+        H, W = local_pts.shape[-3], local_pts.shape[-2]
+        flat_pts = local_pts.reshape(-1, H, W, 3).permute(0, 3, 1, 2)
+        flat_z = flat_pts[:, 2:3].clamp_min(1e-8)
+        flat_ray_xy = flat_pts[:, 0:2] / flat_z
+        flat_scale = scale_map.reshape(-1, H, W, 1).permute(0, 3, 1, 2).long()
+
+        image_weight = torch.ones(
+            (flat_pts.shape[0], 1, H, W),
+            device=flat_pts.device,
+            dtype=flat_pts.dtype,
+        )
+        if exclude_mask is None:
+            valid_weight = image_weight
+        else:
+            valid_weight = (
+                ~exclude_mask.reshape(-1, H, W, 1).permute(0, 3, 1, 2).bool()
+            ).to(dtype=flat_pts.dtype)
+
+        center_pts = flat_pts
+        area_cache = {}
+        for size in self.quadtree_patch_sizes:
+            size = int(size)
+            if size <= 1:
+                continue
+
+            size_mask = flat_scale == size
+            if not size_mask.any():
+                continue
+
+            pad_h = (size - H % size) % size
+            pad_w = (size - W % size) % size
+            area = area_cache.setdefault(size, float(size * size))
+
+            weighted_ray_xy = F.pad(flat_ray_xy * valid_weight, (0, pad_w, 0, pad_h))
+            weighted_z = F.pad(flat_z * valid_weight, (0, pad_w, 0, pad_h))
+            valid_weight_pad = F.pad(valid_weight, (0, pad_w, 0, pad_h))
+            all_ray_xy = F.pad(flat_ray_xy * image_weight, (0, pad_w, 0, pad_h))
+            all_z = F.pad(flat_z * image_weight, (0, pad_w, 0, pad_h))
+            image_weight_pad = F.pad(image_weight, (0, pad_w, 0, pad_h))
+
+            valid_sum = F.avg_pool2d(valid_weight_pad, kernel_size=size, stride=size) * area
+            valid_ray_xy_sum = F.avg_pool2d(weighted_ray_xy, kernel_size=size, stride=size) * area
+            valid_z_sum = F.avg_pool2d(weighted_z, kernel_size=size, stride=size) * area
+            all_sum = F.avg_pool2d(image_weight_pad, kernel_size=size, stride=size) * area
+            all_ray_xy_sum = F.avg_pool2d(all_ray_xy, kernel_size=size, stride=size) * area
+            all_z_sum = F.avg_pool2d(all_z, kernel_size=size, stride=size) * area
+
+            valid_ray_xy_mean = valid_ray_xy_sum / valid_sum.clamp_min(1.0)
+            valid_z_mean = valid_z_sum / valid_sum.clamp_min(1.0)
+            all_ray_xy_mean = all_ray_xy_sum / all_sum.clamp_min(1.0)
+            all_z_mean = all_z_sum / all_sum.clamp_min(1.0)
+            ray_xy_mean = torch.where(valid_sum > 0, valid_ray_xy_mean, all_ray_xy_mean)
+            z_mean = torch.where(valid_sum > 0, valid_z_mean, all_z_mean)
+            block_mean = torch.cat([ray_xy_mean * z_mean, z_mean], dim=1)
+            block_mean = block_mean.repeat_interleave(size, dim=2).repeat_interleave(size, dim=3)
+            block_mean = block_mean[:, :, :H, :W]
+            center_pts = torch.where(size_mask, block_mean, center_pts)
+
+        return center_pts.permute(0, 2, 3, 1).reshape(*leading_shape, H, W, 3)
 
     def _estimate_scale_based_radius(self, gaussian_dict, scene_size_scalar, radius_scale=None):
         """Fallback local radius used when pixel-footprint estimation is unavailable.
@@ -1714,6 +1862,12 @@ class Pi3_3DGS(nn.Module):
                             (v_coords - offset) % scale_map.long() == 0)
 
                 quad_keep_mask = quad_keep_mask & (~mask_push_scale)
+                if self.proposal_sampling_mode == "random_equal":
+                    quad_keep_mask = self._build_random_equal_support_mask(
+                        quad_keep_mask,
+                        exclude_mask=mask_push_scale,
+                    )
+                    scale_map = torch.ones_like(scale_map)
         else:
             with torch.no_grad():
                 keep_shape = (B, N_sub, H, W)
@@ -1928,6 +2082,8 @@ class Pi3_3DGS(nn.Module):
             b_selected_count = 0
             b_density_sum = 0.0
             b_density_num = 0
+            b_residual_norm_sum = 0.0
+            b_residual_norm_num = 0
 
             for start in range(0, N_sub, self.gs_decoder_view_chunk_size):
                 end = min(start + self.gs_decoder_view_chunk_size, N_sub)
@@ -1938,9 +2094,13 @@ class Pi3_3DGS(nn.Module):
                 hidden_chunk = hidden_views[b, start:end].reshape(end - start, hw, -1)
                 pos_chunk = pos_views[b, start:end].reshape(end - start, hw, -1)
                 gs_h_chunk = self.gs_decoder(hidden_chunk, xpos=pos_chunk)[:, self.patch_start_idx:]
-                gs_attrs_chunk = self.gs_head([gs_h_chunk], (H, W)).reshape(end - start, H, W, 13)
+                gs_attrs_chunk = self.gs_head(
+                    [gs_h_chunk],
+                    (H, W),
+                    image=imgs_raw_sub[b, start:end],
+                ).reshape(end - start, H, W, 16)
 
-                density_logits_chunk = gs_attrs_chunk[..., 11]
+                density_logits_chunk = gs_attrs_chunk[..., 14]
                 learned_mask_chunk = self._build_learned_support_mask(
                     density_logits_chunk, proposal_mask_chunk
                 )
@@ -1954,8 +2114,19 @@ class Pi3_3DGS(nn.Module):
                 b_selected_count += int(mask_chunk.sum().item())
 
                 # 1. 提取当前 chunk 内有效点：heuristic quadtree proposal + learned density extras.
+                local_pts_chunk = local_pts_sub[b, start:end]
+                if self.enable_quadtree and quad_keep_mask[b, start:end].any():
+                    quad_center_pts_chunk = self._build_quadtree_center_points(
+                        local_pts_chunk,
+                        scale_map[b, start:end],
+                        exclude_mask=mask_push_scale[b, start:end],
+                    )
+                else:
+                    quad_center_pts_chunk = local_pts_chunk
+
                 gs_attrs_v = gs_attrs_chunk[mask_chunk]
-                local_pts_v = local_pts_sub[b, start:end][mask_chunk]
+                local_pts_v = local_pts_chunk[mask_chunk]
+                quad_center_pts_v = quad_center_pts_chunk[mask_chunk]
                 scale_map_v = scale_map[b, start:end][mask_chunk]
                 is_quad_center_v = quad_keep_mask[b, start:end][mask_chunk]
                 low_conf_v = mask_push_scale[b, start:end][mask_chunk]
@@ -1966,10 +2137,11 @@ class Pi3_3DGS(nn.Module):
                 # 及时释放 chunk 级无用显存
                 del hidden_chunk, pos_chunk, gs_h_chunk, gs_attrs_chunk
                 del proposal_mask_chunk, learned_mask_chunk, mask_chunk, density_logits_chunk
+                del local_pts_chunk, quad_center_pts_chunk
 
                 # 2. 先解析 learnable density gate。gate 不只负责候选点补充，
                 #    还以可导方式调制 opacity，使密度分配本身能吃到渲染梯度。
-                density_prob_v = torch.sigmoid(gs_attrs_v[:, 11:12] / self.density_gate_temperature)
+                density_prob_v = torch.sigmoid(gs_attrs_v[:, 14:15] / self.density_gate_temperature)
                 gated_density = density_prob_v.clamp_min(self.density_gate_min_prob)
                 base_opacity_v = torch.sigmoid(gs_attrs_v[:, 7:8])
                 opacity_v = base_opacity_v * gated_density.pow(self.density_gate_opacity_power)
@@ -1984,6 +2156,7 @@ class Pi3_3DGS(nn.Module):
                 # 应用过滤
                 gs_attrs_v = gs_attrs_v[valid_mask]
                 local_pts_v = local_pts_v[valid_mask]
+                quad_center_pts_v = quad_center_pts_v[valid_mask]
                 scale_map_v = scale_map_v[valid_mask]
                 is_quad_center_v = is_quad_center_v[valid_mask]
                 low_conf_v = low_conf_v[valid_mask]
@@ -2000,19 +2173,35 @@ class Pi3_3DGS(nn.Module):
                     * self.scale_activation_multiplier
                 )
                 color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
-                scale_bias_v = torch.tanh(gs_attrs_v[:, 12:13])
+                residual_raw_v = torch.tanh(gs_attrs_v[:, 11:14])
+                scale_bias_v = torch.tanh(gs_attrs_v[:, 15:16])
 
                 # 【修复 OOM 广播灾难】：强制转为 (N, 1) 的形状，避免 N x N 维度爆炸
                 mask_low = low_conf_v.view(-1, 1)
                 mask_quad = is_quad_center_v.view(-1, 1)
                 map_scale = scale_map_v.view(-1, 1)
 
+                # Quadtree representatives sit at the averaged 3D center of their cell.
+                local_pts_v = torch.where(mask_quad, quad_center_pts_v, local_pts_v)
                 scale_v = torch.where(mask_low, scale_v * self.low_conf_scale_boost, scale_v)
                 scale_v = torch.where(mask_quad, scale_v * map_scale, scale_v)
                 scale_v = scale_v * torch.exp(self.scale_bias_strength * scale_bias_v)
 
+                if self.enable_xyz_residual and self.xyz_residual_scale_ratio > 0:
+                    residual_radius = (
+                        scene_size[b].to(device=local_pts_v.device, dtype=local_pts_v.dtype)
+                        * self.xyz_residual_scale_ratio
+                    ).clamp_min(self.xyz_residual_scale_min)
+                    local_xyz_residual_v = residual_raw_v * residual_radius
+                    local_pts_v = local_pts_v + local_xyz_residual_v
+                else:
+                    local_xyz_residual_v = torch.zeros_like(local_pts_v)
+
                 b_density_sum += float(density_prob_v.detach().float().sum().item())
                 b_density_num += int(density_prob_v.numel())
+                residual_norm_v = local_xyz_residual_v.detach().float().norm(dim=-1)
+                b_residual_norm_sum += float(residual_norm_v.sum().item())
+                b_residual_norm_num += int(residual_norm_v.numel())
 
                 cam_poses_v = camera_poses_sub[b, view_idx_v]
                 cam_rot_v = cam_poses_v[:, :3, :3]
@@ -2033,8 +2222,8 @@ class Pi3_3DGS(nn.Module):
                 b_source_view.append(view_idx_v)
                 b_comp_color.append(comp_color_v)
 
-                del gs_attrs_v, local_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
-                del density_prob_v, scale_bias_v
+                del gs_attrs_v, local_pts_v, quad_center_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
+                del density_prob_v, residual_raw_v, scale_bias_v, local_xyz_residual_v, residual_norm_v
 
             # 当前 Batch 视角处理完毕，合并结果兜底
             if len(b_xyz) > 0:
@@ -2065,7 +2254,9 @@ class Pi3_3DGS(nn.Module):
                 stats_b["density_gate_mean"] = self._stats_tensor(
                     b_density_sum / max(b_density_num, 1), imgs.device, imgs.dtype
                 )
-                stats_b["xyz_residual_norm"] = self._stats_tensor(0.0, imgs.device, imgs.dtype)
+                stats_b["xyz_residual_norm"] = self._stats_tensor(
+                    b_residual_norm_sum / max(b_residual_norm_num, 1), imgs.device, imgs.dtype
+                )
                 fused_gaussians.append(gaussian_b)
                 redundancy_stats.append(stats_b)
             else:
