@@ -494,11 +494,12 @@ def main():
         gaussians = res["gaussians"]
         pred_c2w = res["camera_poses"]
         pred_K = res["intrinsics"]
-        num_near = gaussians.get("num_near", None)
-
         pred_w2c = se3_inverse(pred_c2w)
         current_gaussians = select_render_gaussians(gaussians, batch_index=0)
-        current_num_near = num_near[0:1] if isinstance(num_near, torch.Tensor) else None
+        # Render all valid Gaussians. Some model variants append pushed/far
+        # support Gaussians after the near slice; truncating by num_near leaves
+        # visible RGB holes.
+        current_num_near = None
 
         ply_filename = os.path.join(args.output_dir, f"gaussians_chunk_{start_idx:04d}_to_{end_idx - 1:04d}.ply")
         save_ply_binary(current_gaussians, ply_filename)

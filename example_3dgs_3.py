@@ -792,11 +792,11 @@ def main():
                 f"Model returned {pred_c2w.shape[1]} camera poses for {len(frame_indices)} render frames."
             )
 
-        num_near = gaussians.get("num_near", None)
-
         pred_w2c = se3_inverse(pred_c2w)
         current_gaussians = select_render_gaussians(gaussians, batch_index=0)
-        current_num_near = num_near[0:1] if num_near is not None else None
+        # Render all valid Gaussians; pushed/far support can live after any
+        # legacy num_near slice and should still contribute RGB.
+        current_num_near = None
 
         ply_filename = os.path.join(args.output_dir, f"gaussians_{scene_label}.ply")
         save_ply_binary(current_gaussians, ply_filename)

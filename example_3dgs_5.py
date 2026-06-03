@@ -125,6 +125,7 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
     opacities = gaussians["opacity"]
     colors = gaussians["color"]
     conf = gaussians.get("conf", None)
+    pushed = gaussians.get("pushed", None)
 
     B = means.shape[0]
 
@@ -138,6 +139,8 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
             colors = colors[:, :max_N]
             if isinstance(conf, torch.Tensor):
                 conf = conf[:, :max_N]
+            if isinstance(pushed, torch.Tensor):
+                pushed = pushed[:, :max_N]
 
             range_seq = torch.arange(max_N, device=means.device).expand(B, max_N)
             valid_mask = range_seq < num_gaussians.unsqueeze(1)
@@ -151,6 +154,8 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
             colors = colors[:, :limit]
             if isinstance(conf, torch.Tensor):
                 conf = conf[:, :limit]
+            if isinstance(pushed, torch.Tensor):
+                pushed = pushed[:, :limit]
 
     rgb, alpha, _ = rasterization(
         means=means.contiguous().float(),
@@ -166,7 +171,21 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
         packed=False,
     )
 
-    if isinstance(conf, torch.Tensor):
+    if isinstance(pushed, torch.Tensor):
+        if pushed.ndim == 2:
+            pushed = pushed.unsqueeze(-1)
+        if pushed.shape[0] == opacities.shape[0] and pushed.shape[1] == opacities.shape[1]:
+            opacities_depth = torch.where(
+                pushed.to(device=opacities.device) > 0.5,
+                torch.zeros_like(opacities),
+                opacities,
+            )
+        else:
+            raise RuntimeError(
+                "gaussians['pushed'] must align with opacity for depth rendering. "
+                f"Got pushed shape {tuple(pushed.shape)} and opacity shape {tuple(opacities.shape)}."
+            )
+    elif isinstance(conf, torch.Tensor):
         conf_prob = torch.sigmoid(conf)
         if conf_prob.ndim == 2:
             conf_prob = conf_prob.unsqueeze(-1)
@@ -965,7 +984,7 @@ def is_retryable_inference_error(exc):
 
 
 def select_render_gaussians(gaussians, batch_index=0):
-    render_keys = {"xyz", "rotation", "scale", "opacity", "color", "competition_color"}
+    render_keys = {"xyz", "rotation", "scale", "opacity", "color", "competition_color", "pushed"}
     current = {
         k: v[batch_index:batch_index + 1]
         for k, v in gaussians.items()
@@ -1518,8 +1537,6 @@ def main():
                 f"Model returned {pred_c2w.shape[1]} camera poses for {len(frame_indices)} render frames."
             )
 
-        num_near = gaussians.get("num_near", None)
-
         pred_w2c = se3_inverse(pred_c2w)
         raw_gaussians = select_render_gaussians(gaussians, batch_index=0)
         if args.color_source == "input" and args.gaussian_mode == "model":
@@ -1534,9 +1551,11 @@ def main():
                 dtype=raw_gaussians["color"].dtype,
             )
         current_gaussians = filter_gaussians_by_opacity(raw_gaussians, args.render_opacity_threshold)
-        current_num_near = None if args.render_opacity_threshold is not None else (
-            num_near[0:1] if num_near is not None else None
-        )
+        # Render all valid Gaussians. Some model variants append pushed/far
+        # support Gaussians after the near slice; truncating by num_near leaves
+        # visible RGB holes. Optional opacity filtering above is the only render
+        # pruning applied here.
+        current_num_near = None
         raw_opacity_flat = raw_gaussians["opacity"].detach().float().reshape(-1)
         raw_total_count = int(raw_opacity_flat.numel())
         raw_active_count = int((raw_opacity_flat > 0.05).sum().item())

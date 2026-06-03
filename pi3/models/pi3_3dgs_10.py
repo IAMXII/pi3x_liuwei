@@ -2077,6 +2077,8 @@ class Pi3_3DGS(nn.Module):
             #####
             # --- 优化后的高斯解析逻辑 ---
             b_xyz, b_rot, b_scale, b_opacity, b_color, b_conf, b_source_view, b_comp_color = [], [], [], [], [], [], [], []
+            b_pushed = []
+            export_pushed_mask = not self.training
             b_proposal_count = 0
             b_learned_extra_count = 0
             b_selected_count = 0
@@ -2219,6 +2221,7 @@ class Pi3_3DGS(nn.Module):
                 b_opacity.append(opacity_v)
                 b_color.append(color_v)
                 b_conf.append(conf_v)
+                b_pushed.append(mask_low.to(dtype=opacity_v.dtype))
                 b_source_view.append(view_idx_v)
                 b_comp_color.append(comp_color_v)
 
@@ -2237,6 +2240,8 @@ class Pi3_3DGS(nn.Module):
                     "competition_color": torch.cat(b_comp_color, dim=0),
                     "source_view": torch.cat(b_source_view, dim=0),
                 }
+                if export_pushed_mask:
+                    gaussian_b["pushed"] = torch.cat(b_pushed, dim=0)
                 source_view_b = torch.cat(b_source_view, dim=0)
                 # Local competition now includes color-aware redundancy scoring,
                 # redundancy-coefficient activation, and soft opacity suppression.
@@ -2272,6 +2277,8 @@ class Pi3_3DGS(nn.Module):
                     "competition_color": torch.zeros((1, 3), device=imgs.device) + grad_anchor,
                     "source_view": torch.zeros((1,), device=imgs.device, dtype=torch.long),
                 }
+                if export_pushed_mask:
+                    gaussian_b["pushed"] = torch.zeros((1, 1), device=imgs.device) + grad_anchor
                 source_view_b = torch.zeros((1,), device=imgs.device, dtype=torch.long)
                 # Local competition now includes color-aware redundancy scoring,
                 # redundancy-coefficient activation, and soft opacity suppression.
@@ -2292,7 +2299,9 @@ class Pi3_3DGS(nn.Module):
                 redundancy_stats.append(stats_b)
         # 对齐 Batch 内高斯数量
         max_k = max(g["xyz"].size(0) for g in fused_gaussians)
+        export_pushed_mask = any("pushed" in g for g in fused_gaussians)
         d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out, d_conf_out = [], [], [], [], [], []
+        d_pushed_out = []
         d_comp_color_out, d_source_view_out = [], []
         d_redundancy_score_out, d_redundancy_coef_out, d_comp_gate_out, d_comp_active_out = [], [], [], []
         for g in fused_gaussians:
@@ -2303,6 +2312,11 @@ class Pi3_3DGS(nn.Module):
             d_opacity_out.append(F.pad(g["opacity"], (0, 0, 0, pad_len), value=0.0))
             d_color_out.append(F.pad(g["color"], (0, 0, 0, pad_len), value=0.0))
             d_conf_out.append(F.pad(g["conf"], (0, 0, 0, pad_len), value=-20.0))
+            if export_pushed_mask:
+                pushed = g.get("pushed")
+                if pushed is None:
+                    pushed = torch.zeros_like(g["opacity"])
+                d_pushed_out.append(F.pad(pushed, (0, 0, 0, pad_len), value=0.0))
             d_comp_color_out.append(F.pad(g["competition_color"], (0, 0, 0, pad_len), value=0.0))
             d_source_view_out.append(F.pad(g["source_view"], (0, pad_len), value=-1))
             d_redundancy_score_out.append(F.pad(g["redundancy_score"], (0, 0, 0, pad_len), value=0.0))
@@ -2325,6 +2339,8 @@ class Pi3_3DGS(nn.Module):
             "competition_gate": torch.stack(d_comp_gate_out, dim=0),
             "competition_active": torch.stack(d_comp_active_out, dim=0),
         }
+        if export_pushed_mask:
+            gaussians["pushed"] = torch.stack(d_pushed_out, dim=0)
         gaussian_stats = {
             key: torch.stack([stats[key] for stats in redundancy_stats], dim=0)
             for key in redundancy_stats[0].keys()
