@@ -48,16 +48,18 @@ DATASETS = {
 
 
 VARIANTS = {
-    # Full Pi3_3DGS_10 path: quadtree proposals + local competition + opacity>0.05 render set.
+    # Full Pi3_3DGS_10 path: quadtree proposals + local competition.
+    # RGB rendering must keep pushed/far support Gaussians; only PLY export uses
+    # the opacity threshold.
     "full": [
         "--proposal_sampling_mode", "quadtree",
-        "--render_opacity_threshold", "0.05",
+        "--render_opacity_threshold", "0.0",
         "--ply_opacity_threshold", "0.05",
     ],
     # Quadtree sampling ablation: keep quadtree's per-view proposal count, but choose random pixels.
     "random_equal_sample": [
         "--proposal_sampling_mode", "random_equal",
-        "--render_opacity_threshold", "0.05",
+        "--render_opacity_threshold", "0.0",
         "--ply_opacity_threshold", "0.05",
     ],
     # Local competition ablation requested here: no local competition and no opacity>0.05 render filter.
@@ -245,7 +247,7 @@ def build_command(args, dataset_name, variant_name):
 
     command = [
         args.python,
-        "example_3dgs_5.py",
+        "example_3dgs_6.py",
         "--ckpt", args.ckpt,
         "--output_dir", str(out_dir),
         "--device", args.device,
