@@ -1,0 +1,366 @@
+# @package _global_
+
+# Portable RGB-focused pack generated under:
+#   /data/liuwei/dataset/pi3_rgb_pack
+#
+# These roots keep the existing dataset classes usable with images plus their
+# required camera/split metadata, while omitting depth/mask/raw files.
+
+# =========================================================
+# 🎛️ 数据集全局控制面板 (True 开启，False 关闭)
+# =========================================================
+dataset_switches:
+    tartanair: false
+    scannet: false
+    co3dv2: true
+    wildrgbd: true
+    matrixcity: true
+    mapfree: false
+    midair: true
+    hypersim: true
+    ntu: true
+    real: true
+    kitti: true
+    waymo: true
+    360_v2: true
+# =========================================================
+
+train_dataset:
+    length: 200000         # dummy
+
+    # 这里的权重都会保留，但在代码中可以通过读取 enabled 状态来决定是否使用该权重
+    weights: 
+        co3dv2: 10000
+        wildrgbd: 10000
+        matrixcity: 10000
+        midair: 10000
+        # mapfree: 10000
+        ntu: 10000
+        real: 20000
+        kitti: 10000
+        waymo: 10000
+        360_v2: 5000
+        hypersim: 10000
+
+    TarTanAir:
+        _target_: datasets.tartanair_dataset.TarTanAirDataset
+        z_far: 80
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    ScanNet:
+        _target_: datasets.scannet_dataset.ScannetDataset
+        z_far: 80
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    co3dv2:
+        _target_: datasets.co3dv2_dataset.CO3DV2Dataset
+        root_dir: /data/liuwei/dataset/pi3_rgb_pack/co3dv2_processed
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    wildrgbd:
+        _target_: datasets.wildrgbd_dataset.WildRGBDDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/wildrgbd_processed
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+    
+    matrixcity:
+        _target_: datasets.matrixcity_dataset.MatrixCityDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/matrixcity_processed
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    mapfree:
+        _target_: datasets.mapfree_dataset.MapFreeDataset
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    midair:
+        _target_: datasets.midair_dataset.MidAirDataset
+        root_dir: /data/liuwei/dataset/pi3_rgb_pack/MidAir
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    ntu:
+        _target_: datasets.ntu_dataset.NTUDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/ntu_seq
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    real:
+        _target_: datasets.real_dataset.RealDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/real
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    kitti:
+        _target_: datasets.kitti_dataset.KITTIDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/kitti360/KITTI-360/data_2d_raw
+        use_rectified_intrinsics: true
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    waymo:
+        _target_: datasets.waymo_dataset.WaymoDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/waymo
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    360_v2:
+        _target_: datasets.three_sixty_v2_dataset.ThreeSixtyV2Dataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/360_v2
+        image_dir_name: images_4
+        hold_every: 8
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+    hypersim:
+        _target_: datasets.hypersim_dataset.HyperSimDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/hypersim_processed
+        z_far: 0
+        frame_num: 8
+        aug_crop: 16
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.NoTransform
+        aug_focal: 0.9
+        mode: 'train'
+
+train_dataloader:
+    drop_last: True
+    shuffle: True
+
+test_dataset:
+    weights: 
+        co3dv2: 2000
+        wildrgbd: 2000
+        matrixcity: 2000
+        midair: 2000
+        hypersim: 2000
+        ntu: 2000
+        real: 2000
+        kitti: 2000
+        waymo: 2000
+        360_v2: 2000
+
+    ScanNet:
+        _target_: datasets.scannet_dataset.ScannetDataset
+        z_far: 80
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    co3dv2:
+        _target_: datasets.co3dv2_dataset.CO3DV2Dataset
+        root_dir: /data/liuwei/dataset/pi3_rgb_pack/co3dv2_processed
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    wildrgbd:
+        _target_: datasets.wildrgbd_dataset.WildRGBDDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/wildrgbd_processed
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    matrixcity:
+        _target_: datasets.matrixcity_dataset.MatrixCityDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/matrixcity_processed
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    mapfree:
+        _target_: datasets.mapfree_dataset.MapFreeDataset
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    midair:
+        _target_: datasets.midair_dataset.MidAirDataset
+        root_dir: /data/liuwei/dataset/pi3_rgb_pack/MidAir
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    ntu:
+
+        _target_: datasets.ntu_dataset.NTUDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/ntu_seq
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    real:
+        _target_: datasets.real_dataset.RealDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/real
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    kitti:
+        _target_: datasets.kitti_dataset.KITTIDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/kitti360/KITTI-360/data_2d_raw
+        use_rectified_intrinsics: true
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    waymo:
+        _target_: datasets.waymo_dataset.WaymoDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/waymo
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    360_v2:
+        _target_: datasets.three_sixty_v2_dataset.ThreeSixtyV2Dataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/360_v2
+        image_dir_name: images_4
+        hold_every: 8
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+    hypersim:
+        _target_: datasets.hypersim_dataset.HyperSimDataset
+        data_root: /data/liuwei/dataset/pi3_rgb_pack/hypersim_processed
+        z_far: 0
+        frame_num: 8
+        resolution:
+            - [518, 336]
+        transform:
+            _partial_: true
+            _target_: datasets.base.transforms.ImgToTensor
+        mode: 'test'
+
+test_dataloader:
+    drop_last: False
+    shuffle: True
