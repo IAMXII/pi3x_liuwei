@@ -1,2 +1,0 @@
-num_total,num_active,num_low_conf_active,num_normal_active,low_conf_active_ratio,mean_scale_active,mean_scale_low_conf,mean_scale_normal,mean_conf_active,chunk_start,chunk_end
-2037549,2037549,6490,2031059,0.0031851994725034835,0.00169012148398906,0.005855293478816748,0.0016768118366599083,0.6656284332275391,0,33

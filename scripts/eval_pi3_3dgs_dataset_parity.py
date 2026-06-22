@@ -24,6 +24,8 @@ MODEL_IMPL_ALIASES = {
     "8": "pi3.models.pi3_3dgs_8.Pi3_3DGS",
     "_9": "pi3.models.pi3_3dgs_9.Pi3_3DGS",
     "9": "pi3.models.pi3_3dgs_9.Pi3_3DGS",
+    "_10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
+    "10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
 }
 
 
@@ -273,7 +275,7 @@ def main():
     parser.add_argument("--dataset_index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--model_impl", default=None, help="Use full import path or shorthand _8/_9.")
+    parser.add_argument("--model_impl", default=None, help="Use full import path or shorthand _8/_9/_10.")
     parser.add_argument("--output_dir", default="outputs/pi3_3dgs_dataset_parity")
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--image_dir_name", default=None)

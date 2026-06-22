@@ -6,7 +6,7 @@ from torch.utils.checkpoint import checkpoint
 from .attention import FlashAttentionRope
 from .block import BlockRope
 from ..dinov2.layers import Mlp
-from .conv_head import ConvHead, normalized_view_plane_uv  # 导入全新的卷积头
+from .conv_head import ConvHead, ResidualConvBlock, normalized_view_plane_uv  # 导入全新的卷积头
 
 class TransformerDecoder(nn.Module):
     def __init__(self, in_dim, out_dim, dec_embed_dim=512, depth=5, dec_num_heads=8, mlp_ratio=4, rope=None,
@@ -70,9 +70,10 @@ class AlternatingViewTransformerDecoder(nn.Module):
             return checkpoint(block, hidden, xpos=xpos, use_reentrant=False)
         return block(hidden, xpos=xpos)
 
-    def forward(self, hidden, xpos=None, batch_size=None, num_views=None):
+    def forward(self, hidden, xpos=None, batch_size=None, num_views=None, return_intermediate=False):
         hidden = self.projects(hidden)
         flat_views, seq_len, channels = hidden.shape
+        intermediates = []
 
         if batch_size is None and num_views is None:
             batch_size = 1
@@ -96,7 +97,11 @@ class AlternatingViewTransformerDecoder(nn.Module):
             xpos_mv = None if xpos is None else xpos.reshape(batch_size, num_views * seq_len, -1)
             hidden_mv = self._run_block(fusion_blk, hidden_mv, xpos=xpos_mv)
             hidden = hidden_mv.reshape(flat_views, seq_len, channels)
+            if return_intermediate:
+                intermediates.append(self.linear_out(hidden))
 
+        if return_intermediate:
+            return intermediates
         return self.linear_out(hidden)
 
 
@@ -276,6 +281,387 @@ class ImageAwareConvDenseGaussianHead(nn.Module):
         out = [checkpoint(block, x, use_reentrant=False) for block in self.conv_head.output_block]
         feat = torch.cat(out, dim=1)
         return feat.permute(0, 2, 3, 1)
+
+
+class DPTFeatureFusionBlock(nn.Module):
+    def __init__(self, channels, has_residual=True, res_block_norm='group_norm'):
+        super().__init__()
+        self.has_residual = has_residual
+        if has_residual:
+            self.residual = ResidualConvBlock(
+                channels,
+                channels,
+                channels * 2,
+                activation='relu',
+                norm=res_block_norm,
+            )
+        self.refine = ResidualConvBlock(
+            channels,
+            channels,
+            channels * 2,
+            activation='relu',
+            norm=res_block_norm,
+        )
+        self.out_conv = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x, residual=None, size=None):
+        if self.has_residual and residual is not None:
+            x = x + self.residual(residual)
+        x = self.refine(x)
+        if size is None:
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        else:
+            x = F.interpolate(x, size=size, mode='bilinear', align_corners=True)
+        return self.out_conv(x)
+
+
+class ImageAwareDPTDenseGaussianHead(nn.Module):
+    """
+    DPT/refinenet-style dense Gaussian head for V12.
+
+    It consumes intermediate GS decoder tokens, builds a small multi-scale
+    pyramid, fuses it back to full resolution, and injects RGB features at the
+    end so shape/opacity channels can react to local high-frequency details.
+    """
+    def __init__(
+            self,
+            patch_size,
+            dec_embed_dim,
+            dim_out=[4, 3, 1, 3, 3, 1, 1],
+            image_channels=3,
+            feature_channels=64,
+            head_channels=48,
+            res_block_norm='group_norm',
+            use_checkpoint=True,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.dim_out = dim_out
+        self.feature_channels = feature_channels
+        self.use_checkpoint = bool(use_checkpoint)
+
+        self.projects = nn.ModuleList([
+            nn.Conv2d(dec_embed_dim, feature_channels, kernel_size=1)
+            for _ in range(4)
+        ])
+        self.uv_fusers = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(feature_channels + 2, feature_channels, kernel_size=1),
+                nn.ReLU(inplace=True),
+            )
+            for _ in range(4)
+        ])
+        self.resize_layers = nn.ModuleList([
+            nn.ConvTranspose2d(feature_channels, feature_channels, kernel_size=4, stride=4, padding=0),
+            nn.ConvTranspose2d(feature_channels, feature_channels, kernel_size=2, stride=2, padding=0),
+            nn.Identity(),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=3, stride=2, padding=1),
+        ])
+
+        self.refinenet4 = DPTFeatureFusionBlock(feature_channels, has_residual=False, res_block_norm=res_block_norm)
+        self.refinenet3 = DPTFeatureFusionBlock(feature_channels, has_residual=True, res_block_norm=res_block_norm)
+        self.refinenet2 = DPTFeatureFusionBlock(feature_channels, has_residual=True, res_block_norm=res_block_norm)
+        self.refinenet1 = DPTFeatureFusionBlock(feature_channels, has_residual=True, res_block_norm=res_block_norm)
+
+        self.dpt_image_merger = nn.Sequential(
+            nn.Conv2d(image_channels, feature_channels, kernel_size=7, stride=1, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.image_gate = nn.Parameter(torch.tensor(0.5))
+
+        self.output_block = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(feature_channels + 2, head_channels, kernel_size=3, stride=1, padding=1, padding_mode='replicate'),
+                nn.ReLU(inplace=True),
+                ResidualConvBlock(
+                    head_channels,
+                    head_channels,
+                    head_channels * 2,
+                    activation='relu',
+                    norm=res_block_norm,
+                ),
+                nn.Conv2d(head_channels, dim, kernel_size=1, stride=1, padding=0),
+            )
+            for dim in dim_out
+        ])
+        self._init_residual_branch()
+
+    def _init_residual_branch(self):
+        # Keep center residual and scale-bias neutral at initialization.
+        for idx in (4, 6):
+            if idx < len(self.output_block):
+                final = self.output_block[idx][-1]
+                if isinstance(final, nn.Conv2d):
+                    nn.init.zeros_(final.weight)
+                    nn.init.zeros_(final.bias)
+
+    def _tokens_to_map(self, tokens, patch_h, patch_w):
+        return tokens.permute(0, 2, 1).reshape(tokens.shape[0], tokens.shape[-1], patch_h, patch_w).contiguous()
+
+    def _append_uv(self, x, img_h, img_w):
+        uv = normalized_view_plane_uv(
+            width=x.shape[-1],
+            height=x.shape[-2],
+            aspect_ratio=img_w / img_h,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+        return torch.cat([x, uv], dim=1)
+
+    def _checkpoint_block(self, fn, *args):
+        if self.use_checkpoint and self.training:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
+    def forward(self, decout, img_shape, image=None):
+        H, W = img_shape
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        img_h, img_w = patch_h * self.patch_size, patch_w * self.patch_size
+
+        if isinstance(decout, (list, tuple)):
+            token_list = list(decout)
+        else:
+            token_list = [decout]
+        if len(token_list) < 4:
+            token_list = [token_list[0]] * (4 - len(token_list)) + token_list
+        token_list = token_list[-4:]
+
+        feats = []
+        for tokens, project, uv_fuser, resize in zip(token_list, self.projects, self.uv_fusers, self.resize_layers):
+            x = self._tokens_to_map(tokens, patch_h, patch_w)
+            x = project(x)
+            x = uv_fuser(self._append_uv(x, img_h, img_w))
+            x = resize(x)
+            feats.append(x)
+
+        layer_1, layer_2, layer_3, layer_4 = feats
+        path_4 = self._checkpoint_block(
+            lambda x4: self.refinenet4(x4, size=layer_3.shape[-2:]),
+            layer_4,
+        )
+        path_3 = self._checkpoint_block(
+            lambda x4, x3: self.refinenet3(x4, x3, size=layer_2.shape[-2:]),
+            path_4,
+            layer_3,
+        )
+        path_2 = self._checkpoint_block(
+            lambda x3, x2: self.refinenet2(x3, x2, size=layer_1.shape[-2:]),
+            path_3,
+            layer_2,
+        )
+        x = self._checkpoint_block(
+            lambda x2, x1: self.refinenet1(x2, x1, size=(img_h, img_w)),
+            path_2,
+            layer_1,
+        )
+
+        if image is not None:
+            if image.dim() == 5:
+                image = image.reshape(-1, *image.shape[-3:])
+            image = image.to(device=x.device, dtype=x.dtype)
+            if image.shape[-2:] != x.shape[-2:]:
+                image = F.interpolate(image, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            x = x + self.image_gate.to(dtype=x.dtype) * self.dpt_image_merger(image)
+
+        x = self._append_uv(x, img_h, img_w)
+        out = [checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+        feat = torch.cat(out, dim=1)
+        return feat.permute(0, 2, 3, 1)
+
+
+class PixelShuffleUpsampleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, upscale_factor, num_res_blocks=2,
+                 dim_times_res_block_hidden=2, res_block_norm='group_norm'):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels * upscale_factor * upscale_factor,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode='replicate',
+            ),
+            nn.PixelShuffle(upscale_factor),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, padding_mode='replicate'),
+            *(
+                ResidualConvBlock(
+                    out_channels,
+                    out_channels,
+                    dim_times_res_block_hidden * out_channels,
+                    activation="relu",
+                    norm=res_block_norm,
+                )
+                for _ in range(num_res_blocks)
+            ),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class ImageAwarePixelShuffleDenseGaussianHead(nn.Module):
+    """
+    V12 dense Gaussian head.
+
+    It replaces additive RGB injection with concat + 1x1 fusion, feeds Sobel
+    guidance into the image path, and upsamples patch tokens to pixels with
+    PixelShuffle factors 2 and 7, matching the 14px ViT patch size.
+    """
+    def __init__(self, patch_size, dec_embed_dim, dim_out=[4, 3, 1, 12, 3, 1, 1],
+                 image_channels=3, image_feat_channels=64, head_channels=64):
+        super().__init__()
+        if patch_size != 14:
+            raise ValueError("ImageAwarePixelShuffleDenseGaussianHead expects patch_size=14")
+        self.patch_size = patch_size
+        self.projects = nn.Identity()
+        self.using_uv = True
+        self.upsample_blocks = nn.ModuleList([
+            PixelShuffleUpsampleBlock(
+                dec_embed_dim + 2,
+                256,
+                upscale_factor=2,
+                num_res_blocks=2,
+                dim_times_res_block_hidden=2,
+                res_block_norm='group_norm',
+            ),
+            PixelShuffleUpsampleBlock(
+                256 + 2,
+                head_channels,
+                upscale_factor=7,
+                num_res_blocks=2,
+                dim_times_res_block_hidden=2,
+                res_block_norm='group_norm',
+            ),
+        ])
+        image_input_channels = image_channels + 4
+        self.image_merger = nn.Sequential(
+            nn.Conv2d(image_input_channels, image_feat_channels, kernel_size=7, stride=1, padding=3),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(image_feat_channels, image_feat_channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.fusion_conv = nn.Conv2d(head_channels + image_feat_channels, head_channels, kernel_size=1, stride=1)
+        self.output_block = nn.ModuleList([
+            self._make_output_block(
+                head_channels + 2,
+                dim_out_,
+                dim_times_res_block_hidden=2,
+                last_res_blocks=0,
+                last_conv_channels=32,
+                last_conv_size=1,
+                res_block_norm='group_norm',
+            )
+            for dim_out_ in dim_out
+        ])
+        sobel_x = torch.tensor(
+            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+        self._init_fusion_and_residual_paths(head_channels, image_feat_channels)
+
+    def _make_output_block(self, dim_in, dim_out, dim_times_res_block_hidden,
+                           last_res_blocks, last_conv_channels, last_conv_size,
+                           res_block_norm):
+        return nn.Sequential(
+            nn.Conv2d(dim_in, last_conv_channels, kernel_size=3, stride=1, padding=1, padding_mode='replicate'),
+            *(
+                ResidualConvBlock(
+                    last_conv_channels,
+                    last_conv_channels,
+                    dim_times_res_block_hidden * last_conv_channels,
+                    activation='relu',
+                    norm=res_block_norm,
+                )
+                for _ in range(last_res_blocks)
+            ),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(last_conv_channels, dim_out, kernel_size=last_conv_size, stride=1,
+                      padding=last_conv_size // 2, padding_mode='replicate'),
+        )
+
+    def _init_fusion_and_residual_paths(self, head_channels, image_feat_channels):
+        nn.init.zeros_(self.fusion_conv.weight)
+        nn.init.zeros_(self.fusion_conv.bias)
+        with torch.no_grad():
+            eye = torch.eye(head_channels, dtype=self.fusion_conv.weight.dtype)
+            self.fusion_conv.weight[:, :head_channels, 0, 0].copy_(eye)
+            image_slice = self.fusion_conv.weight[:, head_channels:head_channels + image_feat_channels, 0, 0]
+            image_slice.normal_(mean=0.0, std=0.01)
+
+        if len(self.output_block) > 4:
+            residual_last = self.output_block[4][-1]
+            if isinstance(residual_last, nn.Conv2d):
+                nn.init.zeros_(residual_last.weight)
+                nn.init.zeros_(residual_last.bias)
+
+    def _image_guidance(self, image, target_hw, dtype, device):
+        image = image.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        if image.shape[-2:] != target_hw:
+            image = F.interpolate(image, size=target_hw, mode="bilinear", align_corners=False)
+
+        gray = (
+            0.2989 * image[:, 0:1]
+            + 0.5870 * image[:, 1:2]
+            + 0.1140 * image[:, 2:3]
+        )
+        sobel_x = self.sobel_x.to(device=device, dtype=dtype)
+        sobel_y = self.sobel_y.to(device=device, dtype=dtype)
+        grad_x = F.conv2d(F.pad(gray, (1, 1, 1, 1), mode="replicate"), sobel_x)
+        grad_y = F.conv2d(F.pad(gray, (1, 1, 1, 1), mode="replicate"), sobel_y)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+        return torch.cat([image, gray, grad_x, grad_y, grad_mag], dim=1)
+
+    def forward(self, decout, img_shape, image=None):
+        H, W = img_shape
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        tokens = decout[-1] if isinstance(decout, list) else decout
+
+        x = self.projects(tokens).permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous()
+        img_h = patch_h * self.patch_size
+        img_w = patch_w * self.patch_size
+
+        for block in self.upsample_blocks:
+            if self.using_uv:
+                uv = normalized_view_plane_uv(
+                    width=x.shape[-1],
+                    height=x.shape[-2],
+                    aspect_ratio=img_w / img_h,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+                x = torch.cat([x, uv], dim=1)
+            x = checkpoint(block, x, use_reentrant=False)
+
+        if image is not None:
+            if image.dim() == 5:
+                image = image.reshape(-1, *image.shape[-3:])
+            img_feat = self.image_merger(self._image_guidance(image, x.shape[-2:], x.dtype, x.device))
+            x = self.fusion_conv(torch.cat([x, img_feat], dim=1))
+
+        if self.using_uv:
+            uv = normalized_view_plane_uv(
+                width=x.shape[-1],
+                height=x.shape[-2],
+                aspect_ratio=img_w / img_h,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+            x = torch.cat([x, uv], dim=1)
+
+        out = [checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+        feat = torch.cat(out, dim=1)
+        return feat.permute(0, 2, 3, 1)
+
 
 class AppearanceModulationHead(nn.Module):
     def __init__(self, patch_size=14, dec_embed_dim=1024, light_dim=512): # changed light_dim to match CLIP

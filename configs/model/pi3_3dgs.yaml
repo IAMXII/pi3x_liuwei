@@ -60,7 +60,7 @@ loss:
 train:
     num_workers: 16
     batch_size: 1              # not use, dynamic batch size
-    num_epoch: 25 #80
+    num_epoch: 40 #80
     iters_per_epoch: 5000 # 800
 
     print_freq: 40

@@ -1,4 +1,4 @@
-# Pi3_3DGS_10: Pi3_3DGS_9 plus Hunyuan-style GS decoding.
+# Pi3_3DGS_11: Pi3_3DGS_10 plus multi-view-aware local competition.
 # 1. forward 中每个 batch 的高斯候选合并后，调用 _apply_local_competition。
 # 2. 先估计每个高斯的局部尺度：优先用相机位姿、内参和可见像素足迹计算
 #    cube_size，并转成 local_radius；不可见或信息不足时退回由预测 scale 得到
@@ -6,9 +6,10 @@
 # 3. _estimate_color_aware_redundancy 统计局部冗余度：按 Reduced-3DGS 的
 #    固定 K 近邻候选（默认 30）计算冗余，不再用 counts/view/hash 作为
 #    local competition 的资格条件；唯一额外约束是颜色相近的近邻才计入冗余。
-# 4. 将 redundancy_score 通过 mean + lambda * std（且不低于 redundancy_minimum）
-#    得到阈值，再归一化成 redundancy_coef。只有 redundancy_coef > 0 的高斯
-#    才会进入透明度压制。
+# 4. 将 redundancy_score 通过 mean（lambda 固定为 0，且不低于 redundancy_minimum）
+#    得到阈值，再归一化成 redundancy_coef。透明度压制仍按原始 redundancy
+#    逻辑执行；同时导出局部相交近邻是否来自多个 source view，供 overlay
+#    过滤单视角冗余区域。
 # 5. local competition 后半段保持软抑制：opacity *= gate；不做 Reduced-3DGS
 #    的物理 prune，也不再做额外 top-k 截断。
 
@@ -327,7 +328,7 @@ class Pi3_3DGS(nn.Module):
             enable_redundancy_pruning=True,
             redundancy_voxel_size_ratio=0.002,
             redundancy_radius_scale=1.0,
-            redundancy_lambda_mercy=0.1,
+            redundancy_lambda_mercy=0.0,
             redundancy_minimum=3,
             redundancy_opacity_quantile=0.5,
             redundancy_max_prune_ratio=0.5,
@@ -360,12 +361,11 @@ class Pi3_3DGS(nn.Module):
             density_gate_min_prob=0.05,
             density_gate_opacity_power=0.5,
             scale_bias_strength=0.5,
-            scale_activation_multiplier=0.1,
-            opacity_filter_threshold=0.0,
+            scale_activation_multiplier=0.06,
+            opacity_filter_threshold=0.02,
             proposal_sampling_mode="quadtree",
             random_sampling_seed=2024,
             enable_local_competition=True,
-            hard_prune_redundant_gaussians_eval=False,
             competition_voxel_size_ratio=0.002,
             competition_radius_scale=1.5,
             competition_color_bins=16,
@@ -453,7 +453,6 @@ class Pi3_3DGS(nn.Module):
         self.proposal_sampling_mode = proposal_sampling_mode
         self.random_sampling_seed = int(random_sampling_seed)
         self.enable_local_competition = bool(enable_local_competition)
-        self.hard_prune_redundant_gaussians_eval = bool(hard_prune_redundant_gaussians_eval)
         self.competition_voxel_size_ratio = max(0.0, float(competition_voxel_size_ratio))
         self.competition_radius_scale = max(0.0, float(competition_radius_scale))
         self.competition_color_bins = max(2, int(competition_color_bins))
@@ -1026,8 +1025,8 @@ class Pi3_3DGS(nn.Module):
                 redundancy_threshold=0.0,
                 redundancy_coef_mean=0.0,
                 redundancy_coef_max=0.0,
+                multiview_supported=0,
                 hard_cap_pruned=0,
-                hard_redundancy_pruned=0,
         ):
             stats["competition_gate_mean"] = self._stats_tensor(gate_mean, device, dtype)
             stats["competition_groups"] = self._stats_tensor(groups, device, dtype)
@@ -1042,8 +1041,8 @@ class Pi3_3DGS(nn.Module):
             stats["redundancy_coef_max"] = self._stats_tensor(redundancy_coef_max, device, dtype)
             stats["redundancy_gate_mean"] = self._stats_tensor(gate_mean, device, dtype)
             stats["redundancy_expected_suppressed"] = self._stats_tensor(expected_suppressed, device, dtype)
+            stats["redundancy_multiview_supported"] = self._stats_tensor(multiview_supported, device, dtype)
             stats["hard_cap_pruned"] = self._stats_tensor(hard_cap_pruned, device, dtype)
-            stats["hard_redundancy_pruned"] = self._stats_tensor(hard_redundancy_pruned, device, dtype)
             return stats
 
         def attach_competition_diagnostics(
@@ -1052,6 +1051,7 @@ class Pi3_3DGS(nn.Module):
                 redundancy_coef=None,
                 gate=None,
                 active_mask=None,
+                multiview_support=None,
         ):
             gaussian_dict = dict(gaussian_dict)
             k = gaussian_dict["xyz"].shape[0]
@@ -1063,25 +1063,17 @@ class Pi3_3DGS(nn.Module):
                 gate = torch.ones((k,), device=device, dtype=torch.float32)
             if active_mask is None:
                 active_mask = torch.zeros((k,), device=device, dtype=torch.bool)
+            if multiview_support is None:
+                multiview_support = torch.zeros((k,), device=device, dtype=torch.bool)
 
             gaussian_dict["redundancy_score"] = redundancy.detach().to(device=device, dtype=dtype).reshape(k, 1)
             gaussian_dict["redundancy_coef"] = redundancy_coef.detach().to(device=device, dtype=dtype).reshape(k, 1)
             gaussian_dict["competition_gate"] = gate.detach().to(device=device, dtype=dtype).reshape(k, 1)
             gaussian_dict["competition_active"] = active_mask.detach().to(device=device, dtype=dtype).reshape(k, 1)
+            gaussian_dict["redundancy_multiview_support"] = (
+                multiview_support.detach().to(device=device, dtype=dtype).reshape(k, 1)
+            )
             return gaussian_dict
-
-        def filter_gaussian_dict(gaussian_dict, keep_mask, original_count):
-            filtered = {}
-            for key, value in gaussian_dict.items():
-                if (
-                        isinstance(value, torch.Tensor)
-                        and value.ndim >= 1
-                        and value.shape[0] == original_count
-                ):
-                    filtered[key] = value[keep_mask]
-                else:
-                    filtered[key] = value
-            return filtered
 
         if K == 0:
             stats = self._redundancy_stats(device, dtype, 0)
@@ -1119,27 +1111,29 @@ class Pi3_3DGS(nn.Module):
             # 1) Reduced-3DGS-style redundancy score, with color similarity gate.
             #    This score is the actual criterion for deciding whether a
             #    Gaussian is redundant enough to participate in competition.
-            redundancy = self._estimate_color_aware_redundancy(
+            redundancy, multiview_support = self._estimate_color_aware_redundancy(
                 gaussian_dict,
                 neighborhood_size,
                 local_radius=local_radius,
+                source_view=source_view,
+                return_multiview_support=True,
             )
             mean_redundancy = redundancy.mean()
             std_redundancy = redundancy.std(unbiased=False)
             redundancy_threshold = torch.clamp(
-                mean_redundancy + self.redundancy_lambda_mercy * std_redundancy,
+                mean_redundancy,
                 min=float(self.redundancy_minimum),
             )
             max_redundancy = redundancy.max()
             redundancy_coef = (redundancy - redundancy_threshold) / (max_redundancy - redundancy_threshold + 1e-6)
             redundancy_coef = torch.clamp(redundancy_coef, 0.0, 1.0)
 
-            # 2) Match Reduced-3DGS candidate selection: redundant primitives are
-            #    exactly those above the global mercy threshold. No counts/view/
-            #    hash group can veto this mask.
+            # 2) Keep opacity suppression like the original redundancy-driven
+            #    local competition. Multi-view support is exported as a separate
+            #    diagnostic so visual overlays can hide single-view-only regions.
             active_mask = redundancy > redundancy_threshold
             active_count = int(active_mask.sum().item())
-            active_group_count = 0
+            active_group_count = int(multiview_support.sum().item())
             redundancy_coef_mean = float(redundancy_coef.mean().item())
             redundancy_coef_max = float(redundancy_coef.max().item())
 
@@ -1157,6 +1151,7 @@ class Pi3_3DGS(nn.Module):
                 redundancy_threshold=float(redundancy_threshold.item()),
                 redundancy_coef_mean=redundancy_coef_mean,
                 redundancy_coef_max=redundancy_coef_max,
+                multiview_supported=active_group_count,
             )
             stats["pixel_scale"] = self._stats_tensor(self.redundancy_pixel_scale, device, dtype)
             stats["cube_size_mean"] = cube_size.detach().float().mean().to(device=device, dtype=dtype)
@@ -1168,6 +1163,7 @@ class Pi3_3DGS(nn.Module):
                 gaussian_dict,
                 redundancy=redundancy,
                 redundancy_coef=redundancy_coef,
+                multiview_support=multiview_support,
             )
             return gaussian_dict, stats
 
@@ -1176,58 +1172,6 @@ class Pi3_3DGS(nn.Module):
         # group, the strongest redundant point maps to the same floor that the
         # old grouped gate could reach.
         redundancy_weight = redundancy_coef.to(device=device, dtype=torch.float32)
-
-        if self.hard_prune_redundant_gaussians_eval and not self.training:
-            keep_mask = ~active_mask
-            if not keep_mask.any():
-                opacity_quality = gaussian_dict["opacity"].detach().float().reshape(-1)
-                keep_idx = torch.argmax(opacity_quality)
-                keep_mask = torch.zeros_like(active_mask)
-                keep_mask[keep_idx] = True
-
-            gate = keep_mask.to(device=device, dtype=torch.float32)
-            gaussian_dict = attach_competition_diagnostics(
-                gaussian_dict,
-                redundancy=redundancy,
-                redundancy_coef=redundancy_coef,
-                gate=gate,
-                active_mask=active_mask,
-            )
-            gaussian_dict = filter_gaussian_dict(gaussian_dict, keep_mask, K)
-            hard_redundancy_pruned = int((~keep_mask).sum().item())
-            stats = self._redundancy_stats(
-                device,
-                dtype,
-                K,
-                after_count=gaussian_dict["xyz"].shape[0],
-                pruned=hard_redundancy_pruned,
-                candidates=active_count,
-                threshold=float(redundancy_threshold.item()),
-                voxel_size=neighborhood_size,
-                mean_redundancy=float(mean_redundancy.item()),
-            )
-            stats = add_competition_stats(
-                stats,
-                gate_mean=float(gate.detach().float().mean().item()),
-                groups=active_group_count,
-                candidates=active_count,
-                expected_suppressed=float(hard_redundancy_pruned),
-                redundancy_threshold=float(redundancy_threshold.item()),
-                redundancy_coef_mean=redundancy_coef_mean,
-                redundancy_coef_max=redundancy_coef_max,
-                hard_cap_pruned=0,
-                hard_redundancy_pruned=hard_redundancy_pruned,
-            )
-            stats["pixel_scale"] = self._stats_tensor(self.redundancy_pixel_scale, device, dtype)
-            stats["cube_size_mean"] = cube_size.detach().float().mean().to(device=device, dtype=dtype)
-            stats["cube_size_median"] = cube_size.detach().float().median().to(device=device, dtype=dtype)
-            stats["local_radius_mean"] = local_radius.detach().float().mean().to(device=device, dtype=dtype)
-            stats["local_radius_median"] = local_radius.detach().float().median().to(device=device, dtype=dtype)
-            stats["count_after_physical"] = self._stats_tensor(gaussian_dict["xyz"].shape[0], device, dtype)
-            stats["physical_pruned"] = self._stats_tensor(hard_redundancy_pruned, device, dtype)
-            stats = add_effective_stats(stats, gaussian_dict["opacity"], before_count=K)
-            return gaussian_dict, stats
-
         gate_floor = torch.tensor(float(self.competition_min_gate), device=device, dtype=torch.float32)
         gate = 1.0 - self.competition_strength * redundancy_weight * (1.0 - gate_floor)
         gate = torch.where(active_mask, gate, torch.ones_like(gate))
@@ -1241,6 +1185,7 @@ class Pi3_3DGS(nn.Module):
             redundancy_coef=redundancy_coef,
             gate=gate,
             active_mask=active_mask,
+            multiview_support=multiview_support,
         )
 
         # Keep local competition as a soft opacity gate only. Dense/no-quadtree
@@ -1268,6 +1213,7 @@ class Pi3_3DGS(nn.Module):
             redundancy_threshold=float(redundancy_threshold.item()),
             redundancy_coef_mean=redundancy_coef_mean,
             redundancy_coef_max=redundancy_coef_max,
+            multiview_supported=active_group_count,
             hard_cap_pruned=hard_cap_pruned,
         )
         stats["pixel_scale"] = self._stats_tensor(self.redundancy_pixel_scale, device, dtype)
@@ -1382,7 +1328,14 @@ class Pi3_3DGS(nn.Module):
         uuv = torch.cross(q_vec, uv, dim=-1)
         return vectors - 2.0 * q_w * uv + 2.0 * uuv
 
-    def _estimate_color_aware_redundancy(self, gaussian_dict, voxel_size, local_radius=None):
+    def _estimate_color_aware_redundancy(
+            self,
+            gaussian_dict,
+            voxel_size,
+            local_radius=None,
+            source_view=None,
+            return_multiview_support=False,
+    ):
         """Estimate Reduced-3DGS-style local redundancy with an extra color gate.
 
         Reduced-3DGS first finds a fixed number of nearest spatial neighbours,
@@ -1396,9 +1349,15 @@ class Pi3_3DGS(nn.Module):
         device = xyz.device
         pts = xyz.detach().float()
         if K == 0:
-            return torch.zeros((0,), device=device, dtype=torch.float32)
+            redundancy = torch.zeros((0,), device=device, dtype=torch.float32)
+            if return_multiview_support:
+                return redundancy, torch.zeros((0,), device=device, dtype=torch.bool)
+            return redundancy
         if K == 1:
-            return torch.ones((1,), device=device, dtype=torch.float32)
+            redundancy = torch.ones((1,), device=device, dtype=torch.float32)
+            if return_multiview_support:
+                return redundancy, torch.zeros((1,), device=device, dtype=torch.bool)
+            return redundancy
 
         color = self._get_redundancy_color(gaussian_dict)
         use_color = (
@@ -1411,6 +1370,14 @@ class Pi3_3DGS(nn.Module):
         if rotation is not None:
             rotation = rotation.detach().float()
 
+        if source_view is None:
+            source_view = gaussian_dict.get("source_view", None)
+        source_view_tensor = None
+        if isinstance(source_view, torch.Tensor):
+            source_view_tensor = source_view.detach().reshape(-1).to(device=device, dtype=torch.long)
+            if source_view_tensor.numel() != K:
+                source_view_tensor = None
+
         if local_radius is not None:
             radius = local_radius.detach().float().to(device=device).view(-1).clamp_min(1e-8)
         else:
@@ -1420,6 +1387,7 @@ class Pi3_3DGS(nn.Module):
         num_neighbours = min(max(num_neighbours, 1), K - 1)
         raw_redundancy = torch.ones((K,), device=device, dtype=torch.float32)
         min_redundancy = torch.full((K,), float("inf"), device=device, dtype=torch.float32)
+        multiview_support = torch.zeros((K,), device=device, dtype=torch.float32)
 
         def process_neighbour_indices(center_idx, neighbour_idx):
             if neighbour_idx.numel() == 0:
@@ -1465,6 +1433,27 @@ class Pi3_3DGS(nn.Module):
                 reduce="amin",
                 include_self=True,
             )
+            if source_view_tensor is not None:
+                center_view = source_view_tensor.index_select(0, center_idx)[:, None]
+                neighbour_view = source_view_tensor[neighbour_idx]
+                cross_view_mask = (
+                    intersection_mask
+                    & (center_view >= 0)
+                    & (neighbour_view >= 0)
+                    & (neighbour_view != center_view)
+                )
+                group_has_cross_view = cross_view_mask.any(dim=-1, keepdim=True)
+                if group_has_cross_view.any():
+                    support_mask = all_mask & group_has_cross_view.expand_as(all_mask)
+                    support_indices = all_indices[support_mask]
+                    if support_indices.numel() > 0:
+                        multiview_support.scatter_reduce_(
+                            0,
+                            support_indices,
+                            torch.ones_like(support_indices, dtype=torch.float32),
+                            reduce="amax",
+                            include_self=True,
+                        )
 
         process_chunk = max(1024, min(65536, 2_000_000 // max(num_neighbours, 1)))
         used_simple_knn = False
@@ -1522,7 +1511,10 @@ class Pi3_3DGS(nn.Module):
                 process_neighbour_indices(center_idx, neighbour_idx)
 
         redundancy = torch.where(torch.isfinite(min_redundancy), min_redundancy, raw_redundancy)
-        return self._cap_redundancy_count(redundancy)
+        redundancy = self._cap_redundancy_count(redundancy)
+        if return_multiview_support:
+            return redundancy, multiview_support > 0.5
+        return redundancy
 
     def _finalize_redundancy_stats(self, stats, gaussian_dict, before_count, device, dtype):
         """Add effective-count statistics after opacity suppression."""
@@ -1591,7 +1583,7 @@ class Pi3_3DGS(nn.Module):
             mean_redundancy = redundancy.mean()
             std_redundancy = redundancy.std(unbiased=False)
             threshold = torch.clamp(
-                mean_redundancy + self.redundancy_lambda_mercy * std_redundancy,
+                mean_redundancy,
                 min=float(self.redundancy_minimum),
             )
 
@@ -1911,7 +1903,7 @@ class Pi3_3DGS(nn.Module):
                     if i == len(patch_sizes) - 1:
                         is_flat_expanded = torch.ones((B * N_sub, 1, H_pad, W_pad), dtype=torch.bool, device=imgs.device)
                     else:
-                        current_threshold = base_threshold * (1.0 + relax_factor * math.log2(32/size))
+                        current_threshold = base_threshold * (1.0 + relax_factor * math.log2(size))
                         pooled_score = F.max_pool2d(score_map_padded, kernel_size=size, stride=size)
                         is_flat_expanded = pooled_score.repeat_interleave(size, dim=2).repeat_interleave(size,
                                                                                                          dim=3) < current_threshold
@@ -2240,14 +2232,9 @@ class Pi3_3DGS(nn.Module):
                 # 3. 仅对存活的点解析其余属性并变换
                 local_rot_v = F.normalize(gs_attrs_v[:, 0:4], dim=-1)
                 scale_v = (
-                    torch.exp(gs_attrs_v[:, 4:7])
+                    torch.exp(torch.clamp(gs_attrs_v[:, 4:7], min=-10.0, max=5.0))
                     * self.scale_activation_multiplier
                 )
-                # scale_v = (
-                #     F.softplus(gs_attrs_v[:, 4:7])
-                #     * self.scale_activation_multiplier
-                # )
-                
                 color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
                 residual_raw_v = torch.tanh(gs_attrs_v[:, 11:14])
                 scale_bias_v = torch.tanh(gs_attrs_v[:, 15:16])
@@ -2377,7 +2364,8 @@ class Pi3_3DGS(nn.Module):
         d_xyz_out, d_rot_out, d_scale_out, d_opacity_out, d_color_out, d_conf_out = [], [], [], [], [], []
         d_pushed_out = []
         d_comp_color_out, d_source_view_out = [], []
-        d_redundancy_score_out, d_redundancy_coef_out, d_comp_gate_out, d_comp_active_out = [], [], [], []
+        d_redundancy_score_out, d_redundancy_coef_out = [], []
+        d_comp_gate_out, d_comp_active_out, d_multiview_support_out = [], [], []
         for g in fused_gaussians:
             pad_len = max_k - g["xyz"].size(0)
             d_xyz_out.append(F.pad(g["xyz"], (0, 0, 0, pad_len), value=0.0))
@@ -2397,6 +2385,9 @@ class Pi3_3DGS(nn.Module):
             d_redundancy_coef_out.append(F.pad(g["redundancy_coef"], (0, 0, 0, pad_len), value=0.0))
             d_comp_gate_out.append(F.pad(g["competition_gate"], (0, 0, 0, pad_len), value=1.0))
             d_comp_active_out.append(F.pad(g["competition_active"], (0, 0, 0, pad_len), value=0.0))
+            d_multiview_support_out.append(
+                F.pad(g["redundancy_multiview_support"], (0, 0, 0, pad_len), value=0.0)
+            )
 
         gaussians = {
             "xyz": torch.stack(d_xyz_out, dim=0),
@@ -2412,6 +2403,7 @@ class Pi3_3DGS(nn.Module):
             "redundancy_coef": torch.stack(d_redundancy_coef_out, dim=0),
             "competition_gate": torch.stack(d_comp_gate_out, dim=0),
             "competition_active": torch.stack(d_comp_active_out, dim=0),
+            "redundancy_multiview_support": torch.stack(d_multiview_support_out, dim=0),
         }
         if export_pushed_mask:
             gaussians["pushed"] = torch.stack(d_pushed_out, dim=0)

@@ -30,6 +30,8 @@ MODEL_IMPL_ALIASES = {
     "9": "pi3.models.pi3_3dgs_9.Pi3_3DGS",
     "_10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
     "10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
+    "_11": "pi3.models.pi3_3dgs_11.Pi3_3DGS",
+    "11": "pi3.models.pi3_3dgs_11.Pi3_3DGS",
 }
 
 
@@ -41,21 +43,7 @@ def save_heatmap(tensor, path):
     cv2.imwrite(path, heatmap_color)
 
 
-def save_ply_binary(gaussians, path, opacity_threshold=0.05):
-    xyz = gaussians["xyz"].detach().cpu().float().numpy().reshape(-1, 3)
-    rot = gaussians["rotation"].detach().cpu().float().numpy().reshape(-1, 4)
-    scale = gaussians["scale"].detach().cpu().float().numpy().reshape(-1, 3)
-    opacity = gaussians["opacity"].detach().cpu().float().numpy().reshape(-1)
-    color = gaussians["color"].detach().cpu().float().numpy().reshape(-1, 3)
-
-    total_count = xyz.shape[0]
-    keep_mask = opacity > opacity_threshold
-    xyz = xyz[keep_mask]
-    rot = rot[keep_mask]
-    scale = scale[keep_mask]
-    opacity = opacity[keep_mask]
-    color = color[keep_mask]
-
+def _write_ply_binary_arrays(xyz, rot, scale, opacity, color, path):
     scale_ply = np.log(np.clip(scale, 1e-10, None))
     opacity_clipped = np.clip(opacity, 1e-6, 1 - 1e-6)
     opacity_ply = np.log(opacity_clipped / (1 - opacity_clipped))
@@ -81,7 +69,81 @@ def save_ply_binary(gaussians, path, opacity_threshold=0.05):
         f.write(b"end_header\n")
         f.write(attributes.tobytes())
 
+
+def _gaussian_ply_arrays(gaussians):
+    xyz = gaussians["xyz"].detach().cpu().float().numpy().reshape(-1, 3)
+    rot = gaussians["rotation"].detach().cpu().float().numpy().reshape(-1, 4)
+    scale = gaussians["scale"].detach().cpu().float().numpy().reshape(-1, 3)
+    opacity = gaussians["opacity"].detach().cpu().float().numpy().reshape(-1)
+    color = gaussians["color"].detach().cpu().float().numpy().reshape(-1, 3)
+    return xyz, rot, scale, opacity, color
+
+
+def save_ply_binary(gaussians, path, opacity_threshold=0.05):
+    xyz, rot, scale, opacity, color = _gaussian_ply_arrays(gaussians)
+    total_count = xyz.shape[0]
+    keep_mask = opacity > opacity_threshold
+    xyz = xyz[keep_mask]
+    rot = rot[keep_mask]
+    scale = scale[keep_mask]
+    opacity = opacity[keep_mask]
+    color = color[keep_mask]
+
+    _write_ply_binary_arrays(xyz, rot, scale, opacity, color, path)
+
     return xyz.shape[0], total_count
+
+
+def _gaussian_optional_vector_tensor(gaussians, key, length, device, fill, dtype=torch.float32):
+    value = gaussians.get(key)
+    if not isinstance(value, torch.Tensor):
+        return torch.full((length,), fill, device=device, dtype=dtype), False
+    value = value.detach()
+    if value.ndim >= 3:
+        value = value[0, :, 0]
+    elif value.ndim == 2 and value.shape[0] == 1:
+        value = value[0]
+    elif value.ndim == 2 and value.shape[1] == 1:
+        value = value[:, 0]
+    else:
+        value = value.reshape(-1)
+    value = value.reshape(-1).to(device=device, dtype=dtype)
+    out = torch.full((length,), fill, device=device, dtype=dtype)
+    n = min(length, value.numel())
+    if n > 0:
+        out[:n] = value[:n]
+    return out, True
+
+
+def _redundancy_suppression_mask_tensor(
+    gaussians,
+    length,
+    device,
+    redundancy_coef_threshold=0.0,
+    gate_epsilon=1e-6,
+    require_multiview_support=False,
+):
+    active, has_active = _gaussian_optional_vector_tensor(gaussians, "competition_active", length, device, 0.0)
+    gate, has_gate = _gaussian_optional_vector_tensor(gaussians, "competition_gate", length, device, 1.0)
+    coef, has_coef = _gaussian_optional_vector_tensor(gaussians, "redundancy_coef", length, device, 0.0)
+    multiview, has_multiview = _gaussian_optional_vector_tensor(
+        gaussians,
+        "redundancy_multiview_support",
+        length,
+        device,
+        0.0,
+    )
+
+    mask = torch.zeros((length,), device=device, dtype=torch.bool)
+    if has_active:
+        mask |= active > 0.5
+    if has_gate:
+        mask |= gate < (1.0 - float(gate_epsilon))
+    if not has_active and not has_gate and has_coef:
+        mask |= coef > float(redundancy_coef_threshold)
+    if require_multiview_support and has_multiview:
+        mask &= multiview > 0.5
+    return mask
 
 
 def se3_inverse(T):
@@ -212,6 +274,651 @@ def render_frame(gaussians, w2c, K, H, W, num_gaussians=None):
     )
 
     return rgb, depth, alpha
+
+
+def parse_rgb_triplet(value):
+    if isinstance(value, (list, tuple)):
+        parts = value
+    else:
+        parts = str(value).replace(";", ",").split(",")
+    if len(parts) != 3:
+        raise ValueError(f"RGB color must have three comma-separated values, got {value!r}")
+    rgb = [float(part) for part in parts]
+    if max(rgb) > 1.0:
+        rgb = [channel / 255.0 for channel in rgb]
+    return tuple(float(np.clip(channel, 0.0, 1.0)) for channel in rgb)
+
+
+def _select_gaussian_masked_subset(gaussians, keep_mask):
+    filtered = {}
+    n = keep_mask.numel()
+    for key, value in gaussians.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim >= 2
+            and value.shape[0] == 1
+            and value.shape[1] == n
+        ):
+            filtered[key] = value[:, keep_mask]
+        else:
+            filtered[key] = value
+    return filtered
+
+
+def _redundancy_appearance_multiview_mask(
+    gaussians,
+    source_images,
+    all_w2c,
+    all_K,
+    H,
+    W,
+    color_threshold=0.12,
+    min_views=2,
+    match_radius=2,
+    chunk_size=200000,
+):
+    device = gaussians["opacity"].device
+    xyz = gaussians["xyz"].detach().float()[0]
+    n = xyz.shape[0]
+    if n == 0:
+        return torch.zeros((0,), device=device, dtype=torch.bool)
+
+    source_images = source_images.detach().to(device=device, dtype=torch.float32)
+    if source_images.ndim == 5:
+        source_images = source_images.reshape(-1, *source_images.shape[-3:])
+    all_w2c = all_w2c.detach().reshape(-1, 4, 4).to(device=device, dtype=torch.float32)
+    all_K = all_K.detach().reshape(-1, 3, 3).to(device=device, dtype=torch.float32)
+    view_count = min(source_images.shape[0], all_w2c.shape[0], all_K.shape[0])
+    min_views = max(1, int(min_views))
+    if view_count < min_views:
+        return torch.zeros((n,), device=device, dtype=torch.bool)
+    source_images = source_images[:view_count]
+    all_w2c = all_w2c[:view_count]
+    all_K = all_K[:view_count]
+
+    color = gaussians.get("competition_color")
+    if not isinstance(color, torch.Tensor):
+        color = gaussians["color"]
+    ref_color = color.detach().float()[0].to(device=device).clamp(0.0, 1.0)
+
+    R = all_w2c[:, :3, :3]
+    t = all_w2c[:, :3, 3]
+    fx = all_K[:, 0, 0].abs().clamp_min(1e-6)
+    fy = all_K[:, 1, 1].abs().clamp_min(1e-6)
+    cx = all_K[:, 0, 2]
+    cy = all_K[:, 1, 2]
+    out = torch.zeros((n,), device=device, dtype=torch.bool)
+    match_radius = max(0, int(match_radius))
+    offsets = [
+        (dx, dy)
+        for dy in range(-match_radius, match_radius + 1)
+        for dx in range(-match_radius, match_radius + 1)
+    ]
+    chunk_size = max(1, int(chunk_size))
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        pts = xyz[start:end]
+        cam = torch.matmul(pts.unsqueeze(0), R.transpose(1, 2)) + t[:, None, :]
+        z = cam[..., 2]
+        z_safe = z.clamp_min(1e-6)
+        px = fx[:, None] * cam[..., 0] / z_safe + cx[:, None]
+        py = fy[:, None] * cam[..., 1] / z_safe + cy[:, None]
+        projectable = (
+            (z > 1e-6)
+            & torch.isfinite(px)
+            & torch.isfinite(py)
+        )
+
+        min_diff = torch.full_like(px, float("inf"), dtype=torch.float32)
+        for dx, dy in offsets:
+            px_off = px + float(dx)
+            py_off = py + float(dy)
+            offset_valid = (
+                projectable
+                & (px_off >= 0)
+                & (px_off <= W - 1)
+                & (py_off >= 0)
+                & (py_off <= H - 1)
+            )
+            gx = 2.0 * px_off / max(W - 1, 1) - 1.0
+            gy = 2.0 * py_off / max(H - 1, 1) - 1.0
+            grid = torch.stack([gx, gy], dim=-1).reshape(view_count, end - start, 1, 2)
+            sampled = F.grid_sample(
+                source_images,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze(-1).permute(0, 2, 1)
+            diff = torch.linalg.norm(sampled - ref_color[start:end].unsqueeze(0), dim=-1)
+            diff = torch.where(offset_valid, diff, torch.full_like(diff, float("inf")))
+            min_diff = torch.minimum(min_diff, diff)
+        support = min_diff <= float(color_threshold)
+        out[start:end] = support.sum(dim=0) >= min_views
+
+    return out
+
+
+def render_gaussian_alpha(gaussians, w2c, K, H, W):
+    means = gaussians["xyz"].detach()
+    if means.shape[1] == 0:
+        return torch.zeros((1, 1, H, W, 1), device=means.device, dtype=torch.float32)
+    if means.device.type != "cuda":
+        _, alpha = render_gaussian_scene_frame(
+            gaussians,
+            w2c,
+            K,
+            H,
+            W,
+            ellipsoid_alpha_threshold=0.0,
+            depth_test=False,
+        )
+        return alpha
+
+    ones_color = torch.ones_like(gaussians["color"].detach()).contiguous().float()
+    _, alpha, _ = rasterization(
+        means=means.contiguous().float(),
+        quats=gaussians["rotation"].detach().contiguous().float(),
+        scales=gaussians["scale"].detach().contiguous().float(),
+        opacities=gaussians["opacity"].detach().squeeze(-1).contiguous().float(),
+        colors=ones_color,
+        viewmats=w2c.float(),
+        Ks=K.float(),
+        width=W,
+        height=H,
+        render_mode="RGB",
+        packed=False,
+    )
+    return alpha
+
+
+def _dilate_binary_mask(mask, radius):
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    kernel_size = radius * 2 + 1
+    return F.max_pool2d(
+        mask.unsqueeze(0),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=radius,
+    ).squeeze(0)
+
+
+def _erode_binary_mask(mask, radius):
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    return 1.0 - _dilate_binary_mask(1.0 - mask, radius)
+
+
+def _close_binary_mask(mask, radius):
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    return _erode_binary_mask(_dilate_binary_mask(mask, radius), radius)
+
+
+def _binary_mask_boundary(mask, width):
+    width = int(width)
+    if width <= 0:
+        return torch.zeros_like(mask)
+    dilated = _dilate_binary_mask(mask, width)
+    eroded = _erode_binary_mask(mask, width)
+    return (dilated - eroded).clamp(0.0, 1.0)
+
+
+def build_redundancy_suppression_overlay(
+    gaussians,
+    base_image,
+    w2c,
+    K,
+    H,
+    W,
+    overlay_color=(1.0, 0.15, 0.0),
+    overlay_alpha=0.55,
+    min_gaussian_opacity=0.2,
+    redundancy_coef_threshold=0.0,
+    overlay_mask=None,
+    mask_threshold=0.02,
+    connect_radius=4,
+    boundary_width=2,
+    boundary_alpha=0.95,
+    boundary_color=None,
+):
+    device = gaussians["opacity"].device
+    opacity_flat = gaussians["opacity"].detach().float()[0].reshape(-1)
+    if overlay_mask is None:
+        suppression_mask = _redundancy_suppression_mask_tensor(
+            gaussians,
+            opacity_flat.numel(),
+            device,
+            redundancy_coef_threshold=redundancy_coef_threshold,
+        )
+    else:
+        suppression_mask = overlay_mask.detach().to(device=device, dtype=torch.bool).reshape(-1)
+    suppressed_count = int(suppression_mask.sum().item())
+    if suppressed_count == 0:
+        mask_alpha = torch.zeros((1, H, W), device=base_image.device, dtype=torch.float32)
+        return base_image.clamp(0.0, 1.0), mask_alpha, suppressed_count
+
+    overlay_gaussians = _select_gaussian_masked_subset(gaussians, suppression_mask)
+    overlay_gaussians = dict(overlay_gaussians)
+    overlay_opacity = overlay_gaussians["opacity"].detach().clone().float()
+    if min_gaussian_opacity > 0:
+        overlay_opacity = torch.maximum(
+            overlay_opacity,
+            torch.full_like(overlay_opacity, float(min_gaussian_opacity)),
+        )
+    overlay_gaussians["opacity"] = overlay_opacity.clamp(0.0, 0.99)
+
+    alpha = render_gaussian_alpha(overlay_gaussians, w2c, K, H, W)
+    mask_alpha = alpha[0, 0].permute(2, 0, 1).to(device=base_image.device).clamp(0.0, 1.0)
+    region_mask = (mask_alpha >= float(mask_threshold)).to(dtype=base_image.dtype)
+    region_mask = _close_binary_mask(region_mask, connect_radius)
+    boundary_mask = _binary_mask_boundary(region_mask, boundary_width)
+
+    overlay_weight = (region_mask * float(overlay_alpha)).clamp(0.0, 1.0)
+    color = torch.tensor(overlay_color, device=base_image.device, dtype=base_image.dtype).view(3, 1, 1)
+    overlay = base_image.clamp(0.0, 1.0) * (1.0 - overlay_weight) + color * overlay_weight
+
+    if boundary_alpha > 0 and boundary_mask.any():
+        if boundary_color is None:
+            boundary_color = overlay_color
+        boundary_weight = (boundary_mask * float(boundary_alpha)).clamp(0.0, 1.0)
+        boundary_rgb = torch.tensor(boundary_color, device=base_image.device, dtype=base_image.dtype).view(3, 1, 1)
+        overlay = overlay * (1.0 - boundary_weight) + boundary_rgb * boundary_weight
+
+    return overlay.clamp(0.0, 1.0), region_mask, suppressed_count
+
+
+def _quat_to_rotation_matrix(quats):
+    quats = F.normalize(quats.float(), dim=-1)
+    r, x, y, z = quats.unbind(dim=-1)
+    one = torch.ones_like(r)
+    two = 2.0
+    return torch.stack(
+        [
+            one - two * (y * y + z * z),
+            two * (x * y - r * z),
+            two * (x * z + r * y),
+            two * (x * y + r * z),
+            one - two * (x * x + z * z),
+            two * (y * z - r * x),
+            two * (x * z - r * y),
+            two * (y * z + r * x),
+            one - two * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(quats.shape[:-1] + (3, 3))
+
+
+def _select_gaussian_scene_subset(
+    opacities,
+    px,
+    py,
+    H,
+    W,
+    max_gaussians,
+    selection_mode="screen_tile",
+    tile_size=16,
+):
+    if max_gaussians is None or int(max_gaussians) <= 0:
+        return None
+    max_gaussians = int(max_gaussians)
+    if opacities.numel() <= max_gaussians:
+        return None
+
+    if selection_mode == "opacity":
+        return torch.topk(opacities, k=max_gaussians, largest=True, sorted=False).indices
+
+    tile_size = max(1, int(tile_size))
+    tiles_x = max(1, int(math.ceil(float(W) / float(tile_size))))
+    tiles_y = max(1, int(math.ceil(float(H) / float(tile_size))))
+    tile_x = torch.floor(px / float(tile_size)).long().clamp(0, tiles_x - 1)
+    tile_y = torch.floor(py / float(tile_size)).long().clamp(0, tiles_y - 1)
+    tile_id = tile_y * tiles_x + tile_x
+
+    nonempty_tiles = max(1, int(torch.unique(tile_id).numel()))
+    per_tile = max(1, max_gaussians // nonempty_tiles)
+    # Sort by tile first and opacity second so each visible image region keeps
+    # candidates. Global top-k alone creates empty chunks in large scenes.
+    sort_key = tile_id.to(torch.float64) * 2.0 - opacities.clamp(0.0, 1.0).to(torch.float64)
+    sorted_idx = torch.argsort(sort_key)
+    sorted_tile = tile_id.index_select(0, sorted_idx)
+
+    tile_start = torch.ones(sorted_tile.shape[0], device=sorted_tile.device, dtype=torch.bool)
+    tile_start[1:] = sorted_tile[1:] != sorted_tile[:-1]
+    group_ids = torch.cumsum(tile_start.to(torch.long), dim=0) - 1
+    start_positions = torch.nonzero(tile_start, as_tuple=False).flatten()
+    ranks = torch.arange(sorted_tile.shape[0], device=sorted_tile.device) - start_positions.index_select(0, group_ids)
+    selected = sorted_idx.index_select(0, torch.nonzero(ranks < per_tile, as_tuple=False).flatten())
+
+    if selected.numel() > max_gaussians:
+        rel = torch.topk(opacities.index_select(0, selected), k=max_gaussians, largest=True, sorted=False).indices
+        return selected.index_select(0, rel)
+
+    if selected.numel() < max_gaussians:
+        remaining = max_gaussians - int(selected.numel())
+        keep_mask = torch.ones(opacities.shape[0], device=opacities.device, dtype=torch.bool)
+        keep_mask[selected] = False
+        rest_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
+        if rest_idx.numel() > 0:
+            k = min(remaining, int(rest_idx.numel()))
+            rel = torch.topk(opacities.index_select(0, rest_idx), k=k, largest=True, sorted=False).indices
+            selected = torch.cat([selected, rest_idx.index_select(0, rel)], dim=0)
+
+    return selected
+
+
+def render_gaussian_scene_frame(
+    gaussians,
+    w2c,
+    K,
+    H,
+    W,
+    num_gaussians=None,
+    scale_modifier=1.0,
+    opacity_multiplier=1.0,
+    opacity_power=1.0,
+    opacity_threshold=None,
+    ellipsoid_alpha_threshold=0.05,
+    max_gaussians=0,
+    selection_mode="screen_tile",
+    selection_tile_size=16,
+    exclude_pushed=False,
+    depth_test=True,
+    max_screen_radius=0.0,
+):
+    means = gaussians["xyz"].detach()
+    quats = gaussians["rotation"].detach()
+    scales = gaussians["scale"].detach()
+    opacities = gaussians["opacity"].detach()
+    colors = gaussians["color"].detach()
+    pushed = gaussians.get("pushed", None)
+    if isinstance(pushed, torch.Tensor):
+        pushed = pushed.detach()
+    device = means.device
+
+    B = means.shape[0]
+
+    if num_gaussians is not None:
+        if isinstance(num_gaussians, torch.Tensor):
+            max_N = int(num_gaussians.max().item())
+            means = means[:, :max_N]
+            quats = quats[:, :max_N]
+            scales = scales[:, :max_N]
+            opacities = opacities[:, :max_N].clone()
+            colors = colors[:, :max_N]
+            if isinstance(pushed, torch.Tensor):
+                pushed = pushed[:, :max_N]
+
+            range_seq = torch.arange(max_N, device=means.device).expand(B, max_N)
+            valid_mask = range_seq < num_gaussians.unsqueeze(1)
+            opacities[~valid_mask] = 0.0
+        else:
+            limit = int(num_gaussians)
+            means = means[:, :limit]
+            quats = quats[:, :limit]
+            scales = scales[:, :limit]
+            opacities = opacities[:, :limit]
+            colors = colors[:, :limit]
+            if isinstance(pushed, torch.Tensor):
+                pushed = pushed[:, :limit]
+
+    means = means[0].float()
+    quats = quats[0].float()
+    scales = scales[0].float() * float(scale_modifier)
+    opacities = opacities[0].reshape(-1).float().clone()
+    colors = colors[0].float().clamp(0.0, 1.0)
+    if isinstance(pushed, torch.Tensor):
+        pushed = pushed[0].reshape(-1).to(device=device)
+
+    if opacity_threshold is not None:
+        opacities = torch.where(
+            opacities > float(opacity_threshold),
+            opacities,
+            torch.zeros_like(opacities),
+        )
+    if opacity_power != 1.0:
+        opacities = opacities.clamp(0.0, 1.0).pow(float(opacity_power))
+    if opacity_multiplier != 1.0:
+        opacities = opacities * float(opacity_multiplier)
+    opacities = opacities.clamp(0.0, 0.99)
+
+    w2c_view = w2c.reshape(-1, 4, 4)[0].to(device=device, dtype=torch.float32)
+    K_view = K.reshape(-1, 3, 3)[0].to(device=device, dtype=torch.float32)
+    R_view = w2c_view[:3, :3]
+    t_view = w2c_view[:3, 3]
+    xyz_cam = means @ R_view.transpose(0, 1) + t_view
+    z_cam = xyz_cam[:, 2]
+
+    fx = K_view[0, 0].abs().clamp_min(1e-6)
+    fy = K_view[1, 1].abs().clamp_min(1e-6)
+    cx = K_view[0, 2]
+    cy = K_view[1, 2]
+    z_safe = z_cam.clamp_min(1e-6)
+    px = fx * xyz_cam[:, 0] / z_safe + cx
+    py = fy * xyz_cam[:, 1] / z_safe + cy
+    ndc_x = 2.0 * px / max(float(W), 1.0) - 1.0
+    ndc_y = 2.0 * py / max(float(H), 1.0) - 1.0
+
+    finite = (
+        torch.isfinite(means).all(dim=-1)
+        & torch.isfinite(scales).all(dim=-1)
+        & torch.isfinite(quats).all(dim=-1)
+        & torch.isfinite(colors).all(dim=-1)
+        & torch.isfinite(opacities)
+        & torch.isfinite(px)
+        & torch.isfinite(py)
+        & (opacities > 0)
+        & (z_cam > 1e-6)
+        & (ndc_x.abs() <= 1.3)
+        & (ndc_y.abs() <= 1.3)
+    )
+    if exclude_pushed and isinstance(pushed, torch.Tensor) and pushed.numel() == finite.numel():
+        finite &= pushed <= 0.5
+
+    if not finite.any():
+        rgb = torch.zeros((1, 1, H, W, 3), device=device, dtype=torch.float32)
+        alpha = torch.zeros((1, 1, H, W, 1), device=device, dtype=torch.float32)
+        return rgb, alpha
+
+    def keep(mask):
+        return (
+            means[mask],
+            quats[mask],
+            scales[mask],
+            opacities[mask],
+            colors[mask],
+            xyz_cam[mask],
+            z_cam[mask],
+            px[mask],
+            py[mask],
+        )
+
+    means, quats, scales, opacities, colors, xyz_cam, z_cam, px, py = keep(finite)
+
+    top_idx = _select_gaussian_scene_subset(
+        opacities,
+        px,
+        py,
+        H,
+        W,
+        max_gaussians,
+        selection_mode=selection_mode,
+        tile_size=selection_tile_size,
+    )
+    if top_idx is not None:
+        means = means.index_select(0, top_idx)
+        quats = quats.index_select(0, top_idx)
+        scales = scales.index_select(0, top_idx)
+        opacities = opacities.index_select(0, top_idx)
+        colors = colors.index_select(0, top_idx)
+        xyz_cam = xyz_cam.index_select(0, top_idx)
+        z_cam = z_cam.index_select(0, top_idx)
+        px = px.index_select(0, top_idx)
+        py = py.index_select(0, top_idx)
+
+    rotations = _quat_to_rotation_matrix(quats)
+    scale_mats = torch.diag_embed(scales)
+    # MonoGS gau_vert.glsl uses M = S * R and Sigma = transpose(M) * M.
+    m = torch.matmul(scale_mats, rotations)
+    cov_world = torch.matmul(m.transpose(1, 2), m)
+    cov_cam = torch.matmul(
+        R_view.unsqueeze(0),
+        torch.matmul(cov_world, R_view.transpose(0, 1).unsqueeze(0)),
+    )
+
+    z_safe = z_cam.clamp_min(1e-6)
+    tan_fovx = (0.5 * float(W)) / fx
+    tan_fovy = (0.5 * float(H)) / fy
+    x_cam = (xyz_cam[:, 0] / z_safe).clamp(-1.3 * tan_fovx, 1.3 * tan_fovx) * z_safe
+    y_cam = (xyz_cam[:, 1] / z_safe).clamp(-1.3 * tan_fovy, 1.3 * tan_fovy) * z_safe
+    zeros = torch.zeros_like(z_safe)
+    jac = torch.stack(
+        [
+            fx / z_safe,
+            zeros,
+            -(fx * x_cam) / (z_safe * z_safe),
+            zeros,
+            fy / z_safe,
+            -(fy * y_cam) / (z_safe * z_safe),
+        ],
+        dim=-1,
+    ).reshape(-1, 2, 3)
+    cov2d = torch.matmul(jac, torch.matmul(cov_cam, jac.transpose(1, 2)))
+    cov00 = cov2d[:, 0, 0] + 0.3
+    cov01 = cov2d[:, 0, 1]
+    cov11 = cov2d[:, 1, 1] + 0.3
+    det = cov00 * cov11 - cov01 * cov01
+
+    valid_cov = torch.isfinite(det) & (det > 1e-8) & (cov00 > 0) & (cov11 > 0)
+    if not valid_cov.any():
+        rgb = torch.zeros((1, 1, H, W, 3), device=device, dtype=torch.float32)
+        alpha = torch.zeros((1, 1, H, W, 1), device=device, dtype=torch.float32)
+        return rgb, alpha
+
+    colors = colors[valid_cov]
+    opacities = opacities[valid_cov]
+    z_cam = z_cam[valid_cov]
+    px = px[valid_cov]
+    py = py[valid_cov]
+    cov00 = cov00[valid_cov]
+    cov01 = cov01[valid_cov]
+    cov11 = cov11[valid_cov]
+    det = det[valid_cov]
+
+    conic00 = cov11 / det
+    conic01 = -cov01 / det
+    conic11 = cov00 / det
+    radius_x = 3.0 * torch.sqrt(cov00.clamp_min(1e-8))
+    radius_y = 3.0 * torch.sqrt(cov11.clamp_min(1e-8))
+    if max_screen_radius is not None and float(max_screen_radius) > 0:
+        radius_limit = float(max_screen_radius)
+        radius_valid = (radius_x <= radius_limit) & (radius_y <= radius_limit)
+        if not radius_valid.any():
+            rgb = torch.zeros((1, 1, H, W, 3), device=device, dtype=torch.float32)
+            alpha = torch.zeros((1, 1, H, W, 1), device=device, dtype=torch.float32)
+            return rgb, alpha
+        colors = colors[radius_valid]
+        opacities = opacities[radius_valid]
+        z_cam = z_cam[radius_valid]
+        px = px[radius_valid]
+        py = py[radius_valid]
+        conic00 = conic00[radius_valid]
+        conic01 = conic01[radius_valid]
+        conic11 = conic11[radius_valid]
+        radius_x = radius_x[radius_valid]
+        radius_y = radius_y[radius_valid]
+
+    x0 = torch.floor(px - radius_x).long().clamp(0, W - 1)
+    x1 = torch.ceil(px + radius_x).long().clamp(0, W - 1)
+    y0 = torch.floor(py - radius_y).long().clamp(0, H - 1)
+    y1 = torch.ceil(py + radius_y).long().clamp(0, H - 1)
+    visible = (
+        (x1 >= x0)
+        & (y1 >= y0)
+        & (px + radius_x >= 0)
+        & (px - radius_x < W)
+        & (py + radius_y >= 0)
+        & (py - radius_y < H)
+    )
+    if not visible.any():
+        rgb = torch.zeros((1, 1, H, W, 3), device=device, dtype=torch.float32)
+        alpha = torch.zeros((1, 1, H, W, 1), device=device, dtype=torch.float32)
+        return rgb, alpha
+
+    colors = colors[visible]
+    opacities = opacities[visible]
+    z_cam = z_cam[visible]
+    px = px[visible]
+    py = py[visible]
+    conic00 = conic00[visible]
+    conic01 = conic01[visible]
+    conic11 = conic11[visible]
+    x0 = x0[visible]
+    x1 = x1[visible]
+    y0 = y0[visible]
+    y1 = y1[visible]
+
+    order = torch.argsort(z_cam, descending=True)
+    colors = colors.index_select(0, order).cpu().numpy()
+    opacities = opacities.index_select(0, order).cpu().numpy()
+    z_cam = z_cam.index_select(0, order).cpu().numpy()
+    px = px.index_select(0, order).cpu().numpy()
+    py = py.index_select(0, order).cpu().numpy()
+    conic00 = conic00.index_select(0, order).cpu().numpy()
+    conic01 = conic01.index_select(0, order).cpu().numpy()
+    conic11 = conic11.index_select(0, order).cpu().numpy()
+    x0 = x0.index_select(0, order).cpu().numpy()
+    x1 = x1.index_select(0, order).cpu().numpy()
+    y0 = y0.index_select(0, order).cpu().numpy()
+    y1 = y1.index_select(0, order).cpu().numpy()
+
+    image = np.zeros((H, W, 3), dtype=np.float32)
+    alpha_acc = np.zeros((H, W), dtype=np.float32)
+    depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
+    threshold = float(ellipsoid_alpha_threshold)
+
+    for idx in range(colors.shape[0]):
+        xa, xb = int(x0[idx]), int(x1[idx])
+        ya, yb = int(y0[idx]), int(y1[idx])
+        if xa > xb or ya > yb:
+            continue
+
+        xs = np.arange(xa, xb + 1, dtype=np.float32)[None, :] - float(px[idx])
+        ys = np.arange(ya, yb + 1, dtype=np.float32)[:, None] - float(py[idx])
+        power = (
+            -0.5 * (float(conic00[idx]) * xs * xs + float(conic11[idx]) * ys * ys)
+            - float(conic01[idx]) * xs * ys
+        )
+        exp_power = np.exp(np.minimum(power, 0.0)).astype(np.float32)
+        opacity = np.minimum(0.99, float(opacities[idx]) * exp_power)
+        src_alpha = ((power <= 0.0) & (opacity >= (1.0 / 255.0)) & (opacity > threshold)).astype(np.float32)
+        src_mask = src_alpha > 0.0
+        if bool(depth_test):
+            depth_roi = depth_buffer[ya:yb + 1, xa:xb + 1]
+            src_mask = src_mask & (float(z_cam[idx]) < depth_roi)
+        if not np.any(src_mask):
+            continue
+
+        src_rgb = colors[idx][None, None, :] * exp_power[:, :, None]
+        roi = image[ya:yb + 1, xa:xb + 1]
+        alpha_roi = alpha_acc[ya:yb + 1, xa:xb + 1]
+        if bool(depth_test):
+            depth_roi[src_mask] = float(z_cam[idx])
+            roi[src_mask] = src_rgb[src_mask]
+            alpha_roi[src_mask] = 1.0
+        else:
+            inv_alpha = 1.0 - src_alpha
+            roi[:] = src_rgb * src_alpha[:, :, None] + roi * inv_alpha[:, :, None]
+            alpha_roi[:] = src_alpha + alpha_roi * inv_alpha
+
+    rgb = torch.from_numpy(image).to(device=device, dtype=torch.float32).reshape(1, 1, H, W, 3)
+    alpha = torch.from_numpy(alpha_acc[..., None]).to(device=device, dtype=torch.float32).reshape(1, 1, H, W, 1)
+    return rgb, alpha
 
 
 def list_sorted_files(directory, extensions):
@@ -984,7 +1691,20 @@ def is_retryable_inference_error(exc):
 
 
 def select_render_gaussians(gaussians, batch_index=0):
-    render_keys = {"xyz", "rotation", "scale", "opacity", "color", "competition_color", "pushed"}
+    render_keys = {
+        "xyz",
+        "rotation",
+        "scale",
+        "opacity",
+        "color",
+        "competition_color",
+        "source_view",
+        "redundancy_score",
+        "redundancy_coef",
+        "competition_gate",
+        "competition_active",
+        "pushed",
+    }
     current = {
         k: v[batch_index:batch_index + 1]
         for k, v in gaussians.items()
@@ -1026,6 +1746,197 @@ def filter_gaussians_by_opacity(gaussians, opacity_threshold=None):
         else:
             filtered[key] = value
     return filtered
+
+
+def _gaussian_vector(gaussians, key, length, fill=0.0, dtype=torch.float32):
+    value = gaussians.get(key)
+    if not isinstance(value, torch.Tensor):
+        return torch.full((length,), fill, device=gaussians["opacity"].device, dtype=dtype)
+    value = value.detach()
+    if value.ndim == 3:
+        value = value[0, :, 0]
+    elif value.ndim == 2 and value.shape[0] == 1:
+        value = value[0]
+    value = value.reshape(-1).to(device=gaussians["opacity"].device, dtype=dtype)
+    if value.numel() == length:
+        return value
+    out = torch.full((length,), fill, device=gaussians["opacity"].device, dtype=dtype)
+    n = min(length, value.numel())
+    if n > 0:
+        out[:n] = value[:n]
+    return out
+
+
+def _gaussian_matrix(gaussians, key, length, channels, fill=0.0):
+    value = gaussians.get(key)
+    device = gaussians["opacity"].device
+    if not isinstance(value, torch.Tensor):
+        return torch.full((length, channels), fill, device=device, dtype=torch.float32)
+    value = value.detach()
+    if value.ndim == 3:
+        value = value[0]
+    value = value.reshape(value.shape[0], -1).to(device=device, dtype=torch.float32)
+    if value.shape[0] == length and value.shape[1] >= channels:
+        return value[:, :channels]
+    out = torch.full((length, channels), fill, device=device, dtype=torch.float32)
+    n = min(length, value.shape[0])
+    c = min(channels, value.shape[1])
+    if n > 0 and c > 0:
+        out[:n, :c] = value[:n, :c]
+    return out
+
+
+def _select_diagnostic_indices(opacity_pre, opacity_post, redundancy_score, redundancy_coef, gate, max_rows):
+    n = int(opacity_post.numel())
+    if max_rows is None or max_rows <= 0 or n <= max_rows:
+        return torch.arange(n, device=opacity_post.device)
+
+    priority = torch.maximum(opacity_post, opacity_pre)
+    priority = priority + redundancy_coef + 0.05 * redundancy_score.clamp_min(0.0)
+    priority = priority + (1.0 - gate).clamp_min(0.0)
+    k = min(int(max_rows), n)
+    return torch.topk(priority, k=k, largest=True, sorted=False).indices
+
+
+def save_opacity_cdf_plot(opacity_pre, opacity_post, gate, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pre = opacity_pre.detach().float().cpu().numpy()
+    post = opacity_post.detach().float().cpu().numpy()
+    gate_np = gate.detach().float().cpu().numpy()
+    bins = np.linspace(0.0, 1.0, 401)
+
+    def cumulative(values):
+        values = np.clip(values[np.isfinite(values)], 0.0, 1.0)
+        if values.size == 0:
+            return np.zeros((bins.size - 1,), dtype=np.float32)
+        hist, _ = np.histogram(values, bins=bins)
+        return np.cumsum(hist).astype(np.float64) / max(1, int(hist.sum()))
+
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.4))
+    x = bins[1:]
+    axes[0].plot(x, cumulative(pre), color="#3B6FB6", linewidth=2.0, label="pre-gate opacity")
+    axes[0].plot(x, cumulative(post), color="#D4513C", linewidth=2.0, label="post-gate opacity")
+    axes[0].axvline(0.05, color="#202020", linestyle="--", linewidth=1.1, label="0.05 threshold")
+    axes[0].set_xlim(0, 1)
+    axes[0].set_ylim(0, 1)
+    axes[0].set_xlabel("opacity")
+    axes[0].set_ylabel("CDF")
+    axes[0].grid(True, linewidth=0.3, alpha=0.35)
+    axes[0].legend(frameon=False, fontsize=8)
+
+    suppression = 1.0 - np.clip(gate_np[np.isfinite(gate_np)], 0.0, 1.0)
+    axes[1].hist(suppression, bins=np.linspace(0, 1, 80), color="#E08B2D", alpha=0.78)
+    axes[1].set_xlabel("1 - competition gate")
+    axes[1].set_ylabel("count")
+    axes[1].set_title("opacity suppression")
+    axes[1].grid(True, linewidth=0.3, alpha=0.35)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(path, dpi=260, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
+def write_gaussian_diagnostics(gaussians, scene_label, output_dir, max_rows=250000, opacity_threshold=0.05):
+    diag_dir = os.path.join(output_dir, "gaussian_diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    opacity_post = gaussians["opacity"].detach().float()[0, :, 0]
+    n = int(opacity_post.numel())
+    redundancy_score = _gaussian_vector(gaussians, "redundancy_score", n, fill=0.0)
+    redundancy_coef = _gaussian_vector(gaussians, "redundancy_coef", n, fill=0.0)
+    gate = _gaussian_vector(gaussians, "competition_gate", n, fill=1.0).clamp(1e-6, 1.0)
+    competition_active = _gaussian_vector(gaussians, "competition_active", n, fill=0.0)
+    source_view = _gaussian_vector(gaussians, "source_view", n, fill=-1, dtype=torch.float32)
+    opacity_pre = (opacity_post / gate).clamp(0.0, 1.0)
+
+    stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in scene_label)
+    cdf_path = os.path.join(diag_dir, f"opacity_cdf_{stem}.png")
+    save_opacity_cdf_plot(opacity_pre, opacity_post, gate, cdf_path)
+
+    idx = _select_diagnostic_indices(
+        opacity_pre,
+        opacity_post,
+        redundancy_score,
+        redundancy_coef,
+        gate,
+        max_rows=max_rows,
+    )
+    xyz = _gaussian_matrix(gaussians, "xyz", n, 3).index_select(0, idx).cpu().numpy()
+    color = _gaussian_matrix(gaussians, "color", n, 3).index_select(0, idx).cpu().numpy()
+    comp_color = _gaussian_matrix(gaussians, "competition_color", n, 3).index_select(0, idx).cpu().numpy()
+
+    idx_cpu = idx.detach().cpu().numpy()
+    columns = {
+        "redundancy_score": redundancy_score.index_select(0, idx).cpu().numpy(),
+        "redundancy_coef": redundancy_coef.index_select(0, idx).cpu().numpy(),
+        "competition_gate": gate.index_select(0, idx).cpu().numpy(),
+        "competition_active": competition_active.index_select(0, idx).cpu().numpy(),
+        "opacity_pre": opacity_pre.index_select(0, idx).cpu().numpy(),
+        "opacity_post": opacity_post.index_select(0, idx).cpu().numpy(),
+        "source_view": source_view.index_select(0, idx).cpu().numpy(),
+    }
+
+    csv_path = os.path.join(diag_dir, f"per_gaussian_diagnostics_{stem}.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "scene",
+                "gaussian_index",
+                "redundancy_score",
+                "redundancy_coef",
+                "competition_gate",
+                "competition_active",
+                "opacity_pre",
+                "opacity_post",
+                "active_005",
+                "source_view",
+                "xyz_x",
+                "xyz_y",
+                "xyz_z",
+                "color_r",
+                "color_g",
+                "color_b",
+                "competition_color_r",
+                "competition_color_g",
+                "competition_color_b",
+            ],
+        )
+        writer.writeheader()
+        for row_i, gaussian_index in enumerate(idx_cpu):
+            opacity_value = float(columns["opacity_post"][row_i])
+            writer.writerow(
+                {
+                    "scene": scene_label,
+                    "gaussian_index": int(gaussian_index),
+                    "redundancy_score": f"{float(columns['redundancy_score'][row_i]):.8f}",
+                    "redundancy_coef": f"{float(columns['redundancy_coef'][row_i]):.8f}",
+                    "competition_gate": f"{float(columns['competition_gate'][row_i]):.8f}",
+                    "competition_active": int(float(columns["competition_active"][row_i]) > 0.5),
+                    "opacity_pre": f"{float(columns['opacity_pre'][row_i]):.8f}",
+                    "opacity_post": f"{opacity_value:.8f}",
+                    "active_005": int(opacity_value > float(opacity_threshold)),
+                    "source_view": int(round(float(columns["source_view"][row_i]))),
+                    "xyz_x": f"{float(xyz[row_i, 0]):.8f}",
+                    "xyz_y": f"{float(xyz[row_i, 1]):.8f}",
+                    "xyz_z": f"{float(xyz[row_i, 2]):.8f}",
+                    "color_r": f"{float(color[row_i, 0]):.8f}",
+                    "color_g": f"{float(color[row_i, 1]):.8f}",
+                    "color_b": f"{float(color[row_i, 2]):.8f}",
+                    "competition_color_r": f"{float(comp_color[row_i, 0]):.8f}",
+                    "competition_color_g": f"{float(comp_color[row_i, 1]):.8f}",
+                    "competition_color_b": f"{float(comp_color[row_i, 2]):.8f}",
+                }
+            )
+
+    return {
+        "diagnostic_csv": csv_path,
+        "diagnostic_rows": int(idx.numel()),
+        "diagnostic_total_gaussians": n,
+        "opacity_cdf_path": cdf_path,
+    }
 
 
 def _scatter_weighted_average(values, weights, inverse_indices, num_voxels):
@@ -1255,6 +2166,8 @@ def main():
                         help="Ablation: use dense Gaussian candidates instead of quadtree-selected candidates.")
     parser.add_argument("--disable_local_competition", action="store_true",
                         help="Ablation: disable local competition opacity suppression.")
+    parser.add_argument("--hard_prune_redundant_gaussians_eval", action="store_true",
+                        help="Physically remove Gaussians above the local redundancy threshold during eval.")
     parser.add_argument("--disable_learnable_sampling", action="store_true",
                         help="Ablation: disable learned density extras; only proposal candidates are used.")
     parser.add_argument("--disable_density_opacity_gate", action="store_true",
@@ -1291,6 +2204,34 @@ def main():
                         help="If set, render only Gaussians with opacity above this threshold.")
     parser.add_argument("--ply_opacity_threshold", type=float, default=0.05,
                         help="Opacity threshold used when saving the PLY point cloud.")
+    parser.add_argument("--save_redundancy_overlay", action=argparse.BooleanOptionalAction, default=True,
+                        help="Save an input-image overlay showing where redundant Gaussians had opacity suppressed.")
+    parser.add_argument("--redundancy_overlay_color", type=str, default="1.0,0.15,0.0",
+                        help="RGB color for the redundancy overlay, as 0-1 or 0-255 comma values.")
+    parser.add_argument("--redundancy_overlay_alpha", type=float, default=0.55,
+                        help="Blend opacity for the redundancy overlay on top of the input image.")
+    parser.add_argument("--redundancy_overlay_min_gaussian_opacity", type=float, default=0.3,
+                        help="Minimum visualization opacity used when rendering suppressed Gaussians into the overlay mask.")
+    parser.add_argument("--redundancy_overlay_mask_threshold", type=float, default=0.02,
+                        help="Rendered alpha threshold used to convert redundancy overlays into solid regions.")
+    parser.add_argument("--redundancy_overlay_connect_radius", type=int, default=4,
+                        help="Pixel radius for closing small gaps in redundancy overlay regions.")
+    parser.add_argument("--redundancy_overlay_boundary_width", type=float, default=0.5,
+                        help="Pixel width of the redundancy overlay region boundary.")
+    parser.add_argument("--redundancy_overlay_boundary_alpha", type=float, default=0.95,
+                        help="Blend opacity for the redundancy overlay region boundary.")
+    parser.add_argument("--redundancy_overlay_boundary_color", type=str, default=None,
+                        help="Optional RGB color for overlay boundaries. Defaults to --redundancy_overlay_color.")
+    parser.add_argument("--redundancy_overlay_coef_threshold", type=float, default=0.0,
+                        help="Fallback redundancy_coef threshold used for overlays when competition_active/gate are unavailable.")
+    parser.add_argument("--redundancy_overlay_multiview_color_threshold", type=float, default=0.2,
+                        help="Max RGB distance for counting a suppressed Gaussian as visible in another input view.")
+    parser.add_argument("--redundancy_overlay_match_radius", type=int, default=4,
+                        help="Pixel radius around projected Gaussian centers used for multi-view appearance matching.")
+    parser.add_argument("--redundancy_overlay_min_views", type=int, default=2,
+                        help="Minimum number of input views with matching appearance before a suppressed Gaussian is overlaid.")
+    parser.add_argument("--redundancy_overlay_chunk_size", type=int, default=200000,
+                        help="Chunk size for appearance-based multi-view overlay filtering.")
     parser.add_argument("--scale_bias_strength", type=float, default=None,
                         help="Override Pi3_3DGS scale_bias_strength for ablations.")
     parser.add_argument("--scale_activation_multiplier", type=float, default=None,
@@ -1334,6 +2275,34 @@ def main():
                         help="Skip writing Gaussian .ply files; useful for metric-only sweeps.")
     parser.add_argument("--skip_save_frames", action="store_true",
                         help="Skip writing rendered RGB/depth/opacity images; metrics are still computed.")
+    parser.add_argument("--skip_save_gaussian_scene", action="store_true",
+                        help="Skip writing MonoGS-style Gaussian scene visualization images.")
+    parser.add_argument("--gaussian_scene_scale_modifier", type=float, default=1.0,
+                        help="Scale multiplier for Gaussian scene visualization, similar to MonoGS GUI's Gaussian Scale slider.")
+    parser.add_argument("--gaussian_scene_opacity_multiplier", type=float, default=1.0,
+                        help="Opacity multiplier for Gaussian scene visualization only.")
+    parser.add_argument("--gaussian_scene_opacity_power", type=float, default=1.0,
+                        help="Opacity power for Gaussian scene visualization only. Values below 1 boost faint Gaussians.")
+    parser.add_argument("--gaussian_scene_opacity_threshold", type=float, default=None,
+                        help="If set, zero Gaussians below this opacity only for Gaussian scene visualization.")
+    parser.add_argument("--gaussian_scene_ellipsoid_alpha_threshold", type=float, default=0.05,
+                        help="MonoGS Elipsoid Shader fragment alpha threshold for render_mod=-4.")
+    parser.add_argument("--gaussian_scene_max_gaussians", type=int, default=0,
+                        help="Max Gaussians used for offline ellipsoid visualization. Use 0 to render every visible Gaussian.")
+    parser.add_argument("--gaussian_scene_selection_mode", type=str, choices=["screen_tile", "opacity"], default="screen_tile",
+                        help="How to downselect Gaussians when --gaussian_scene_max_gaussians is positive.")
+    parser.add_argument("--gaussian_scene_selection_tile_size", type=int, default=16,
+                        help="Screen tile size used by --gaussian_scene_selection_mode screen_tile.")
+    parser.add_argument("--gaussian_scene_exclude_pushed", action=argparse.BooleanOptionalAction, default=False,
+                        help="Exclude model pushed/far support Gaussians from MonoGS-style ellipsoid visualization.")
+    parser.add_argument("--gaussian_scene_depth_test", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use a z-buffer for MonoGS-style ellipsoid visualization occlusion.")
+    parser.add_argument("--gaussian_scene_max_screen_radius", type=float, default=0.0,
+                        help="Optional screen-space radius cap for ellipsoid visualization. 0 disables the cap.")
+    parser.add_argument("--save_gaussian_diagnostics", action="store_true",
+                        help="Write per-Gaussian redundancy/opacity diagnostics and opacity CDF plots.")
+    parser.add_argument("--gaussian_diagnostic_max_rows", type=int, default=250000,
+                        help="Max rows per diagnostic CSV. Use 0 to write every Gaussian.")
     parser.add_argument("--sparse_metric_max_radius", type=int, default=16,
                         help="Max pixel radius for local sparse LiDAR point pairs.")
     parser.add_argument("--sparse_metric_min_pixel_distance", type=int, default=2,
@@ -1354,6 +2323,50 @@ def main():
                         help="Local residual consistency also limits relative depth gaps.")
     args = parser.parse_args()
     args.use_depth_sigma_filter = not args.disable_depth_sigma_filter
+    args.redundancy_overlay_color_rgb = parse_rgb_triplet(args.redundancy_overlay_color)
+    args.redundancy_overlay_boundary_color_rgb = (
+        args.redundancy_overlay_color_rgb
+        if args.redundancy_overlay_boundary_color is None
+        else parse_rgb_triplet(args.redundancy_overlay_boundary_color)
+    )
+    if not (0.0 <= args.redundancy_overlay_alpha <= 1.0):
+        raise ValueError("--redundancy_overlay_alpha must be in [0, 1].")
+    if not (0.0 <= args.redundancy_overlay_mask_threshold <= 1.0):
+        raise ValueError("--redundancy_overlay_mask_threshold must be in [0, 1].")
+    if args.redundancy_overlay_connect_radius < 0:
+        raise ValueError("--redundancy_overlay_connect_radius must be non-negative.")
+    if args.redundancy_overlay_boundary_width < 0:
+        raise ValueError("--redundancy_overlay_boundary_width must be non-negative.")
+    if not (0.0 <= args.redundancy_overlay_boundary_alpha <= 1.0):
+        raise ValueError("--redundancy_overlay_boundary_alpha must be in [0, 1].")
+    if args.redundancy_overlay_min_gaussian_opacity < 0:
+        raise ValueError("--redundancy_overlay_min_gaussian_opacity must be non-negative.")
+    if args.redundancy_overlay_coef_threshold < 0:
+        raise ValueError("--redundancy_overlay_coef_threshold must be non-negative.")
+    if args.redundancy_overlay_multiview_color_threshold < 0:
+        raise ValueError("--redundancy_overlay_multiview_color_threshold must be non-negative.")
+    if args.redundancy_overlay_match_radius < 0:
+        raise ValueError("--redundancy_overlay_match_radius must be non-negative.")
+    if args.redundancy_overlay_min_views <= 0:
+        raise ValueError("--redundancy_overlay_min_views must be positive.")
+    if args.redundancy_overlay_chunk_size <= 0:
+        raise ValueError("--redundancy_overlay_chunk_size must be positive.")
+    if args.gaussian_scene_scale_modifier <= 0:
+        raise ValueError("--gaussian_scene_scale_modifier must be positive.")
+    if args.gaussian_scene_opacity_multiplier < 0:
+        raise ValueError("--gaussian_scene_opacity_multiplier must be non-negative.")
+    if args.gaussian_scene_opacity_power <= 0:
+        raise ValueError("--gaussian_scene_opacity_power must be positive.")
+    if args.gaussian_scene_opacity_threshold is not None and args.gaussian_scene_opacity_threshold < 0:
+        raise ValueError("--gaussian_scene_opacity_threshold must be non-negative when set.")
+    if args.gaussian_scene_ellipsoid_alpha_threshold < 0:
+        raise ValueError("--gaussian_scene_ellipsoid_alpha_threshold must be non-negative.")
+    if args.gaussian_scene_max_gaussians < 0:
+        raise ValueError("--gaussian_scene_max_gaussians must be non-negative.")
+    if args.gaussian_scene_selection_tile_size <= 0:
+        raise ValueError("--gaussian_scene_selection_tile_size must be positive.")
+    if args.gaussian_scene_max_screen_radius < 0:
+        raise ValueError("--gaussian_scene_max_screen_radius must be non-negative.")
     if args.eval_source == "raw_folder" and not args.data_path:
         raise ValueError("--data_path is required when --eval_source raw_folder.")
     if args.eval_source == "three_sixty_v2_dataset" and not args.dataset_scene:
@@ -1376,6 +2389,7 @@ def main():
     print(f"Ablation: {args.ablation_name}")
     print(f"Quadtree enabled: {not args.disable_quadtree}")
     print(f"Local competition enabled: {not args.disable_local_competition}")
+    print(f"Local competition hard redundancy prune: {args.hard_prune_redundant_gaussians_eval}")
     print("Local competition hard cap enabled: False")
     print(f"Gaussian render mode: {args.gaussian_mode}")
     print(f"Gaussian branch view stride: {args.gs_view_stride}")
@@ -1404,11 +2418,13 @@ def main():
         "enable_quadtree": not args.disable_quadtree,
         "enable_local_competition": not args.disable_local_competition,
     })
+    valid_model_keys = set(inspect.signature(model_cls.__init__).parameters)
+    if args.hard_prune_redundant_gaussians_eval and "hard_prune_redundant_gaussians_eval" in valid_model_keys:
+        model_kwargs["hard_prune_redundant_gaussians_eval"] = True
     if args.disable_learnable_sampling:
         model_kwargs["enable_learnable_sampling"] = False
     if args.disable_density_opacity_gate:
         model_kwargs["density_gate_opacity_power"] = 0.0
-    valid_model_keys = set(inspect.signature(model_cls.__init__).parameters)
     for arg_name in (
         "density_gate_min_prob",
         "density_gate_opacity_power",
@@ -1562,6 +2578,26 @@ def main():
         opacity_flat = current_gaussians["opacity"].detach().float().reshape(-1)
         rendered_count = int(opacity_flat.numel())
         rendered_active_count = int((opacity_flat > 0.05).sum().item())
+        redundancy_suppression_mask = _redundancy_suppression_mask_tensor(
+            raw_gaussians,
+            raw_total_count,
+            raw_gaussians["opacity"].device,
+            redundancy_coef_threshold=args.redundancy_overlay_coef_threshold,
+        )
+        redundancy_appearance_mask = _redundancy_appearance_multiview_mask(
+            raw_gaussians,
+            imgs_batch[0],
+            pred_w2c,
+            pred_K,
+            H,
+            W,
+            color_threshold=args.redundancy_overlay_multiview_color_threshold,
+            min_views=args.redundancy_overlay_min_views,
+            match_radius=args.redundancy_overlay_match_radius,
+            chunk_size=args.redundancy_overlay_chunk_size,
+        )
+        redundancy_suppression_mask &= redundancy_appearance_mask
+        redundancy_suppression_count = int(redundancy_suppression_mask.sum().item())
         stat_values = {}
         gaussian_stats = res.get("gaussian_stats", {})
         if isinstance(gaussian_stats, dict):
@@ -1570,6 +2606,16 @@ def main():
                     stat_flat = stat_tensor.detach().float().reshape(stat_tensor.shape[0], -1)
                     if stat_flat.shape[0] > 0 and stat_flat.shape[1] == 1:
                         stat_values[f"stat_{stat_key}"] = float(stat_flat[0, 0].cpu().item())
+
+        diagnostic_values = {}
+        if args.save_gaussian_diagnostics:
+            diagnostic_values = write_gaussian_diagnostics(
+                raw_gaussians,
+                scene_label,
+                args.output_dir,
+                max_rows=args.gaussian_diagnostic_max_rows,
+                opacity_threshold=0.05,
+            )
 
         ply_filename = os.path.join(args.output_dir, f"gaussians_{scene_label}.ply")
         if args.skip_save_ply:
@@ -1589,7 +2635,7 @@ def main():
                 f"({kept_count}/{ply_input_count} kept, "
                 f"{removed_count} removed with opacity <= {args.ply_opacity_threshold:g})"
             )
-        scene_gaussian_reports.append({
+        scene_report = {
             "scene": scene_label,
             "ply_path": saved_ply_path,
             "total_count": raw_total_count,
@@ -1599,11 +2645,14 @@ def main():
             "rendered_count": rendered_count,
             "rendered_active_count_opacity_gt_005": rendered_active_count,
             "ply_kept_count": kept_count,
+            "redundancy_suppression_count": redundancy_suppression_count,
             "opacity_threshold": args.ply_opacity_threshold,
             "render_opacity_threshold": args.render_opacity_threshold,
             "ply_opacity_threshold": args.ply_opacity_threshold,
             **stat_values,
-        })
+            **diagnostic_values,
+        }
+        scene_gaussian_reports.append(scene_report)
 
         for i, global_frame_idx in enumerate(frame_indices):
             frame_name = frame_items[global_frame_idx]["stem"]
@@ -1638,6 +2687,55 @@ def main():
                 save_image(rgb_out, rgb_path)
                 save_depth(depth_out, depth_path)
                 save_heatmap(alpha_out, opacity_path)
+                if args.save_redundancy_overlay:
+                    overlay_tensor, _, _ = build_redundancy_suppression_overlay(
+                        raw_gaussians,
+                        gt_img,
+                        view_w2c,
+                        view_K,
+                        H,
+                        W,
+                        overlay_color=args.redundancy_overlay_color_rgb,
+                        overlay_alpha=args.redundancy_overlay_alpha,
+                        min_gaussian_opacity=args.redundancy_overlay_min_gaussian_opacity,
+                        redundancy_coef_threshold=args.redundancy_overlay_coef_threshold,
+                        overlay_mask=redundancy_suppression_mask,
+                        mask_threshold=args.redundancy_overlay_mask_threshold,
+                        connect_radius=args.redundancy_overlay_connect_radius,
+                        boundary_width=args.redundancy_overlay_boundary_width,
+                        boundary_alpha=args.redundancy_overlay_boundary_alpha,
+                        boundary_color=args.redundancy_overlay_boundary_color_rgb,
+                    )
+                    overlay_path = os.path.join(
+                        args.output_dir,
+                        f"redundancy_suppression_overlay_{global_frame_idx:04d}.png",
+                    )
+                    save_image(overlay_tensor, overlay_path)
+                    del overlay_tensor
+                if not args.skip_save_gaussian_scene:
+                    gaussian_scene_tensor, gaussian_scene_alpha = render_gaussian_scene_frame(
+                        current_gaussians,
+                        view_w2c,
+                        view_K,
+                        H,
+                        W,
+                        num_gaussians=current_num_near,
+                        scale_modifier=args.gaussian_scene_scale_modifier,
+                        opacity_multiplier=args.gaussian_scene_opacity_multiplier,
+                        opacity_power=args.gaussian_scene_opacity_power,
+                        opacity_threshold=args.gaussian_scene_opacity_threshold,
+                        ellipsoid_alpha_threshold=args.gaussian_scene_ellipsoid_alpha_threshold,
+                        max_gaussians=args.gaussian_scene_max_gaussians,
+                        selection_mode=args.gaussian_scene_selection_mode,
+                        selection_tile_size=args.gaussian_scene_selection_tile_size,
+                        exclude_pushed=args.gaussian_scene_exclude_pushed,
+                        depth_test=args.gaussian_scene_depth_test,
+                        max_screen_radius=args.gaussian_scene_max_screen_radius,
+                    )
+                    gaussian_scene_out = gaussian_scene_tensor[0, 0].permute(2, 0, 1)
+                    gaussian_scene_path = os.path.join(args.output_dir, f"gaussian_scene_{global_frame_idx:04d}.png")
+                    save_image(gaussian_scene_out, gaussian_scene_path)
+                    del gaussian_scene_tensor, gaussian_scene_alpha, gaussian_scene_out
 
             if use_depth_eval:
                 pred_depth_cpu = depth_out.squeeze(0).float().cpu()
@@ -1979,6 +3077,7 @@ def main():
         f.write(f"ablation_name: {args.ablation_name}\n")
         f.write(f"quadtree_enabled: {not args.disable_quadtree}\n")
         f.write(f"local_competition_enabled: {not args.disable_local_competition}\n")
+        f.write(f"hard_prune_redundant_gaussians_eval: {args.hard_prune_redundant_gaussians_eval}\n")
         f.write("local_competition_hard_cap_enabled: False\n")
         f.write(f"learnable_sampling_enabled: {not args.disable_learnable_sampling}\n")
         f.write(f"density_opacity_gate_enabled: {not args.disable_density_opacity_gate}\n")
@@ -2006,7 +3105,34 @@ def main():
         if loaded_config_path:
             f.write(f"model_config: {loaded_config_path}\n")
         f.write(f"render_frames_saved: {not args.skip_save_frames}\n")
+        f.write(f"gaussian_scene_saved: {not args.skip_save_frames and not args.skip_save_gaussian_scene}\n")
+        f.write(f"gaussian_scene_scale_modifier: {args.gaussian_scene_scale_modifier}\n")
+        f.write(f"gaussian_scene_opacity_multiplier: {args.gaussian_scene_opacity_multiplier}\n")
+        f.write(f"gaussian_scene_opacity_power: {args.gaussian_scene_opacity_power}\n")
+        f.write(f"gaussian_scene_opacity_threshold: {args.gaussian_scene_opacity_threshold}\n")
+        f.write(f"gaussian_scene_ellipsoid_alpha_threshold: {args.gaussian_scene_ellipsoid_alpha_threshold}\n")
+        f.write(f"gaussian_scene_max_gaussians: {args.gaussian_scene_max_gaussians}\n")
+        f.write(f"gaussian_scene_selection_mode: {args.gaussian_scene_selection_mode}\n")
+        f.write(f"gaussian_scene_selection_tile_size: {args.gaussian_scene_selection_tile_size}\n")
+        f.write(f"gaussian_scene_exclude_pushed: {args.gaussian_scene_exclude_pushed}\n")
+        f.write(f"gaussian_scene_depth_test: {args.gaussian_scene_depth_test}\n")
+        f.write(f"gaussian_scene_max_screen_radius: {args.gaussian_scene_max_screen_radius}\n")
         f.write(f"ply_saved: {not args.skip_save_ply}\n")
+        f.write(f"redundancy_overlay_saved: {not args.skip_save_frames and args.save_redundancy_overlay}\n")
+        f.write(f"redundancy_overlay_color: {args.redundancy_overlay_color_rgb}\n")
+        f.write(f"redundancy_overlay_alpha: {args.redundancy_overlay_alpha}\n")
+        f.write(f"redundancy_overlay_min_gaussian_opacity: {args.redundancy_overlay_min_gaussian_opacity}\n")
+        f.write(f"redundancy_overlay_mask_threshold: {args.redundancy_overlay_mask_threshold}\n")
+        f.write(f"redundancy_overlay_connect_radius: {args.redundancy_overlay_connect_radius}\n")
+        f.write(f"redundancy_overlay_boundary_width: {args.redundancy_overlay_boundary_width}\n")
+        f.write(f"redundancy_overlay_boundary_alpha: {args.redundancy_overlay_boundary_alpha}\n")
+        f.write(f"redundancy_overlay_boundary_color: {args.redundancy_overlay_boundary_color_rgb}\n")
+        f.write(f"redundancy_overlay_coef_threshold: {args.redundancy_overlay_coef_threshold}\n")
+        f.write(f"redundancy_overlay_multiview_color_threshold: {args.redundancy_overlay_multiview_color_threshold}\n")
+        f.write(f"redundancy_overlay_match_radius: {args.redundancy_overlay_match_radius}\n")
+        f.write(f"redundancy_overlay_min_views: {args.redundancy_overlay_min_views}\n")
+        f.write(f"gaussian_diagnostics_saved: {args.save_gaussian_diagnostics}\n")
+        f.write(f"gaussian_diagnostic_max_rows: {args.gaussian_diagnostic_max_rows}\n")
         f.write(f"scene_mode: {scene_mode}\n")
         f.write(f"gs_view_stride: {args.gs_view_stride}\n")
         if args.per_chunk_scene:
@@ -2082,6 +3208,7 @@ def main():
                     f"raw_active>0.05={report['raw_active_count_opacity_gt_005']} / {report['raw_total_count']}, "
                     f"rendered={report['rendered_count']}, "
                     f"ply_kept={report['ply_kept_count']} "
+                    f"redundancy_suppression={report['redundancy_suppression_count']} "
                     f"ply={report['ply_path'] or 'skipped'}\n"
                 )
     print(f"Metrics saved to: {metrics_file}")
@@ -2102,7 +3229,9 @@ def main():
                     "active_count_opacity_gt_005", "raw_total_count",
                     "raw_active_count_opacity_gt_005", "rendered_count",
                     "rendered_active_count_opacity_gt_005", "ply_kept_count",
+                    "redundancy_suppression_count",
                     "opacity_threshold", "render_opacity_threshold", "ply_opacity_threshold",
+                    "diagnostic_csv", "diagnostic_rows", "diagnostic_total_gaussians", "opacity_cdf_path",
                     *stat_fieldnames,
                 ],
             )

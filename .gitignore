@@ -25,3 +25,31 @@ ckpts
 resize_demo_imgs.py
 img_dir_to_video.py
 wandb/
+
+/feed forward-gs.pdf
+
+# Generated output directories
+output_*/
+
+# Video files
+*.[3][gG]2
+*.[3][gG][pP]
+*.[aA][sS][fF]
+*.[aA][vV][iI]
+*.[dD][iI][vV][xX]
+*.[fF][lL][vV]
+*.[mM]2[tT][sS]
+*.[mM]4[vV]
+*.[mM][kK][vV]
+*.[mM][oO][vV]
+*.[mM][pP]4
+*.[mM][pP][eE][gG]
+*.[mM][pP][gG]
+*.[mM][tT][sS]
+*.[oO][gG][vV]
+*.[rR][mM]
+*.[rR][mM][vV][bB]
+*.[tT][sS]
+*.[vV][oO][bB]
+*.[wW][eE][bB][mM]
+*.[wW][mM][vV]

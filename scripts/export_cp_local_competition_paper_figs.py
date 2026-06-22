@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gc
+import inspect
 import os
 import sys
 from contextlib import nullcontext
@@ -26,44 +27,87 @@ from export_cp_quadtree_gaussian_paper_figs import (
     colorize_scalar,
     load_frame_range,
     render_alpha_maps,
-    resolve_checkpoint_path,
     robust_limits,
     safe_name,
     save_contact_sheet,
     save_panel,
     save_rgb,
 )
-from pi3.models.pi3_3dgs_7 import Pi3_3DGS
+from example_3dgs_5 import (
+    MODEL_IMPL_ALIASES,
+    import_model_class,
+    infer_hydra_config_path,
+    load_hydra_config,
+    load_model_kwargs_from_config,
+    resolve_checkpoint_path,
+)
+
+LOCAL_MODEL_IMPL_ALIASES = {
+    **MODEL_IMPL_ALIASES,
+    "_7": "pi3.models.pi3_3dgs_7.Pi3_3DGS",
+    "7": "pi3.models.pi3_3dgs_7.Pi3_3DGS",
+}
 
 
 def load_model(args, device):
     ckpt = resolve_checkpoint_path(args.ckpt)
-    model = Pi3_3DGS(
-        pos_type="rope100",
-        decoder_size="large",
-        ckpt=None,
-        debug_mem=False,
-        gs_view_stride=args.gs_view_stride,
-        enable_local_competition=False,
-    ).to(device).eval()
+    model_impl = LOCAL_MODEL_IMPL_ALIASES.get(args.model_impl, args.model_impl)
+    model_cls = import_model_class(model_impl)
+    config_path = None if args.ignore_model_config else (args.model_config or infer_hydra_config_path(ckpt))
+    cfg, loaded_config_path = load_hydra_config(config_path)
+    model_kwargs = {
+        "pos_type": "rope100",
+        "decoder_size": "large",
+        "ckpt": None,
+        "debug_mem": False,
+    }
+    model_kwargs.update(load_model_kwargs_from_config(cfg, model_cls))
+    model_kwargs.update({
+        "ckpt": None,
+        "debug_mem": False,
+        "gs_view_stride": args.gs_view_stride,
+        "enable_local_competition": True,
+    })
+    valid_keys = set(inspect.signature(model_cls.__init__).parameters)
+    valid_keys.discard("self")
+    model_kwargs = {key: value for key, value in model_kwargs.items() if key in valid_keys}
+    model = model_cls(**model_kwargs).to(device).eval()
     if ckpt.endswith(".safetensors"):
         weight = load_file(ckpt, device="cpu")
     else:
         weight = torch.load(ckpt, map_location="cpu", weights_only=False)
-    load_result = model.load_state_dict(weight, strict=False)
+    if hasattr(model, "_load_state_dict_flexible"):
+        load_result = model._load_state_dict_flexible(weight)
+    else:
+        load_result = model.load_state_dict(weight, strict=False)
     del weight
     print(f"Checkpoint: {ckpt}")
+    print(f"Model implementation: {model_impl}")
+    if loaded_config_path:
+        print(f"Model config: {loaded_config_path}")
     print(f"load_state_dict: {load_result}")
-    return model, ckpt
+    return model, ckpt, model_impl, loaded_config_path
 
 
-def run_forward(model, imgs_batch, device, amp_context, enable_local_competition):
+def run_forward(model, imgs_batch, device, amp_context, enable_local_competition, competition_strength=None):
+    old_enable = getattr(model, "enable_local_competition", None)
+    old_strength = getattr(model, "competition_strength", None)
     model.enable_local_competition = bool(enable_local_competition)
+    if competition_strength is not None and hasattr(model, "competition_strength"):
+        model.competition_strength = float(competition_strength)
     tag = "with" if enable_local_competition else "without"
+    if competition_strength is not None:
+        tag += f" strength={float(competition_strength):g}"
     print(f"Running inference {tag} local competition...")
-    with torch.no_grad():
-        with amp_context():
-            return model(imgs_batch, return_viz=False)
+    try:
+        with torch.no_grad():
+            with amp_context():
+                return model(imgs_batch, return_viz=False)
+    finally:
+        if old_enable is not None:
+            model.enable_local_competition = old_enable
+        if old_strength is not None and hasattr(model, "competition_strength"):
+            model.competition_strength = old_strength
 
 
 def select_indices_by_opacity(gaussians, min_opacity=0.01, max_gaussians=180000):
@@ -81,7 +125,20 @@ def select_indices_by_opacity(gaussians, min_opacity=0.01, max_gaussians=180000)
 
 def gather_gaussians(gaussians, idx):
     out = {}
-    for key in ("xyz", "rotation", "scale", "opacity", "color", "conf"):
+    for key in (
+        "xyz",
+        "rotation",
+        "scale",
+        "opacity",
+        "color",
+        "conf",
+        "competition_color",
+        "source_view",
+        "redundancy_score",
+        "redundancy_coef",
+        "competition_gate",
+        "competition_active",
+    ):
         value = gaussians.get(key)
         if isinstance(value, torch.Tensor):
             out[key] = value[:, idx].contiguous()
@@ -104,8 +161,26 @@ def stats_to_cpu(stats):
     return out
 
 
-def run_variant_and_render(model, imgs_batch, device, amp_context, enable_comp, idx=None, args=None, height=None, width=None):
-    result = run_forward(model, imgs_batch, device, amp_context, enable_comp)
+def run_variant_and_render(
+        model,
+        imgs_batch,
+        device,
+        amp_context,
+        enable_comp,
+        idx=None,
+        args=None,
+        height=None,
+        width=None,
+        competition_strength=None,
+):
+    result = run_forward(
+        model,
+        imgs_batch,
+        device,
+        amp_context,
+        enable_comp,
+        competition_strength=competition_strength,
+    )
     if idx is None:
         idx = select_indices_by_opacity(
             result["gaussians"],
@@ -162,6 +237,109 @@ def save_histograms(opacity_before, opacity_after, gate_proxy, out_dir):
     fig.savefig(path, dpi=280, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
     return path
+
+
+def save_opacity_cdf(opacity_before, opacity_after, path):
+    before = np.clip(opacity_before[np.isfinite(opacity_before)], 0.0, 1.0)
+    after = np.clip(opacity_after[np.isfinite(opacity_after)], 0.0, 1.0)
+    bins = np.linspace(0.0, 1.0, 401)
+
+    def cdf(values):
+        if values.size == 0:
+            return np.zeros((bins.size - 1,), dtype=np.float32)
+        hist, _ = np.histogram(values, bins=bins)
+        return np.cumsum(hist).astype(np.float64) / max(1, int(hist.sum()))
+
+    fig, ax = plt.subplots(figsize=(5.4, 3.7))
+    x = bins[1:]
+    ax.plot(x, cdf(before), color="#3B6FB6", linewidth=2.0, label="pre-gate")
+    ax.plot(x, cdf(after), color="#D4513C", linewidth=2.0, label="post-gate")
+    ax.axvline(0.05, color="#202020", linestyle="--", linewidth=1.1, label="0.05 threshold")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("opacity")
+    ax.set_ylabel("CDF")
+    ax.grid(True, linewidth=0.3, alpha=0.35)
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout(pad=0.5)
+    fig.savefig(path, dpi=280, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+    return path
+
+
+def vector_from_gaussians(gaussians, key, length, fill=0.0):
+    value = gaussians.get(key)
+    if not isinstance(value, torch.Tensor):
+        return np.full((length,), fill, dtype=np.float32)
+    arr = value.detach().float().cpu().numpy()
+    if arr.ndim == 3:
+        arr = arr[0, :, 0]
+    elif arr.ndim == 2:
+        arr = arr[0]
+    arr = arr.reshape(-1).astype(np.float32, copy=False)
+    if arr.shape[0] == length:
+        return arr
+    out = np.full((length,), fill, dtype=np.float32)
+    n = min(length, arr.shape[0])
+    out[:n] = arr[:n]
+    return out
+
+
+def matrix_from_gaussians(gaussians, key, length, channels, fill=0.0):
+    value = gaussians.get(key)
+    if not isinstance(value, torch.Tensor):
+        return np.full((length, channels), fill, dtype=np.float32)
+    arr = value.detach().float().cpu().numpy()
+    if arr.ndim == 3:
+        arr = arr[0]
+    arr = arr.reshape(arr.shape[0], -1).astype(np.float32, copy=False)
+    if arr.shape[0] == length and arr.shape[1] >= channels:
+        return arr[:, :channels]
+    out = np.full((length, channels), fill, dtype=np.float32)
+    n = min(length, arr.shape[0])
+    c = min(channels, arr.shape[1])
+    out[:n, :c] = arr[:n, :c]
+    return out
+
+
+def write_per_gaussian_diagnostics(gauss_before, gauss_after, path, max_rows=250000):
+    opacity_pre = gauss_before["opacity"][0, :, 0].numpy()
+    opacity_post = gauss_after["opacity"][0, :, 0].numpy()
+    n = int(opacity_post.shape[0])
+    redundancy = vector_from_gaussians(gauss_after, "redundancy_score", n, fill=0.0)
+    coef = vector_from_gaussians(gauss_after, "redundancy_coef", n, fill=0.0)
+    gate = vector_from_gaussians(gauss_after, "competition_gate", n, fill=1.0)
+    active = vector_from_gaussians(gauss_after, "competition_active", n, fill=0.0)
+    source_view = vector_from_gaussians(gauss_before, "source_view", n, fill=-1.0)
+    xyz = matrix_from_gaussians(gauss_before, "xyz", n, 3)
+    color = matrix_from_gaussians(gauss_before, "color", n, 3)
+
+    indices = np.arange(n, dtype=np.int64)
+    if max_rows and max_rows > 0 and n > max_rows:
+        priority = np.maximum(opacity_pre, opacity_post) + coef + np.clip(1.0 - gate, 0.0, 1.0)
+        indices = np.argpartition(priority, -max_rows)[-max_rows:]
+
+    rows = []
+    for idx in indices:
+        rows.append({
+            "gaussian_index": int(idx),
+            "redundancy_score": f"{float(redundancy[idx]):.8f}",
+            "redundancy_coef": f"{float(coef[idx]):.8f}",
+            "competition_gate": f"{float(gate[idx]):.8f}",
+            "competition_active": int(active[idx] > 0.5),
+            "opacity_pre": f"{float(opacity_pre[idx]):.8f}",
+            "opacity_post": f"{float(opacity_post[idx]):.8f}",
+            "active_005": int(opacity_post[idx] > 0.05),
+            "source_view": int(round(float(source_view[idx]))),
+            "xyz_x": f"{float(xyz[idx, 0]):.8f}",
+            "xyz_y": f"{float(xyz[idx, 1]):.8f}",
+            "xyz_z": f"{float(xyz[idx, 2]):.8f}",
+            "color_r": f"{float(color[idx, 0]):.8f}",
+            "color_g": f"{float(color[idx, 1]):.8f}",
+            "color_b": f"{float(color[idx, 2]):.8f}",
+        })
+    write_csv(rows, path)
+    return path, int(indices.shape[0]), n
 
 
 def save_spatial_suppression_distribution(gaussians_before, gate_proxy, path, max_points=80000, seed=0):
@@ -226,10 +404,17 @@ def write_csv(rows, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export local competition paper figures for Pi3_3DGS_7.")
+    parser = argparse.ArgumentParser(
+        description="Export redundancy-aware local opacity competition paper figures for Pi3_3DGS_10."
+    )
     parser.add_argument("--data_root", type=str, default="/data/liuwei/dataset/ntu_seq/cp")
-    parser.add_argument("--output_dir", type=str, default="outputs/cp_800_900_local_competition_paper_figs")
-    parser.add_argument("--ckpt", type=str, default="outputs/pi3_highres_0506_v6_local_comp/ckpts/best_model/model.safetensors")
+    parser.add_argument("--output_dir", type=str, default="outputs/cp_800_900_pi3_3dgs10_local_competition_paper_figs")
+    parser.add_argument("--ckpt", type=str, default="outputs/pi3_3dgs10_hunyuan_decoder/ckpts/best_model/model.safetensors")
+    parser.add_argument("--model_impl", type=str, default="_10", help="Full import path or shorthand _8/_9/_10.")
+    parser.add_argument("--model_config", type=str, default=None,
+                        help="Hydra config.yaml used to restore model construction args. Default: auto-detect near ckpt.")
+    parser.add_argument("--ignore_model_config", action="store_true",
+                        help="Use constructor defaults instead of checkpoint-side config.")
     parser.add_argument("--frame_start", type=int, default=800)
     parser.add_argument("--frame_end", type=int, default=900)
     parser.add_argument("--frame_step", type=int, default=10)
@@ -239,6 +424,10 @@ def main():
     parser.add_argument("--render_min_opacity", type=float, default=0.01)
     parser.add_argument("--max_render_gaussians", type=int, default=180000)
     parser.add_argument("--spatial_max_points", type=int, default=80000)
+    parser.add_argument("--post_gate_competition_strength", type=float, default=None,
+                        help="Post-gate competition strength. Default keeps the model constructor/config value.")
+    parser.add_argument("--diagnostic_max_rows", type=int, default=250000,
+                        help="Max rows in the per-Gaussian diagnostic CSV. Use 0 for every compared Gaussian.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -259,7 +448,12 @@ def main():
     print(f"Frames: {[item['stem'] for item in frame_items]}")
     print(f"Original resolution: {orig_hw[0]}x{orig_hw[1]} | model resolution: {height}x{width}")
 
-    model, ckpt = load_model(args, device)
+    model, ckpt, model_impl, loaded_config_path = load_model(args, device)
+    post_strength = args.post_gate_competition_strength
+    if post_strength is None and hasattr(model, "competition_strength"):
+        post_strength = float(model.competition_strength)
+    if post_strength is None:
+        post_strength = 1.0
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         amp_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -269,10 +463,28 @@ def main():
 
     imgs_batch = imgs_cpu.unsqueeze(0).to(device)
     idx, gauss_before, stats_before, alpha_before = run_variant_and_render(
-        model, imgs_batch, device, amp_context, False, idx=None, args=args, height=height, width=width
+        model,
+        imgs_batch,
+        device,
+        amp_context,
+        True,
+        idx=None,
+        args=args,
+        height=height,
+        width=width,
+        competition_strength=0.0,
     )
     _, gauss_after, stats_after, alpha_after = run_variant_and_render(
-        model, imgs_batch, device, amp_context, True, idx=idx, args=args, height=height, width=width
+        model,
+        imgs_batch,
+        device,
+        amp_context,
+        True,
+        idx=idx,
+        args=args,
+        height=height,
+        width=width,
+        competition_strength=post_strength,
     )
 
     opacity_before = gauss_before["opacity"][0, :, 0].numpy()
@@ -281,6 +493,17 @@ def main():
     suppression_strength = 1.0 - gate_proxy
 
     hist_path = save_histograms(opacity_before, opacity_after, gate_proxy, overview_dir)
+    cdf_path = save_opacity_cdf(
+        opacity_before,
+        opacity_after,
+        os.path.join(overview_dir, "local_competition_opacity_cdf_pre_post.png"),
+    )
+    diag_csv_path, diag_rows, diag_total = write_per_gaussian_diagnostics(
+        gauss_before,
+        gauss_after,
+        os.path.join(args.output_dir, "per_gaussian_local_competition_diagnostics.csv"),
+        max_rows=args.diagnostic_max_rows,
+    )
     spatial_path = os.path.join(overview_dir, "local_competition_spatial_suppression.png")
     save_spatial_suppression_distribution(
         gauss_before,
@@ -312,22 +535,22 @@ def main():
         rel_overlay = blend_heatmap(frame_rgb, rel_img, np.clip(relative, 0.0, 1.0), max_alpha=0.78, base_dim=0.58)
 
         save_rgb(os.path.join(per_frame_dir, f"input_{stem}.png"), frame_rgb)
-        save_rgb(os.path.join(per_frame_dir, f"opacity_without_local_competition_{stem}.png"), before_img)
-        save_rgb(os.path.join(per_frame_dir, f"opacity_with_local_competition_{stem}.png"), after_img)
+        save_rgb(os.path.join(per_frame_dir, f"opacity_pre_gate_strength0_{stem}.png"), before_img)
+        save_rgb(os.path.join(per_frame_dir, f"opacity_post_gate_{stem}.png"), after_img)
         save_rgb(os.path.join(per_frame_dir, f"local_competition_suppression_map_{stem}.png"), supp_img)
         save_rgb(os.path.join(per_frame_dir, f"local_competition_suppression_overlay_{stem}.png"), supp_overlay)
         save_rgb(os.path.join(per_frame_dir, f"local_competition_relative_overlay_{stem}.png"), rel_overlay)
 
         save_panel(
             [frame_rgb, before_img, after_img, supp_overlay],
-            ["Input", "Without local competition", "With local competition", "Suppressed opacity"],
+            ["Input", "Pre-gate strength=0", "Post-gate", "Suppressed opacity"],
             os.path.join(per_frame_dir, f"local_competition_panel_{stem}.png"),
             figsize_per_image=2.8,
             dpi=300,
         )
         save_panel(
             [frame_rgb, before_img, after_img, supp_img, supp_overlay, rel_overlay],
-            ["Input", "Before", "After", "Suppression", "Suppression overlay", "Relative effect"],
+            ["Input", "Pre-gate", "Post-gate", "Suppression", "Suppression overlay", "Relative effect"],
             os.path.join(per_frame_dir, f"local_competition_pipeline_{stem}.png"),
             figsize_per_image=2.35,
             dpi=260,
@@ -346,32 +569,39 @@ def main():
 
     save_contact_sheet(
         contact_rows,
-        ["Input", "Without LC", "With LC", "Suppressed opacity"],
+        ["Input", "Pre-gate", "Post-gate", "Suppressed opacity"],
         os.path.join(overview_dir, "cp_800_900_local_competition_contact_sheet.png"),
         dpi=220,
     )
     write_csv(rows, os.path.join(args.output_dir, "manifest.csv"))
 
     with open(os.path.join(args.output_dir, "summary.txt"), "w") as f:
-        f.write("Pi3_3DGS_7 CP 800-900 local competition paper figures\n")
+        f.write("Pi3_3DGS_10 redundancy-aware local opacity competition paper figures\n")
         f.write("=" * 64 + "\n")
         f.write(f"data_root: {args.data_root}\n")
         f.write(f"frames: {args.frame_start}-{args.frame_end} step {args.frame_step}\n")
         f.write(f"checkpoint: {ckpt}\n")
+        f.write(f"model_impl: {model_impl}\n")
+        f.write(f"model_config: {loaded_config_path or 'N/A'}\n")
         f.write(f"model_resolution: {height}x{width}\n")
         f.write(f"gs_view_stride: {args.gs_view_stride}\n")
+        f.write("pre_gate_competition_strength: 0.0\n")
+        f.write(f"post_gate_competition_strength: {float(post_strength):.8f}\n")
         f.write(f"render_gaussians_compared: {int(idx.numel())}\n")
         f.write(f"opacity_before_mean: {float(opacity_before.mean()):.8f}\n")
         f.write(f"opacity_after_mean: {float(opacity_after.mean()):.8f}\n")
         f.write(f"gate_proxy_mean: {float(gate_proxy.mean()):.8f}\n")
         f.write(f"suppression_strength_mean: {float(suppression_strength.mean()):.8f}\n")
-        f.write("\nwithout_local_competition_stats:\n")
+        f.write(f"diagnostic_csv: {diag_csv_path}\n")
+        f.write(f"diagnostic_rows: {diag_rows} / {diag_total}\n")
+        f.write("\npre_gate_strength0_stats:\n")
         for key in sorted(stats_before):
             f.write(f"  {key}: {stats_before[key]:.8f}\n")
-        f.write("\nwith_local_competition_stats:\n")
+        f.write("\npost_gate_local_competition_stats:\n")
         for key in sorted(stats_after):
             f.write(f"  {key}: {stats_after[key]:.8f}\n")
         f.write(f"\nhistogram: {hist_path}\n")
+        f.write(f"opacity_cdf: {cdf_path}\n")
         f.write(f"spatial_suppression: {spatial_path}\n")
         f.write(f"per_frame_dir: {per_frame_dir}\n")
         f.write(f"overview_dir: {overview_dir}\n")

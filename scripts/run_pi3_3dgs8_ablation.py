@@ -92,6 +92,58 @@ METRIC_PATTERNS = {
 }
 
 
+COUNT_LIKE_STAT_KEYS = {
+    "stat_redundancy_candidates",
+    "stat_competition_candidates",
+    "stat_competition_expected_suppressed",
+    "stat_redundancy_expected_suppressed",
+    "stat_opacity_mass",
+    "stat_active_count_opacity_005",
+    "stat_active_count_opacity_002",
+    "stat_count_before",
+    "stat_count_after",
+    "stat_physical_count",
+    "stat_proposal_count",
+    "stat_learned_extra_count",
+    "stat_selected_count",
+}
+MEAN_LIKE_STAT_KEYS = {
+    "stat_redundancy_coef_mean",
+    "stat_competition_gate_mean",
+    "stat_redundancy_gate_mean",
+    "stat_redundancy_threshold",
+    "stat_local_radius_mean",
+    "stat_local_radius_median",
+    "stat_cube_size_mean",
+    "stat_cube_size_median",
+}
+MAX_LIKE_STAT_KEYS = {
+    "stat_redundancy_coef_max",
+}
+SUMMARY_STAT_KEYS = [
+    "stat_redundancy_candidates",
+    "stat_redundancy_coef_mean",
+    "stat_redundancy_coef_max",
+    "stat_competition_gate_mean",
+    "stat_redundancy_gate_mean",
+    "stat_opacity_mass",
+    "stat_active_count_opacity_005",
+    "stat_competition_expected_suppressed",
+    "stat_redundancy_expected_suppressed",
+    "stat_redundancy_threshold",
+    "stat_local_radius_mean",
+    "stat_local_radius_median",
+    "stat_cube_size_mean",
+    "stat_cube_size_median",
+    "stat_count_before",
+    "stat_count_after",
+    "stat_physical_count",
+    "stat_proposal_count",
+    "stat_learned_extra_count",
+    "stat_selected_count",
+]
+
+
 def parse_float(text):
     try:
         return float(text)
@@ -154,8 +206,11 @@ def parse_gaussian_counts(csv_path):
     rendered = 0
     saved = 0
     ply_paths = []
+    stat_sums = {key: 0.0 for key in COUNT_LIKE_STAT_KEYS}
+    stat_means = {key: [] for key in MEAN_LIKE_STAT_KEYS}
+    stat_max = {key: math.nan for key in MAX_LIKE_STAT_KEYS}
     if not csv_path.is_file():
-        return total, active, rendered, saved, ""
+        return total, active, rendered, saved, "", {}
 
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -171,7 +226,35 @@ def parse_gaussian_counts(csv_path):
             ply_path = row.get("ply_path") or ""
             if ply_path:
                 ply_paths.append(ply_path)
-    return total, active, rendered, saved, ";".join(ply_paths)
+            for key in COUNT_LIKE_STAT_KEYS:
+                value = row.get(key)
+                if value not in (None, ""):
+                    try:
+                        stat_sums[key] += float(value)
+                    except ValueError:
+                        pass
+            for key in MEAN_LIKE_STAT_KEYS:
+                value = row.get(key)
+                if value not in (None, ""):
+                    try:
+                        stat_means[key].append(float(value))
+                    except ValueError:
+                        pass
+            for key in MAX_LIKE_STAT_KEYS:
+                value = row.get(key)
+                if value not in (None, ""):
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        continue
+                    stat_max[key] = parsed if math.isnan(stat_max[key]) else max(stat_max[key], parsed)
+
+    stats = {}
+    stats.update(stat_sums)
+    for key, values in stat_means.items():
+        stats[key] = (sum(values) / len(values)) if values else math.nan
+    stats.update(stat_max)
+    return total, active, rendered, saved, ";".join(ply_paths), stats
 
 
 def summarize_results(output_root, datasets, variants):
@@ -196,11 +279,11 @@ def summarize_results(output_root, datasets, variants):
                 metrics["proposal_sampling_mode"] = ""
                 metrics["render_opacity_threshold"] = ""
                 metrics["ply_opacity_threshold"] = ""
-                total, active, rendered, saved, ply_paths = 0, 0, 0, 0, ""
+                total, active, rendered, saved, ply_paths, stat_summary = 0, 0, 0, 0, "", {}
             else:
                 metrics = parse_metrics(report_path)
-                total, active, rendered, saved, ply_paths = parse_gaussian_counts(out_dir / "gaussian_counts.csv")
-            rows.append({
+                total, active, rendered, saved, ply_paths, stat_summary = parse_gaussian_counts(out_dir / "gaussian_counts.csv")
+            row = {
                 "dataset": dataset,
                 "variant": variant,
                 "output_dir": str(out_dir),
@@ -229,7 +312,10 @@ def summarize_results(output_root, datasets, variants):
                 "gaussian_saved_ply": saved,
                 "ply_paths": ply_paths,
                 "frame_names": metrics["frame_names"],
-            })
+            }
+            for stat_key in SUMMARY_STAT_KEYS:
+                row[stat_key] = stat_summary.get(stat_key, math.nan)
+            rows.append(row)
 
     summary_path = output_root / "summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +374,9 @@ def build_command(args, dataset_name, variant_name):
         command.append("--per_chunk_scene")
     if args.save_aligned_depth:
         command.append("--save_aligned_depth")
+    if args.save_gaussian_diagnostics:
+        command.append("--save_gaussian_diagnostics")
+        command.extend(["--gaussian_diagnostic_max_rows", str(args.gaussian_diagnostic_max_rows)])
     command.extend(VARIANTS[variant_name])
     if variant_name == "random_equal_sample":
         command.extend(["--random_sampling_seed", str(args.random_sampling_seed)])
@@ -318,6 +407,8 @@ def main():
     parser.add_argument("--random_sampling_seed", type=int, default=2024)
     parser.add_argument("--per_chunk_scene", action="store_true")
     parser.add_argument("--save_aligned_depth", action="store_true")
+    parser.add_argument("--save_gaussian_diagnostics", action="store_true")
+    parser.add_argument("--gaussian_diagnostic_max_rows", type=int, default=250000)
     parser.add_argument("--datasets", nargs="+", choices=DATASETS.keys(), default=list(DATASETS.keys()))
     parser.add_argument("--variants", nargs="+", choices=VARIANTS.keys(), default=list(VARIANTS.keys()))
     parser.add_argument("--dry_run", action="store_true")

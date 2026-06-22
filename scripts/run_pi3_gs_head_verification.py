@@ -15,6 +15,60 @@ METRIC_PATTERNS = {
 }
 
 
+COUNT_LIKE_STAT_KEYS = {
+    "stat_redundancy_candidates",
+    "stat_competition_candidates",
+    "stat_competition_expected_suppressed",
+    "stat_redundancy_expected_suppressed",
+    "stat_opacity_mass",
+    "stat_active_count_opacity_005",
+    "stat_active_count_opacity_002",
+    "stat_count_before",
+    "stat_count_after",
+    "stat_physical_count",
+    "stat_proposal_count",
+    "stat_learned_extra_count",
+    "stat_selected_count",
+}
+MEAN_LIKE_STAT_KEYS = {
+    "stat_redundancy_coef_mean",
+    "stat_competition_gate_mean",
+    "stat_redundancy_gate_mean",
+    "stat_redundancy_threshold",
+    "stat_local_radius_mean",
+    "stat_local_radius_median",
+    "stat_cube_size_mean",
+    "stat_cube_size_median",
+    "stat_density_gate_mean",
+}
+MAX_LIKE_STAT_KEYS = {
+    "stat_redundancy_coef_max",
+}
+SUMMARY_STAT_KEYS = [
+    "stat_selected_count",
+    "stat_proposal_count",
+    "stat_density_gate_mean",
+    "stat_redundancy_candidates",
+    "stat_redundancy_coef_mean",
+    "stat_redundancy_coef_max",
+    "stat_competition_gate_mean",
+    "stat_redundancy_gate_mean",
+    "stat_opacity_mass",
+    "stat_active_count_opacity_005",
+    "stat_competition_expected_suppressed",
+    "stat_redundancy_expected_suppressed",
+    "stat_redundancy_threshold",
+    "stat_local_radius_mean",
+    "stat_local_radius_median",
+    "stat_cube_size_mean",
+    "stat_cube_size_median",
+    "stat_count_before",
+    "stat_count_after",
+    "stat_physical_count",
+    "stat_learned_extra_count",
+]
+
+
 VARIANTS = {
     # Baseline from the checkpoint-side Hydra config.
     "full": [],
@@ -123,6 +177,9 @@ def parse_counts(counts_path):
     total = 0
     active = 0
     stats = {}
+    stat_sums = {key: 0.0 for key in COUNT_LIKE_STAT_KEYS}
+    stat_means = {key: [] for key in MEAN_LIKE_STAT_KEYS}
+    stat_max = {key: math.nan for key in MAX_LIKE_STAT_KEYS}
     if not counts_path.is_file():
         return total, active, stats
 
@@ -135,9 +192,21 @@ def parse_counts(counts_path):
                 if not key.startswith("stat_") or value in (None, ""):
                     continue
                 try:
-                    stats[key] = float(value)
+                    parsed = float(value)
                 except ValueError:
-                    pass
+                    continue
+                if key in COUNT_LIKE_STAT_KEYS:
+                    stat_sums[key] += parsed
+                elif key in MEAN_LIKE_STAT_KEYS:
+                    stat_means[key].append(parsed)
+                elif key in MAX_LIKE_STAT_KEYS:
+                    stat_max[key] = parsed if math.isnan(stat_max[key]) else max(stat_max[key], parsed)
+                else:
+                    stats[key] = parsed
+    stats.update(stat_sums)
+    for key, values in stat_means.items():
+        stats[key] = (sum(values) / len(values)) if values else math.nan
+    stats.update(stat_max)
     return total, active, stats
 
 
@@ -193,6 +262,9 @@ def build_command(args, variant):
         command.append("--skip_save_ply")
     if args.skip_save_frames:
         command.append("--skip_save_frames")
+    if args.save_gaussian_diagnostics:
+        command.append("--save_gaussian_diagnostics")
+        command.extend(["--gaussian_diagnostic_max_rows", str(args.gaussian_diagnostic_max_rows)])
     command.extend(VARIANTS[variant])
     return command, out_dir
 
@@ -203,7 +275,7 @@ def summarize(output_root, variants):
         out_dir = Path(output_root) / variant
         metrics = parse_report(out_dir / "metrics_report.txt")
         total, active, stats = parse_counts(out_dir / "gaussian_counts.csv")
-        rows.append({
+        row = {
             "variant": variant,
             "output_dir": str(out_dir),
             "psnr": metrics["psnr"],
@@ -219,12 +291,11 @@ def summarize(output_root, variants):
             "learnable_sampling_enabled": metrics["learnable_sampling_enabled"],
             "density_opacity_gate_enabled": metrics["density_opacity_gate_enabled"],
             "gaussian_mode": metrics["gaussian_mode"],
-            "stat_selected_count": stats.get("stat_selected_count", math.nan),
-            "stat_proposal_count": stats.get("stat_proposal_count", math.nan),
-            "stat_density_gate_mean": stats.get("stat_density_gate_mean", math.nan),
-            "stat_competition_gate_mean": stats.get("stat_competition_gate_mean", math.nan),
             "frame_names": metrics["frame_names"],
-        })
+        }
+        for stat_key in SUMMARY_STAT_KEYS:
+            row[stat_key] = stats.get(stat_key, math.nan)
+        rows.append(row)
 
     summary_path = Path(output_root) / "summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -270,6 +341,8 @@ def main():
     parser.add_argument("--per_chunk_scene", action="store_true")
     parser.add_argument("--skip_save_ply", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip_save_frames", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save_gaussian_diagnostics", action="store_true")
+    parser.add_argument("--gaussian_diagnostic_max_rows", type=int, default=250000)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS.keys(), default=list(VARIANTS.keys()))
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--summarize_only", action="store_true")

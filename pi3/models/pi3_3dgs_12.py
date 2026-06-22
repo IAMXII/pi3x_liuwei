@@ -1,4 +1,4 @@
-# Pi3_3DGS_10: Pi3_3DGS_9 plus Hunyuan-style GS decoding.
+# Pi3_3DGS_12: Pi3_3DGS_10 plus ray-depth center residual and DPT-style GS head.
 # 1. forward 中每个 batch 的高斯候选合并后，调用 _apply_local_competition。
 # 2. 先估计每个高斯的局部尺度：优先用相机位姿、内参和可见像素足迹计算
 #    cube_size，并转成 local_radius；不可见或信息不足时退回由预测 scale 得到
@@ -34,7 +34,7 @@ from .layers.conv_head import ConvHead
 # 导入更新后的包装头
 from .layers.transformer_head import (
     AlternatingViewTransformerDecoder,
-    ImageAwareConvDenseGaussianHead,
+    ImageAwareDPTDenseGaussianHead,
     TransformerDecoder,
     ConvPts3dHead,
     ConvDenseGaussianHead,
@@ -294,7 +294,7 @@ class Pi3_3DGS(nn.Module):
             K_input=1000000,
             debug_mem=False,
             train_stage=1,
-            max_dense_gaussians=1000000,
+            max_dense_gaussians=0,
             min_gaussians_per_view=1024,
             pre_topk_per_view=4096,
             keep_ratio_sqrt=0.4,
@@ -320,6 +320,10 @@ class Pi3_3DGS(nn.Module):
             scale_max_ratio=0.8,
             gs_view_stride=1,
             gs_decoder_view_chunk_size=24,
+            gs_head_view_chunk_size=2,
+            gs_head_feature_channels=64,
+            gs_head_head_channels=48,
+            gs_head_use_checkpoint=True,
             enable_quadtree=True,
             quadtree_base_threshold=0.15,
             quadtree_relax_factor=0.0,
@@ -353,6 +357,8 @@ class Pi3_3DGS(nn.Module):
             enable_xyz_residual=True,
             xyz_residual_scale_ratio=0.02,
             xyz_residual_scale_min=1e-4,
+            ray_depth_residual_scale_ratio=None,
+            ray_uv_residual_pixel_radius=0.25,
             enable_learnable_sampling=True,
             learned_sampling_extra_ratio=0.10,
             learned_sampling_min_extra=128,
@@ -407,6 +413,10 @@ class Pi3_3DGS(nn.Module):
         self.scale_max_ratio = max(float(scale_max_ratio), float(scale_min_ratio) * 1.1)
         self.gs_view_stride = max(1, int(gs_view_stride))
         self.gs_decoder_view_chunk_size = max(1, int(gs_decoder_view_chunk_size))
+        self.gs_head_view_chunk_size = max(1, int(gs_head_view_chunk_size))
+        self.gs_head_feature_channels = max(16, int(gs_head_feature_channels))
+        self.gs_head_head_channels = max(16, int(gs_head_head_channels))
+        self.gs_head_use_checkpoint = bool(gs_head_use_checkpoint)
         self.enable_quadtree = bool(enable_quadtree)
         self.quadtree_base_threshold = max(0.0, float(quadtree_base_threshold))
         self.quadtree_relax_factor = max(0.0, float(quadtree_relax_factor))
@@ -439,6 +449,10 @@ class Pi3_3DGS(nn.Module):
         self.enable_xyz_residual = bool(enable_xyz_residual)
         self.xyz_residual_scale_ratio = max(0.0, float(xyz_residual_scale_ratio))
         self.xyz_residual_scale_min = max(0.0, float(xyz_residual_scale_min))
+        if ray_depth_residual_scale_ratio is None:
+            ray_depth_residual_scale_ratio = self.xyz_residual_scale_ratio
+        self.ray_depth_residual_scale_ratio = max(0.0, float(ray_depth_residual_scale_ratio))
+        self.ray_uv_residual_pixel_radius = max(0.0, float(ray_uv_residual_pixel_radius))
         self.enable_learnable_sampling = bool(enable_learnable_sampling)
         self.learned_sampling_extra_ratio = max(0.0, float(learned_sampling_extra_ratio))
         self.learned_sampling_min_extra = max(0, int(learned_sampling_min_extra))
@@ -576,8 +590,8 @@ class Pi3_3DGS(nn.Module):
             using_uv=True
         )
 
-        # Hunyuan-style GS branch: token refinement with alternating per-view/global
-        # attention, followed by a dense image-aware head for SSIM-sensitive detail.
+        # Hunyuan-style GS branch: alternating per-view/global attention, followed
+        # by a DPT/refinenet dense head for geometry-sensitive high-frequency detail.
         self.gs_decoder = AlternatingViewTransformerDecoder(
             in_dim=2 * self.dec_embed_dim,
             dec_embed_dim=1024,
@@ -587,11 +601,14 @@ class Pi3_3DGS(nn.Module):
         )
         # 16 dims:
         # rotation(4), scale(3), opacity(1), color(3),
-        # xyz_residual(3), density_logit(1), scale_bias(1).
-        self.gs_head = ImageAwareConvDenseGaussianHead(
+        # ray_depth_residual + subpixel_uv_residual(3), density_logit(1), scale_bias(1).
+        self.gs_head = ImageAwareDPTDenseGaussianHead(
             patch_size=14,
             dec_embed_dim=1024,
             dim_out=[4, 3, 1, 3, 3, 1, 1],
+            feature_channels=self.gs_head_feature_channels,
+            head_channels=self.gs_head_head_channels,
+            use_checkpoint=self.gs_head_use_checkpoint,
         )
 
         # self.sky_head = SkyGaussianHead(
@@ -711,7 +728,7 @@ class Pi3_3DGS(nn.Module):
                 f"{key}: {src}->{dst}" for key, src, dst in skipped[:8]
             )
             suffix = "" if len(skipped) <= 8 else f", ... ({len(skipped)} skipped total)"
-            print(f"[Pi3_3DGS_10] Skipped incompatible checkpoint tensors: {preview}{suffix}")
+            print(f"[Pi3_3DGS_12] Skipped incompatible checkpoint tensors: {preview}{suffix}")
         return res
 
     def _stats_tensor(self, value, device, dtype):
@@ -2164,143 +2181,173 @@ class Pi3_3DGS(nn.Module):
 
                 hidden_chunk = hidden_views[b, start:end].reshape(end - start, hw, -1)
                 pos_chunk = pos_views[b, start:end].reshape(end - start, hw, -1)
-                gs_h_chunk = self.gs_decoder(hidden_chunk, xpos=pos_chunk)[:, self.patch_start_idx:]
-                gs_attrs_chunk = self.gs_head(
-                    [gs_h_chunk],
-                    (H, W),
-                    image=imgs_raw_sub[b, start:end],
-                ).reshape(end - start, H, W, 16)
-
-                density_logits_chunk = gs_attrs_chunk[..., 14]
-                learned_mask_chunk = self._build_learned_support_mask(
-                    density_logits_chunk, proposal_mask_chunk
+                gs_h_layers_chunk = self.gs_decoder(
+                    hidden_chunk,
+                    xpos=pos_chunk,
+                    return_intermediate=True,
                 )
-                mask_chunk = proposal_mask_chunk | learned_mask_chunk
-                if not mask_chunk.any():
-                    del hidden_chunk, pos_chunk, gs_h_chunk, gs_attrs_chunk
-                    continue
+                gs_h_layers_chunk = [
+                    gs_h[:, self.patch_start_idx:]
+                    for gs_h in gs_h_layers_chunk
+                ]
+                chunk_views = end - start
+                for head_start in range(0, chunk_views, self.gs_head_view_chunk_size):
+                    head_end = min(head_start + self.gs_head_view_chunk_size, chunk_views)
+                    view_start = start + head_start
+                    view_end = start + head_end
+                    proposal_mask_head = proposal_mask_chunk[head_start:head_end]
+                    if not proposal_mask_head.any() and not self.enable_learnable_sampling:
+                        continue
 
-                b_proposal_count += int(proposal_mask_chunk.sum().item())
-                b_learned_extra_count += int((learned_mask_chunk & ~proposal_mask_chunk).sum().item())
-                b_selected_count += int(mask_chunk.sum().item())
+                    gs_attrs_chunk = self.gs_head(
+                        [gs_h[head_start:head_end] for gs_h in gs_h_layers_chunk],
+                        (H, W),
+                        image=imgs_raw_sub[b, view_start:view_end],
+                    ).reshape(head_end - head_start, H, W, 16)
 
-                # 1. 提取当前 chunk 内有效点：heuristic quadtree proposal + learned density extras.
-                local_pts_chunk = local_pts_sub[b, start:end]
-                if self.enable_quadtree and quad_keep_mask[b, start:end].any():
-                    quad_center_pts_chunk = self._build_quadtree_center_points(
-                        local_pts_chunk,
-                        scale_map[b, start:end],
-                        exclude_mask=mask_push_scale[b, start:end],
+                    density_logits_chunk = gs_attrs_chunk[..., 14]
+                    learned_mask_chunk = self._build_learned_support_mask(
+                        density_logits_chunk, proposal_mask_head
                     )
-                else:
-                    quad_center_pts_chunk = local_pts_chunk
+                    mask_chunk = proposal_mask_head | learned_mask_chunk
+                    if not mask_chunk.any():
+                        del gs_attrs_chunk, density_logits_chunk, learned_mask_chunk, mask_chunk
+                        continue
 
-                gs_attrs_v = gs_attrs_chunk[mask_chunk]
-                local_pts_v = local_pts_chunk[mask_chunk]
-                quad_center_pts_v = quad_center_pts_chunk[mask_chunk]
-                scale_map_v = scale_map[b, start:end][mask_chunk]
-                is_quad_center_v = quad_keep_mask[b, start:end][mask_chunk]
-                low_conf_v = mask_push_scale[b, start:end][mask_chunk]
-                conf_v = conf_logits_sub[b, start:end][mask_chunk]
-                comp_color_v = imgs_raw_sub[b, start:end].permute(0, 2, 3, 1)[mask_chunk]
-                view_idx_v = mask_chunk.nonzero(as_tuple=True)[0] + start
+                    b_proposal_count += int(proposal_mask_head.sum().item())
+                    b_learned_extra_count += int((learned_mask_chunk & ~proposal_mask_head).sum().item())
+                    b_selected_count += int(mask_chunk.sum().item())
 
-                # 及时释放 chunk 级无用显存
-                del hidden_chunk, pos_chunk, gs_h_chunk, gs_attrs_chunk
-                del proposal_mask_chunk, learned_mask_chunk, mask_chunk, density_logits_chunk
-                del local_pts_chunk, quad_center_pts_chunk
+                    # 1. 提取当前 micro chunk 内有效点：heuristic quadtree proposal + learned density extras.
+                    local_pts_chunk = local_pts_sub[b, view_start:view_end]
+                    if self.enable_quadtree and quad_keep_mask[b, view_start:view_end].any():
+                        quad_center_pts_chunk = self._build_quadtree_center_points(
+                            local_pts_chunk,
+                            scale_map[b, view_start:view_end],
+                            exclude_mask=mask_push_scale[b, view_start:view_end],
+                        )
+                    else:
+                        quad_center_pts_chunk = local_pts_chunk
 
-                # 2. 先解析 learnable density gate。gate 不只负责候选点补充，
-                #    还以可导方式调制 opacity，使密度分配本身能吃到渲染梯度。
-                density_prob_v = torch.sigmoid(gs_attrs_v[:, 14:15] / self.density_gate_temperature)
-                gated_density = density_prob_v.clamp_min(self.density_gate_min_prob)
-                base_opacity_v = torch.sigmoid(gs_attrs_v[:, 7:8])
-                opacity_v = base_opacity_v * gated_density.pow(self.density_gate_opacity_power)
+                    gs_attrs_v = gs_attrs_chunk[mask_chunk]
+                    local_pts_v = local_pts_chunk[mask_chunk]
+                    quad_center_pts_v = quad_center_pts_chunk[mask_chunk]
+                    scale_map_v = scale_map[b, view_start:view_end][mask_chunk]
+                    is_quad_center_v = quad_keep_mask[b, view_start:view_end][mask_chunk]
+                    low_conf_v = mask_push_scale[b, view_start:view_end][mask_chunk]
+                    conf_v = conf_logits_sub[b, view_start:view_end][mask_chunk]
+                    comp_color_v = imgs_raw_sub[b, view_start:view_end].permute(0, 2, 3, 1)[mask_chunk]
+                    view_idx_v = mask_chunk.nonzero(as_tuple=True)[0] + view_start
 
-                valid_mask = base_opacity_v[:, 0] > self.opacity_filter_threshold
-                if not valid_mask.any():
-                    fallback_k = min(16, base_opacity_v.shape[0])
-                    top_idx = torch.topk(base_opacity_v[:, 0], k=fallback_k, largest=True).indices
-                    valid_mask = torch.zeros_like(valid_mask)
-                    valid_mask[top_idx] = True
+                    # 及时释放 head micro chunk 级无用显存
+                    del gs_attrs_chunk, density_logits_chunk, learned_mask_chunk, mask_chunk
+                    del local_pts_chunk, quad_center_pts_chunk
 
-                # 应用过滤
-                gs_attrs_v = gs_attrs_v[valid_mask]
-                local_pts_v = local_pts_v[valid_mask]
-                quad_center_pts_v = quad_center_pts_v[valid_mask]
-                scale_map_v = scale_map_v[valid_mask]
-                is_quad_center_v = is_quad_center_v[valid_mask]
-                low_conf_v = low_conf_v[valid_mask]
-                conf_v = conf_v[valid_mask]
-                comp_color_v = comp_color_v[valid_mask]
-                view_idx_v = view_idx_v[valid_mask]
-                opacity_v = opacity_v[valid_mask]
-                density_prob_v = density_prob_v[valid_mask]
+                    # 2. 先解析 learnable density gate。gate 不只负责候选点补充，
+                    #    还以可导方式调制 opacity，使密度分配本身能吃到渲染梯度。
+                    density_prob_v = torch.sigmoid(gs_attrs_v[:, 14:15] / self.density_gate_temperature)
+                    gated_density = density_prob_v.clamp_min(self.density_gate_min_prob)
+                    base_opacity_v = torch.sigmoid(gs_attrs_v[:, 7:8])
+                    opacity_v = base_opacity_v * gated_density.pow(self.density_gate_opacity_power)
 
-                # 3. 仅对存活的点解析其余属性并变换
-                local_rot_v = F.normalize(gs_attrs_v[:, 0:4], dim=-1)
-                scale_v = (
-                    torch.exp(gs_attrs_v[:, 4:7])
-                    * self.scale_activation_multiplier
-                )
-                # scale_v = (
-                #     F.softplus(gs_attrs_v[:, 4:7])
-                #     * self.scale_activation_multiplier
-                # )
-                
-                color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
-                residual_raw_v = torch.tanh(gs_attrs_v[:, 11:14])
-                scale_bias_v = torch.tanh(gs_attrs_v[:, 15:16])
+                    valid_mask = base_opacity_v[:, 0] > self.opacity_filter_threshold
+                    if not valid_mask.any():
+                        fallback_k = min(16, base_opacity_v.shape[0])
+                        top_idx = torch.topk(base_opacity_v[:, 0], k=fallback_k, largest=True).indices
+                        valid_mask = torch.zeros_like(valid_mask)
+                        valid_mask[top_idx] = True
 
-                # 【修复 OOM 广播灾难】：强制转为 (N, 1) 的形状，避免 N x N 维度爆炸
-                mask_low = low_conf_v.view(-1, 1)
-                mask_quad = is_quad_center_v.view(-1, 1)
-                map_scale = scale_map_v.view(-1, 1)
+                    # 应用过滤
+                    gs_attrs_v = gs_attrs_v[valid_mask]
+                    local_pts_v = local_pts_v[valid_mask]
+                    quad_center_pts_v = quad_center_pts_v[valid_mask]
+                    scale_map_v = scale_map_v[valid_mask]
+                    is_quad_center_v = is_quad_center_v[valid_mask]
+                    low_conf_v = low_conf_v[valid_mask]
+                    conf_v = conf_v[valid_mask]
+                    comp_color_v = comp_color_v[valid_mask]
+                    view_idx_v = view_idx_v[valid_mask]
+                    opacity_v = opacity_v[valid_mask]
+                    density_prob_v = density_prob_v[valid_mask]
 
-                # Quadtree representatives sit at the averaged 3D center of their cell.
-                local_pts_v = torch.where(mask_quad, quad_center_pts_v, local_pts_v)
-                scale_v = torch.where(mask_low, scale_v * self.low_conf_scale_boost, scale_v)
-                scale_v = torch.where(mask_quad, scale_v * map_scale, scale_v)
-                scale_v = scale_v * torch.exp(self.scale_bias_strength * scale_bias_v)
+                    # 3. 仅对存活的点解析其余属性并变换
+                    local_rot_v = F.normalize(gs_attrs_v[:, 0:4], dim=-1)
+                    scale_v = (
+                        torch.exp(torch.clamp(gs_attrs_v[:, 4:7], min=-11.0, max=6.0))
+                        * self.scale_activation_multiplier
+                    )
+                    # scale_v = (
+                    #     F.softplus(gs_attrs_v[:, 4:7])
+                    #     * self.scale_activation_multiplier
+                    # )
 
-                if self.enable_xyz_residual and self.xyz_residual_scale_ratio > 0:
-                    residual_radius = (
-                        scene_size[b].to(device=local_pts_v.device, dtype=local_pts_v.dtype)
-                        * self.xyz_residual_scale_ratio
-                    ).clamp_min(self.xyz_residual_scale_min)
-                    local_xyz_residual_v = residual_raw_v * residual_radius
-                    local_pts_v = local_pts_v + local_xyz_residual_v
-                else:
-                    local_xyz_residual_v = torch.zeros_like(local_pts_v)
+                    color_v = torch.sigmoid(gs_attrs_v[:, 8:11])
+                    residual_raw_v = torch.tanh(gs_attrs_v[:, 11:14])
+                    scale_bias_v = torch.tanh(gs_attrs_v[:, 15:16])
 
-                b_density_sum += float(density_prob_v.detach().float().sum().item())
-                b_density_num += int(density_prob_v.numel())
-                residual_norm_v = local_xyz_residual_v.detach().float().norm(dim=-1)
-                b_residual_norm_sum += float(residual_norm_v.sum().item())
-                b_residual_norm_num += int(residual_norm_v.numel())
+                    # 【修复 OOM 广播灾难】：强制转为 (N, 1) 的形状，避免 N x N 维度爆炸
+                    mask_low = low_conf_v.view(-1, 1)
+                    mask_quad = is_quad_center_v.view(-1, 1)
+                    map_scale = scale_map_v.view(-1, 1)
 
-                cam_poses_v = camera_poses_sub[b, view_idx_v]
-                cam_rot_v = cam_poses_v[:, :3, :3]
-                cam_trans_v = cam_poses_v[:, :3, 3]
+                    # Quadtree representatives sit at the averaged 3D center of their cell.
+                    local_pts_v = torch.where(mask_quad, quad_center_pts_v, local_pts_v)
+                    scale_v = torch.where(mask_low, scale_v * self.low_conf_scale_boost, scale_v)
+                    scale_v = torch.where(mask_quad, scale_v * map_scale, scale_v)
+                    scale_v = scale_v * torch.exp(self.scale_bias_strength * scale_bias_v)
 
-                # 坐标与旋转变换 (此时数据量已锐减)
-                xyz_v = torch.bmm(cam_rot_v, local_pts_v.unsqueeze(-1)).squeeze(-1) + cam_trans_v
-                cam_quats_v = matrix_to_quaternion(cam_rot_v)
-                rot_v = F.normalize(quat_mult(cam_quats_v, local_rot_v), dim=-1)
+                    if self.enable_xyz_residual and self.ray_depth_residual_scale_ratio > 0:
+                        base_z_v = local_pts_v[:, 2:3].clamp_min(1e-6)
+                        ray_xy_v = local_pts_v[:, 0:2] / base_z_v
+                        depth_ratio_v = residual_raw_v[:, 0:1] * self.ray_depth_residual_scale_ratio
+                        refined_z_v = (base_z_v * (1.0 + depth_ratio_v)).clamp_min(1e-6)
 
-                # 将存活的点追加到列表
-                b_xyz.append(xyz_v)
-                b_rot.append(rot_v)
-                b_scale.append(scale_v)
-                b_opacity.append(opacity_v)
-                b_color.append(color_v)
-                b_conf.append(conf_v)
-                b_pushed.append(mask_low.to(dtype=opacity_v.dtype))
-                b_source_view.append(view_idx_v)
-                b_comp_color.append(comp_color_v)
+                        if self.ray_uv_residual_pixel_radius > 0:
+                            K_v = K[b, sub_idx[view_idx_v]].to(device=local_pts_v.device, dtype=local_pts_v.dtype)
+                            focal_v = torch.stack([K_v[:, 0, 0], K_v[:, 1, 1]], dim=-1).abs().clamp_min(1e-6)
+                            uv_delta_v = (
+                                residual_raw_v[:, 1:3]
+                                * self.ray_uv_residual_pixel_radius
+                                / focal_v
+                            )
+                            ray_xy_v = ray_xy_v + uv_delta_v
 
-                del gs_attrs_v, local_pts_v, quad_center_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
-                del density_prob_v, residual_raw_v, scale_bias_v, local_xyz_residual_v, residual_norm_v
+                        refined_local_pts_v = torch.cat([ray_xy_v * refined_z_v, refined_z_v], dim=-1)
+                        local_xyz_residual_v = refined_local_pts_v - local_pts_v
+                        local_pts_v = refined_local_pts_v
+                    else:
+                        local_xyz_residual_v = torch.zeros_like(local_pts_v)
+
+                    b_density_sum += float(density_prob_v.detach().float().sum().item())
+                    b_density_num += int(density_prob_v.numel())
+                    residual_norm_v = local_xyz_residual_v.detach().float().norm(dim=-1)
+                    b_residual_norm_sum += float(residual_norm_v.sum().item())
+                    b_residual_norm_num += int(residual_norm_v.numel())
+
+                    cam_poses_v = camera_poses_sub[b, view_idx_v]
+                    cam_rot_v = cam_poses_v[:, :3, :3]
+                    cam_trans_v = cam_poses_v[:, :3, 3]
+
+                    # 坐标与旋转变换 (此时数据量已锐减)
+                    xyz_v = torch.bmm(cam_rot_v, local_pts_v.unsqueeze(-1)).squeeze(-1) + cam_trans_v
+                    cam_quats_v = matrix_to_quaternion(cam_rot_v)
+                    rot_v = F.normalize(quat_mult(cam_quats_v, local_rot_v), dim=-1)
+
+                    # 将存活的点追加到列表
+                    b_xyz.append(xyz_v)
+                    b_rot.append(rot_v)
+                    b_scale.append(scale_v)
+                    b_opacity.append(opacity_v)
+                    b_color.append(color_v)
+                    b_conf.append(conf_v)
+                    b_pushed.append(mask_low.to(dtype=opacity_v.dtype))
+                    b_source_view.append(view_idx_v)
+                    b_comp_color.append(comp_color_v)
+
+                    del gs_attrs_v, local_pts_v, quad_center_pts_v, local_rot_v, cam_poses_v, cam_rot_v, cam_trans_v
+                    del density_prob_v, residual_raw_v, scale_bias_v, local_xyz_residual_v, residual_norm_v
+
+                del hidden_chunk, pos_chunk, gs_h_layers_chunk, proposal_mask_chunk
 
             # 当前 Batch 视角处理完毕，合并结果兜底
             if len(b_xyz) > 0:
@@ -2336,6 +2383,7 @@ class Pi3_3DGS(nn.Module):
                 stats_b["xyz_residual_norm"] = self._stats_tensor(
                     b_residual_norm_sum / max(b_residual_norm_num, 1), imgs.device, imgs.dtype
                 )
+                stats_b["ray_depth_residual_norm"] = stats_b["xyz_residual_norm"]
                 fused_gaussians.append(gaussian_b)
                 redundancy_stats.append(stats_b)
             else:
@@ -2369,6 +2417,7 @@ class Pi3_3DGS(nn.Module):
                 stats_b["selected_count"] = self._stats_tensor(b_selected_count, imgs.device, imgs.dtype)
                 stats_b["density_gate_mean"] = self._stats_tensor(0.0, imgs.device, imgs.dtype)
                 stats_b["xyz_residual_norm"] = self._stats_tensor(0.0, imgs.device, imgs.dtype)
+                stats_b["ray_depth_residual_norm"] = stats_b["xyz_residual_norm"]
                 fused_gaussians.append(gaussian_b)
                 redundancy_stats.append(stats_b)
         # 对齐 Batch 内高斯数量

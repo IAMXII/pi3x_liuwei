@@ -438,13 +438,16 @@ def sobel_edge_loss(pred, gt):
 
 class Pi3LossGS(nn.Module):
     def __init__(
-            self, lambda_rgb=1, lambda_ssim=0.4, lambda_depth=0.5, lambda_lpips=0.1,
+            self, lambda_rgb=1, lambda_ssim=0.3, lambda_depth=0.5, lambda_lpips=0.06,
             lambda_pose=0.2, lambda_scale=0.1, train_stage=1, local_align_res=4096,
         train_conf=False, num_sky_anchors=8196, lpips_downsample=1,
         render_view_chunk_size=8, render_checkpoint=True,
-        render_max_gaussians=0, render_min_gaussians=8192, render_opacity_threshold=0.0,
+        render_max_gaussians=0, render_min_gaussians=8192, render_opacity_threshold=0.05,
         enable_sparsity_loss=True, lambda_sparsity=0.02, sparsity_min_opacity=0.05,
         enable_alpha_regularization=True, lambda_alpha_regul=0.001,
+        enable_scale_sphericity_regularization=True, lambda_scale_sphericity=0.0,
+        scale_sphericity_min_opacity=0.05, scale_sphericity_start_step=0,
+        scale_sphericity_warmup_steps=0,
         lambda_edge=0.0, norm_strategy="mean", use_scheduled_weights=False
     ):
         super().__init__()
@@ -464,6 +467,11 @@ class Pi3LossGS(nn.Module):
         self.sparsity_min_opacity = float(sparsity_min_opacity)
         self.enable_alpha_regularization = bool(enable_alpha_regularization)
         self.lambda_alpha_regul = float(lambda_alpha_regul)
+        self.enable_scale_sphericity_regularization = bool(enable_scale_sphericity_regularization)
+        self.lambda_scale_sphericity = float(lambda_scale_sphericity)
+        self.scale_sphericity_min_opacity = max(0.0, float(scale_sphericity_min_opacity))
+        self.scale_sphericity_start_step = max(0.0, float(scale_sphericity_start_step))
+        self.scale_sphericity_warmup_steps = max(0.0, float(scale_sphericity_warmup_steps))
         
         self.train_stage = int(train_stage) 
         self.local_align_res = local_align_res
@@ -510,6 +518,17 @@ class Pi3LossGS(nn.Module):
             stride = max(1, values.numel() // max_values)
             values = values[::stride][:max_values]
         return values
+
+    @staticmethod
+    def _zero_grad_anchor(*containers):
+        anchor = None
+        for container in containers:
+            values = container.values() if isinstance(container, dict) else (container,)
+            for value in values:
+                if torch.is_tensor(value) and value.requires_grad and value.numel() > 0:
+                    term = value.reshape(-1)[0] * 0.0
+                    anchor = term if anchor is None else anchor + term
+        return anchor
 
     @staticmethod
     def _maybe_release_cuda_cache(tensor, min_slack_bytes=256 * 1024 * 1024):
@@ -862,12 +881,15 @@ class Pi3LossGS(nn.Module):
         loss_rgb = loss_ssim = loss_depth = loss_sobel = loss_pose = loss_conf = loss_scale = loss_edge = torch.tensor(0.0, device=pred_c2w.device)
         loss_sparsity = torch.tensor(0.0, device=pred_c2w.device)
         loss_alpha_regul = torch.tensor(0.0, device=pred_c2w.device)
+        loss_scale_sphericity = torch.tensor(0.0, device=pred_c2w.device)
+        scale_sphericity_active_count = torch.tensor(0.0, device=pred_c2w.device)
         loss_lpips = torch.tensor(0.0, device=pred_c2w.device)
         details = {}
 
         render_w2c = se3_inverse(pred_c2w)
         
         render_view_chunk_size = self._resolve_render_view_chunk_size(gauss_render, H, W, N_total)
+        need_depth_loss = (self.train_stage in [1, 2, 3]) and (self.lambda_depth > 0) and bool(pseudo_mask_2d.any().item())
         if self.train_stage in [1, 2, 3]:
             photo_weight = 0
             for start in range(0, N_total, render_view_chunk_size):
@@ -922,9 +944,7 @@ class Pi3LossGS(nn.Module):
                 loss_lpips = loss_lpips / photo_weight
                 loss_sobel = loss_sobel / photo_weight
 
-        need_depth_loss = (self.train_stage in [1, 2, 3]) and (self.lambda_depth > 0) and bool(pseudo_mask_2d.any().item())
         if need_depth_loss:
-            # gauss_raw['conf'] is Gaussian-level confidence and is used exactly like depth rendering in inference.
             gauss_render_depth = self._build_depth_render_gaussians(gauss_render)
 
             depth_abs_sum = torch.tensor(0.0, device=pred_c2w.device)
@@ -964,11 +984,44 @@ class Pi3LossGS(nn.Module):
             valid_alpha_mask = gauss_raw['opacity'].squeeze(-1) > self.sparsity_min_opacity
             if bool(valid_alpha_mask.any().item()):
                 loss_alpha_regul = gauss_raw['opacity'].float()[valid_alpha_mask].mean()
+        scale_sphericity_progress = 0.0
+        if (
+            self.enable_scale_sphericity_regularization
+            and self.lambda_scale_sphericity > 0
+            and "scale" in gauss_raw
+            and "opacity" in gauss_raw
+        ):
+            if self.scale_sphericity_warmup_steps <= 0:
+                scale_sphericity_progress = 1.0 if float(batch_idx) >= self.scale_sphericity_start_step else 0.0
+            else:
+                scale_sphericity_progress = (
+                    float(batch_idx) - self.scale_sphericity_start_step
+                ) / self.scale_sphericity_warmup_steps
+                scale_sphericity_progress = min(max(scale_sphericity_progress, 0.0), 1.0)
+
+            if scale_sphericity_progress > 0:
+                scale = gauss_raw["scale"].float()
+                opacity_for_scale = gauss_raw["opacity"].detach().float().squeeze(-1)
+                valid_scale_mask = (
+                    (opacity_for_scale > self.scale_sphericity_min_opacity)
+                    & torch.isfinite(scale).all(dim=-1)
+                    & (scale > 0).all(dim=-1)
+                )
+                if bool(valid_scale_mask.any().item()):
+                    scale_sphericity_active_count = valid_scale_mask.sum().to(
+                        device=pred_c2w.device,
+                        dtype=pred_c2w.dtype,
+                    )
+                    valid_scale = scale[valid_scale_mask]
+                    loss_scale_sphericity = torch.abs(
+                        valid_scale - valid_scale.mean(dim=-1, keepdim=True)
+                    ).mean()
 
         weight_rgb = cur_lambda_rgb if self.use_scheduled_weights else self.lambda_rgb
         weight_ssim = cur_lambda_ssim if self.use_scheduled_weights else self.lambda_ssim
         weight_depth = cur_lambda_depth if self.use_scheduled_weights else self.lambda_depth
         weight_lpips = cur_lambda_lpips if self.use_scheduled_weights else self.lambda_lpips
+        weight_scale_sphericity = self.lambda_scale_sphericity * scale_sphericity_progress
 
         final_loss = (
             weight_rgb * loss_rgb +
@@ -977,9 +1030,14 @@ class Pi3LossGS(nn.Module):
             weight_lpips * loss_lpips +
             self.lambda_edge * loss_sobel +
             self.lambda_sparsity * loss_sparsity +
-            self.lambda_alpha_regul * loss_alpha_regul
+            self.lambda_alpha_regul * loss_alpha_regul +
+            weight_scale_sphericity * loss_scale_sphericity
             # 0.0001 * loss_volume
         )
+
+        grad_anchor = self._zero_grad_anchor(gauss_raw, gauss_render)
+        if grad_anchor is not None:
+            final_loss = final_loss + grad_anchor
 
         if final_loss == 0.0:
             final_loss = (pred['local_points'].sum() * 0.0)
@@ -992,6 +1050,8 @@ class Pi3LossGS(nn.Module):
             "loss_lpips": loss_lpips,
             "loss_sparsity": loss_sparsity,
             "loss_alpha_regul": loss_alpha_regul,
+            "loss_scale_sphericity": loss_scale_sphericity,
+            "scale_sphericity_active_count": scale_sphericity_active_count,
             "pseudo_mask_ratio": pseudo_mask_2d.float().mean(),
             "norm_factor_mean": norm_stats.get(
                 "norm_factor_mean",
@@ -1039,6 +1099,14 @@ class Pi3LossGS(nn.Module):
             ),
             "cur_weight_alpha_regul": torch.tensor(
                 self.lambda_alpha_regul if self.enable_alpha_regularization else 0.0,
+                device=pred_c2w.device,
+            ),
+            "cur_weight_scale_sphericity": torch.tensor(
+                float(weight_scale_sphericity),
+                device=pred_c2w.device,
+            ),
+            "scale_sphericity_progress": torch.tensor(
+                float(scale_sphericity_progress),
                 device=pred_c2w.device,
             ),
             "render_view_chunk_size": torch.tensor(
