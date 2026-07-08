@@ -319,11 +319,13 @@ class Pi3_3DGS(nn.Module):
             scale_min_ratio=5e-5,
             scale_max_ratio=0.8,
             gs_view_stride=1,
+            geometry_head_view_chunk_size=24,
             gs_decoder_view_chunk_size=24,
             gs_head_view_chunk_size=2,
             gs_head_feature_channels=64,
             gs_head_head_channels=48,
             gs_head_use_checkpoint=True,
+            gs_head_use_image_branch=True,
             enable_quadtree=True,
             quadtree_base_threshold=0.15,
             quadtree_relax_factor=0.0,
@@ -353,6 +355,7 @@ class Pi3_3DGS(nn.Module):
             redundancy_pixel_scale=1.0,
             redundancy_pixel_footprint_min=1e-5,
             redundancy_pixel_footprint_max_ratio=0.05,
+            footprint_projection_chunk_size=65536,
             use_input_intrinsics=False,
             enable_xyz_residual=True,
             xyz_residual_scale_ratio=0.02,
@@ -412,11 +415,13 @@ class Pi3_3DGS(nn.Module):
         self.scale_min_ratio = float(scale_min_ratio)
         self.scale_max_ratio = max(float(scale_max_ratio), float(scale_min_ratio) * 1.1)
         self.gs_view_stride = max(1, int(gs_view_stride))
+        self.geometry_head_view_chunk_size = max(1, int(geometry_head_view_chunk_size))
         self.gs_decoder_view_chunk_size = max(1, int(gs_decoder_view_chunk_size))
         self.gs_head_view_chunk_size = max(1, int(gs_head_view_chunk_size))
         self.gs_head_feature_channels = max(16, int(gs_head_feature_channels))
         self.gs_head_head_channels = max(16, int(gs_head_head_channels))
         self.gs_head_use_checkpoint = bool(gs_head_use_checkpoint)
+        self.gs_head_use_image_branch = bool(gs_head_use_image_branch)
         self.enable_quadtree = bool(enable_quadtree)
         self.quadtree_base_threshold = max(0.0, float(quadtree_base_threshold))
         self.quadtree_relax_factor = max(0.0, float(quadtree_relax_factor))
@@ -445,6 +450,7 @@ class Pi3_3DGS(nn.Module):
         self.redundancy_pixel_scale = max(float(redundancy_pixel_scale), 1e-6)
         self.redundancy_pixel_footprint_min = max(float(redundancy_pixel_footprint_min), 1e-8)
         self.redundancy_pixel_footprint_max_ratio = max(float(redundancy_pixel_footprint_max_ratio), 0.0)
+        self.footprint_projection_chunk_size = max(1, int(footprint_projection_chunk_size))
         self.use_input_intrinsics = bool(use_input_intrinsics)
         self.enable_xyz_residual = bool(enable_xyz_residual)
         self.xyz_residual_scale_ratio = max(0.0, float(xyz_residual_scale_ratio))
@@ -609,7 +615,10 @@ class Pi3_3DGS(nn.Module):
             feature_channels=self.gs_head_feature_channels,
             head_channels=self.gs_head_head_channels,
             use_checkpoint=self.gs_head_use_checkpoint,
+            use_image_branch=self.gs_head_use_image_branch,
         )
+        if not self.enable_xyz_residual:
+            freeze_all_params([self.gs_head.output_block[4]])
 
         # self.sky_head = SkyGaussianHead(
         #     num_sky_anchors=num_sky_anchors,
@@ -960,30 +969,41 @@ class Pi3_3DGS(nn.Module):
         # Therefore x_cam = R_c2w^T (x_world - t_c2w).
         R = cams[:, :3, :3]
         t = cams[:, :3, 3]
-        pts_cam = torch.matmul(xyz_f.unsqueeze(0) - t[:, None, :], R)  # [M, K, 3]
-        z = pts_cam[..., 2]
-
         fx = Ks[:, 0, 0].abs().clamp_min(1e-6).view(M, 1)
         fy = Ks[:, 1, 1].abs().clamp_min(1e-6).view(M, 1)
         cx = Ks[:, 0, 2].view(M, 1)
         cy = Ks[:, 1, 2].view(M, 1)
 
-        valid_z = z > 1e-6
-        safe_z = z.clamp_min(1e-6)
-        u = pts_cam[..., 0] / safe_z * fx + cx
-        v = pts_cam[..., 1] / safe_z * fy + cy
-        visible = valid_z & (u >= 0.0) & (u <= float(W - 1)) & (v >= 0.0) & (v <= float(H - 1))
+        cube_chunks = []
+        projection_chunk = max(1, int(self.footprint_projection_chunk_size))
+        for start in range(0, K, projection_chunk):
+            end = min(start + projection_chunk, K)
+            xyz_chunk = xyz_f[start:end]
+            pts_cam = torch.matmul(xyz_chunk.unsqueeze(0) - t[:, None, :], R)  # [M, C, 3]
+            z = pts_cam[..., 2]
 
-        # World-space distance corresponding to one pixel at this depth. Since
-        # camera rotations preserve length, z/fx and z/fy are also world lengths.
-        pixel_world_x = safe_z / fx
-        pixel_world_y = safe_z / fy
-        pixel_world = torch.minimum(pixel_world_x, pixel_world_y)
-        pixel_world = pixel_world.masked_fill(~visible, float("inf"))
-        cube_size = pixel_world.min(dim=0).values
+            valid_z = z > 1e-6
+            safe_z = z.clamp_min(1e-6)
+            u = pts_cam[..., 0] / safe_z * fx + cx
+            v = pts_cam[..., 1] / safe_z * fy + cy
+            visible = valid_z & (u >= 0.0) & (u <= float(W - 1)) & (v >= 0.0) & (v <= float(H - 1))
 
-        has_visible = torch.isfinite(cube_size)
-        cube_size = torch.where(has_visible, cube_size, fallback_cube)
+            # World-space distance corresponding to one pixel at this depth.
+            # Since camera rotations preserve length, z/fx and z/fy are also world lengths.
+            pixel_world_x = safe_z / fx
+            pixel_world_y = safe_z / fy
+            pixel_world = torch.minimum(pixel_world_x, pixel_world_y)
+            pixel_world = pixel_world.masked_fill(~visible, float("inf"))
+            cube_chunk = pixel_world.min(dim=0).values
+
+            has_visible = torch.isfinite(cube_chunk)
+            cube_chunk = torch.where(has_visible, cube_chunk, fallback_cube[start:end])
+            cube_chunks.append(cube_chunk)
+
+            del xyz_chunk, pts_cam, z, valid_z, safe_z, u, v, visible
+            del pixel_world_x, pixel_world_y, pixel_world, cube_chunk, has_visible
+
+        cube_size = torch.cat(cube_chunks, dim=0)
         cube_size = cube_size.clamp_min(self.redundancy_pixel_footprint_min)
 
         if self.redundancy_pixel_footprint_max_ratio > 0:
@@ -1332,6 +1352,46 @@ class Pi3_3DGS(nn.Module):
 
         if mem_debug: mem_debug.step("Shared Decoder")
         return torch.cat([final_output[0], final_output[1]], dim=-1), pos.reshape(B * N, hw, -1)
+
+    def _run_conv_head_view_chunks(self, head, hidden_tokens, B, N, patch_h, patch_w, view_chunk_size):
+        """Run dense ConvHead in view chunks to avoid large 32-bit-index kernels."""
+        view_chunk_size = max(1, int(view_chunk_size))
+        if view_chunk_size >= N:
+            return head(hidden_tokens, patch_h=patch_h, patch_w=patch_w)
+
+        hw, dim = hidden_tokens.shape[1], hidden_tokens.shape[2]
+        hidden_by_view = hidden_tokens.reshape(B, N, hw, dim)
+        chunk_outputs = None
+        single_output = None
+
+        for start in range(0, N, view_chunk_size):
+            end = min(start + view_chunk_size, N)
+            chunk = hidden_by_view[:, start:end].reshape(B * (end - start), hw, dim)
+            out = head(chunk, patch_h=patch_h, patch_w=patch_w)
+            if isinstance(out, (list, tuple)):
+                out_list = list(out)
+                if single_output is None:
+                    single_output = False
+            else:
+                out_list = [out]
+                if single_output is None:
+                    single_output = True
+
+            if chunk_outputs is None:
+                chunk_outputs = [[] for _ in out_list]
+
+            for output_index, output_tensor in enumerate(out_list):
+                chunk_outputs[output_index].append(
+                    output_tensor.reshape(B, end - start, *output_tensor.shape[1:])
+                )
+
+            del chunk, out, out_list
+
+        merged = [
+            torch.cat(parts, dim=1).reshape(B * N, *parts[0].shape[2:])
+            for parts in chunk_outputs
+        ]
+        return merged[0] if single_output else merged
 
     def _normalize_scene_size(self, scene_size, B, device, dtype):
         if not isinstance(scene_size, torch.Tensor):
@@ -1711,12 +1771,28 @@ class Pi3_3DGS(nn.Module):
         point_ctx = nullcontext() if modules_require_grad([self.point_decoder, self.point_head]) else torch.no_grad()
         with point_ctx:
             point_h = self.point_decoder(hidden, xpos=pos)[:, self.patch_start_idx:]
-            local_xyz_raw = self.point_head(point_h, patch_h=patch_h, patch_w=patch_w)
+            local_xyz_raw = self._run_conv_head_view_chunks(
+                self.point_head,
+                point_h,
+                B,
+                N_total,
+                patch_h,
+                patch_w,
+                self.geometry_head_view_chunk_size,
+            )
 
         conf_ctx = nullcontext() if modules_require_grad([self.conf_decoder, self.conf_head]) else torch.no_grad()
         with conf_ctx:
             ret_conf = self.conf_decoder(hidden, xpos=pos)
-            conf = self.conf_head(ret_conf[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)[0]
+            conf = self._run_conv_head_view_chunks(
+                self.conf_head,
+                ret_conf[:, self.patch_start_idx:],
+                B,
+                N_total,
+                patch_h,
+                patch_w,
+                self.geometry_head_view_chunk_size,
+            )[0]
 
         conf_logits = conf.permute(0, 2, 3, 1).reshape(B, N_total, H, W, -1)
 
@@ -2324,6 +2400,8 @@ class Pi3_3DGS(nn.Module):
                     b_residual_norm_sum += float(residual_norm_v.sum().item())
                     b_residual_norm_num += int(residual_norm_v.numel())
 
+                    # view_idx_v is local to sub_idx; use each source view pose
+                    # to place all chunked local Gaussians into one world scene.
                     cam_poses_v = camera_poses_sub[b, view_idx_v]
                     cam_rot_v = cam_poses_v[:, :3, :3]
                     cam_trans_v = cam_poses_v[:, :3, 3]

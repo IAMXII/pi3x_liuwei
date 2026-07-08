@@ -45,6 +45,64 @@ CAMERA_MODELS = {
 SH_C0 = 0.28209479177387814
 
 
+def write_gsplat_sh0_ply(path, params, opacity_threshold=0.0, chunk_size=1_000_000):
+    if int(params["colors"].shape[1]) != 1:
+        raise ValueError("write_gsplat_sh0_ply only supports SH degree 0 params.")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    opacities = params["opacities"].detach()
+    if opacity_threshold > 0.0:
+        keep_indices = torch.nonzero(torch.sigmoid(opacities) > float(opacity_threshold), as_tuple=False).flatten()
+        n = int(keep_indices.numel())
+    else:
+        keep_indices = None
+        n = int(opacities.shape[0])
+
+    header = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {n}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float nx",
+        "property float ny",
+        "property float nz",
+        "property float f_dc_0",
+        "property float f_dc_1",
+        "property float f_dc_2",
+        "property float opacity",
+        "property float scale_0",
+        "property float scale_1",
+        "property float scale_2",
+        "property float rot_0",
+        "property float rot_1",
+        "property float rot_2",
+        "property float rot_3",
+        "end_header",
+    ]
+    with path.open("wb") as handle:
+        handle.write(("\n".join(header) + "\n").encode("ascii"))
+        for start in range(0, n, int(chunk_size)):
+            end = min(start + int(chunk_size), n)
+            if keep_indices is None:
+                index = slice(start, end)
+            else:
+                index = keep_indices[start:end]
+            means = params["means"][index].detach().float().cpu().numpy()
+            zeros = np.zeros_like(means, dtype=np.float32)
+            colors = params["colors"][index, 0].detach().float().cpu().numpy()
+            opa = params["opacities"][index].detach().float().cpu().numpy()[:, None]
+            scales = params["scales"][index].detach().float().cpu().numpy()
+            quats = F.normalize(params["quats"][index].detach().float(), dim=-1).cpu().numpy()
+            packed = np.concatenate([means, zeros, colors, opa, scales, quats], axis=1).astype(
+                np.float32,
+                copy=False,
+            )
+            handle.write(packed.tobytes(order="C"))
+
+
 def read_next_bytes(handle, num_bytes, fmt):
     return struct.unpack("<" + fmt, handle.read(num_bytes))
 
@@ -501,10 +559,25 @@ def train_one_variant(args, scene, xyz, rgb, sh_degree):
     )
 
     write_per_frame_csv(variant_dir / "test_metrics_per_frame.csv", test_eval["rows"])
+    final_ply = None
+    if args.save_ply:
+        if int(sh_degree) != 0:
+            raise ValueError("--save-ply currently supports SH degree 0 only.")
+        final_ply = variant_dir / f"optimized_sh0_{args.iters}.ply"
+        write_gsplat_sh0_ply(
+            final_ply,
+            params,
+            opacity_threshold=args.ply_opacity_threshold,
+            chunk_size=args.ply_chunk_size,
+        )
+        print(f"[sh={sh_degree}] saved PLY: {final_ply}", flush=True)
+
     summary = {
         "sh_degree": int(sh_degree),
         "initial_num_points": initial_num_points,
         "final_num_points": int(params["means"].shape[0]),
+        "final_ply": str(final_ply) if final_ply is not None else "",
+        "ply_opacity_threshold": float(args.ply_opacity_threshold),
         "scene_scale": scene_scale,
         "density_control": strategy is not None,
         "train_eval_frames": int(len(train_eval["rows"])),
@@ -534,6 +607,7 @@ def write_pair_summary(output_root, summaries):
                 "sh_degree": item["sh_degree"],
                 "initial_num_points": item["initial_num_points"],
                 "final_num_points": item["final_num_points"],
+                "final_ply": item.get("final_ply", ""),
                 "density_control": item["density_control"],
                 "train_ssim": item["train_ssim"],
                 "test_ssim": item["test_ssim"],
@@ -578,6 +652,9 @@ def parse_args():
     parser.add_argument("--eval-train-frames", type=int, default=25)
     parser.add_argument("--save-renders", action="store_true")
     parser.add_argument("--max-save-renders", type=int, default=8)
+    parser.add_argument("--save-ply", action="store_true")
+    parser.add_argument("--ply-opacity-threshold", type=float, default=0.0)
+    parser.add_argument("--ply-chunk-size", type=int, default=1_000_000)
     parser.add_argument("--enable-density-control", action="store_true")
     parser.add_argument("--strategy-prune-opa", type=float, default=0.005)
     parser.add_argument("--strategy-grow-grad2d", type=float, default=0.0002)

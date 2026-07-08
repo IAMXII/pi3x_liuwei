@@ -333,12 +333,14 @@ class ImageAwareDPTDenseGaussianHead(nn.Module):
             head_channels=48,
             res_block_norm='group_norm',
             use_checkpoint=True,
+            use_image_branch=True,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.dim_out = dim_out
         self.feature_channels = feature_channels
         self.use_checkpoint = bool(use_checkpoint)
+        self.use_image_branch = bool(use_image_branch)
 
         self.projects = nn.ModuleList([
             nn.Conv2d(dec_embed_dim, feature_channels, kernel_size=1)
@@ -370,6 +372,10 @@ class ImageAwareDPTDenseGaussianHead(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.image_gate = nn.Parameter(torch.tensor(0.5))
+        if not self.use_image_branch:
+            self.image_gate.requires_grad_(False)
+            for param in self.dpt_image_merger.parameters():
+                param.requires_grad = False
 
         self.output_block = nn.ModuleList([
             nn.Sequential(
@@ -458,7 +464,7 @@ class ImageAwareDPTDenseGaussianHead(nn.Module):
             layer_1,
         )
 
-        if image is not None:
+        if self.use_image_branch and image is not None:
             if image.dim() == 5:
                 image = image.reshape(-1, *image.shape[-3:])
             image = image.to(device=x.device, dtype=x.dtype)

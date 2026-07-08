@@ -32,6 +32,8 @@ MODEL_IMPL_ALIASES = {
     "10": "pi3.models.pi3_3dgs_10.Pi3_3DGS",
     "_11": "pi3.models.pi3_3dgs_11.Pi3_3DGS",
     "11": "pi3.models.pi3_3dgs_11.Pi3_3DGS",
+    "_12": "pi3.models.pi3_3dgs_12.Pi3_3DGS",
+    "12": "pi3.models.pi3_3dgs_12.Pi3_3DGS",
 }
 
 
@@ -934,6 +936,18 @@ def build_selected_indices(total_count, interval=1, subset_start=None, subset_en
     return base_indices[slice(subset_start, subset_end, subset_step)]
 
 
+def build_evenly_spaced_indices(total_count, target_count):
+    if total_count <= 0:
+        return []
+    target_count = max(1, int(target_count))
+    if target_count >= total_count:
+        return list(range(total_count))
+
+    raw = np.linspace(0, total_count - 1, num=target_count)
+    indices = sorted({int(round(x)) for x in raw})
+    return indices
+
+
 def build_gaussian_input_indices(total_count, stride=2):
     if total_count <= 0:
         return []
@@ -990,15 +1004,19 @@ def format_frame_name_preview(frame_items, max_items=120):
     return ";".join(names[:head_count] + ["..."] + names[-tail_count:])
 
 
-def load_rgb_sequence(path, interval=1, subset_start=None, subset_end=None, subset_step=1, pixel_limit=255000):
+def load_rgb_sequence(path, interval=1, subset_start=None, subset_end=None, subset_step=1,
+                      pixel_limit=255000, target_frame_count=None):
     frame_items = []
     sources = []
 
     if os.path.isdir(path):
         filenames = list_sorted_files(path, RGB_EXTS)
-        selected_indices = build_selected_indices(
-            len(filenames), interval=interval, subset_start=subset_start, subset_end=subset_end, subset_step=subset_step
-        )
+        if target_frame_count is not None:
+            selected_indices = build_evenly_spaced_indices(len(filenames), target_frame_count)
+        else:
+            selected_indices = build_selected_indices(
+                len(filenames), interval=interval, subset_start=subset_start, subset_end=subset_end, subset_step=subset_step
+            )
         for source_index in selected_indices:
             filename = filenames[source_index]
             full_path = os.path.join(path, filename)
@@ -2149,6 +2167,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="output_render_campus_0425")
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--interval", type=int, default=-1)
+    parser.add_argument("--target_frame_count", type=int, default=None,
+                        help="For raw RGB directories, select this many frames evenly over the full sorted sequence.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--chunk_size", type=int, default=100,
                         help="Number of frames per inference chunk when --per_chunk_scene is enabled.")
@@ -2156,6 +2176,12 @@ def main():
                         help="Use the old behavior: build one Gaussian space per chunk instead of one for all frames.")
     parser.add_argument("--gs_view_stride", type=int, default=2,
                         help="View stride used by the model Gaussian branch. 1 uses all input views.")
+    parser.add_argument("--geometry_head_view_chunk_size", type=int, default=None,
+                        help="Override model point/conf dense head view chunk size for long single-scene inference.")
+    parser.add_argument("--gs_decoder_view_chunk_size", type=int, default=None,
+                        help="Override model GS decoder view chunk size for long single-scene inference.")
+    parser.add_argument("--gs_head_view_chunk_size", type=int, default=None,
+                        help="Override model GS head view chunk size for long single-scene inference.")
     parser.add_argument("--model_config", type=str, default=None,
                         help="Hydra config.yaml used to restore model construction args. Default: auto-detect near ckpt.")
     parser.add_argument("--model_impl", type=str, default=None,
@@ -2367,6 +2393,14 @@ def main():
         raise ValueError("--gaussian_scene_selection_tile_size must be positive.")
     if args.gaussian_scene_max_screen_radius < 0:
         raise ValueError("--gaussian_scene_max_screen_radius must be non-negative.")
+    if args.target_frame_count is not None and args.target_frame_count <= 0:
+        raise ValueError("--target_frame_count must be positive when set.")
+    if args.gs_decoder_view_chunk_size is not None and args.gs_decoder_view_chunk_size <= 0:
+        raise ValueError("--gs_decoder_view_chunk_size must be positive when set.")
+    if args.gs_head_view_chunk_size is not None and args.gs_head_view_chunk_size <= 0:
+        raise ValueError("--gs_head_view_chunk_size must be positive when set.")
+    if args.geometry_head_view_chunk_size is not None and args.geometry_head_view_chunk_size <= 0:
+        raise ValueError("--geometry_head_view_chunk_size must be positive when set.")
     if args.eval_source == "raw_folder" and not args.data_path:
         raise ValueError("--data_path is required when --eval_source raw_folder.")
     if args.eval_source == "three_sixty_v2_dataset" and not args.dataset_scene:
@@ -2432,6 +2466,9 @@ def main():
         "scale_bias_strength",
         "scale_activation_multiplier",
         "low_conf_scale_boost",
+        "geometry_head_view_chunk_size",
+        "gs_decoder_view_chunk_size",
+        "gs_head_view_chunk_size",
     ):
         arg_value = getattr(args, arg_name)
         if arg_value is not None:
@@ -2474,6 +2511,7 @@ def main():
             subset_end=args.subset_end,
             subset_step=args.subset_step,
             pixel_limit=args.pixel_limit,
+            target_frame_count=args.target_frame_count,
         )
     if imgs_cpu.numel() == 0:
         raise RuntimeError("No RGB frames loaded.")
@@ -2578,26 +2616,29 @@ def main():
         opacity_flat = current_gaussians["opacity"].detach().float().reshape(-1)
         rendered_count = int(opacity_flat.numel())
         rendered_active_count = int((opacity_flat > 0.05).sum().item())
-        redundancy_suppression_mask = _redundancy_suppression_mask_tensor(
-            raw_gaussians,
-            raw_total_count,
-            raw_gaussians["opacity"].device,
-            redundancy_coef_threshold=args.redundancy_overlay_coef_threshold,
-        )
-        redundancy_appearance_mask = _redundancy_appearance_multiview_mask(
-            raw_gaussians,
-            imgs_batch[0],
-            pred_w2c,
-            pred_K,
-            H,
-            W,
-            color_threshold=args.redundancy_overlay_multiview_color_threshold,
-            min_views=args.redundancy_overlay_min_views,
-            match_radius=args.redundancy_overlay_match_radius,
-            chunk_size=args.redundancy_overlay_chunk_size,
-        )
-        redundancy_suppression_mask &= redundancy_appearance_mask
-        redundancy_suppression_count = int(redundancy_suppression_mask.sum().item())
+        redundancy_suppression_mask = None
+        redundancy_suppression_count = 0
+        if args.save_redundancy_overlay and not args.skip_save_frames:
+            redundancy_suppression_mask = _redundancy_suppression_mask_tensor(
+                raw_gaussians,
+                raw_total_count,
+                raw_gaussians["opacity"].device,
+                redundancy_coef_threshold=args.redundancy_overlay_coef_threshold,
+            )
+            redundancy_appearance_mask = _redundancy_appearance_multiview_mask(
+                raw_gaussians,
+                imgs_batch[0],
+                pred_w2c,
+                pred_K,
+                H,
+                W,
+                color_threshold=args.redundancy_overlay_multiview_color_threshold,
+                min_views=args.redundancy_overlay_min_views,
+                match_radius=args.redundancy_overlay_match_radius,
+                chunk_size=args.redundancy_overlay_chunk_size,
+            )
+            redundancy_suppression_mask &= redundancy_appearance_mask
+            redundancy_suppression_count = int(redundancy_suppression_mask.sum().item())
         stat_values = {}
         gaussian_stats = res.get("gaussian_stats", {})
         if isinstance(gaussian_stats, dict):
@@ -3100,6 +3141,9 @@ def main():
             "scale_bias_strength",
             "scale_activation_multiplier",
             "low_conf_scale_boost",
+            "geometry_head_view_chunk_size",
+            "gs_decoder_view_chunk_size",
+            "gs_head_view_chunk_size",
         ):
             f.write(f"{arg_name}: {getattr(args, arg_name)}\n")
         if loaded_config_path:
@@ -3134,6 +3178,7 @@ def main():
         f.write(f"gaussian_diagnostics_saved: {args.save_gaussian_diagnostics}\n")
         f.write(f"gaussian_diagnostic_max_rows: {args.gaussian_diagnostic_max_rows}\n")
         f.write(f"scene_mode: {scene_mode}\n")
+        f.write(f"target_frame_count: {args.target_frame_count}\n")
         f.write(f"gs_view_stride: {args.gs_view_stride}\n")
         if args.per_chunk_scene:
             f.write(f"chunk_size: {args.chunk_size}\n")

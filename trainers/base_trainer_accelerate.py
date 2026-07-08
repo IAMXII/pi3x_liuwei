@@ -69,6 +69,7 @@ class _LimitedIterable:
 class BaseTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._no_grad_loss_warn_count = 0
 
         with open_dict(cfg):
             cfg.job_logging_cfg = HydraConfig.get().job_logging
@@ -140,6 +141,28 @@ class BaseTrainer:
 
     def build_optimizer(self, cfg_optimizer, model, param_group_fn=None):
         return build_optimizer(cfg_optimizer, model, param_group_fn=param_group_fn)
+
+    def _zero_grad_anchor_from_trainable_params(self):
+        anchor = None
+        for param in self.model.parameters():
+            if param.requires_grad and param.numel() > 0:
+                term = param.reshape(-1)[0] * 0.0
+                anchor = term if anchor is None else anchor + term
+        return anchor
+
+    def _format_no_grad_loss_context(self, batch_output, max_items=12):
+        parts = []
+        for key, value in batch_output.items():
+            if not isinstance(value, torch.Tensor) or value.numel() != 1:
+                continue
+            try:
+                scalar = float(value.detach().float().item())
+            except Exception:
+                scalar = float("nan")
+            parts.append(f"{key}: value={scalar:.6g}, requires_grad={value.requires_grad}")
+            if len(parts) >= max_items:
+                break
+        return "; ".join(parts)
 
     def prepare_training(self):
         # report model details
@@ -604,11 +627,22 @@ class BaseTrainer:
                 )
                 
                 loss = batch_output.loss
-                if loss > self.cfg.train.clip_loss:
+                if not isinstance(loss, torch.Tensor):
+                    raise TypeError(
+                        f"calculate_loss must return a tensor loss, got {type(loss).__name__} "
+                        f"at epoch {epoch}, iter {it}, global step {self.global_step}."
+                    )
+                if loss.numel() != 1:
+                    raise ValueError(
+                        f"calculate_loss must return a scalar tensor loss, got shape {tuple(loss.shape)} "
+                        f"at epoch {epoch}, iter {it}, global step {self.global_step}."
+                    )
+
+                if bool((loss.detach() > self.cfg.train.clip_loss).item()):
                     loss = loss * 0.0
 
                 # Check if the loss is nan
-                loss_value = loss.item()
+                loss_value = float(loss.detach().float().item())
                 if not math.isfinite(loss_value):
                     rank = get_rank()
                     print(
@@ -616,6 +650,25 @@ class BaseTrainer:
                         force=True,
                     )
                     sys.exit(1)
+
+                if not loss.requires_grad:
+                    zero_grad_anchor = self._zero_grad_anchor_from_trainable_params()
+                    no_grad_context = self._format_no_grad_loss_context(batch_output)
+                    if zero_grad_anchor is None:
+                        raise RuntimeError(
+                            "Loss does not require grad and no trainable model parameter was found. "
+                            f"epoch={epoch}, iter={it}, global_step={self.global_step}. "
+                            f"Scalar details: {no_grad_context}"
+                        )
+                    if self._no_grad_loss_warn_count < 8:
+                        self.log_info(
+                            "Loss does not require grad; adding a zero-gradient anchor so this "
+                            f"degenerate batch contributes zero gradients. epoch={epoch}, iter={it}, "
+                            f"global_step={self.global_step}. Scalar details: {no_grad_context}"
+                        )
+                    self._no_grad_loss_warn_count += 1
+                    loss = loss + zero_grad_anchor
+                    batch_output.loss = loss
 
                 self.accelerator.backward(loss)
 
